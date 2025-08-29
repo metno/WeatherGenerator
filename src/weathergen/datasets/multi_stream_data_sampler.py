@@ -24,6 +24,8 @@ from weathergen.datasets.data_reader_base import (
 )
 from weathergen.datasets.data_reader_fesom import DataReaderFesom
 from weathergen.datasets.data_reader_obs import DataReaderObs
+from weathergen.datasets.data_reader_synop import DataReaderSynop
+from weathergen.datasets.icon_dataset import IconDataset
 from weathergen.datasets.masking import Masker
 from weathergen.datasets.stream_data import StreamData, spoof
 from weathergen.datasets.tokenizer_masking import TokenizerMasking
@@ -160,6 +162,17 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
                             msg = f"Unsupported stream type {stream_info['type']}"
                             f"for stream name '{stream_info['name']}'."
                             raise ValueError(msg)
+                        datapath = cf.data_path_fesom
+                    case "icon":
+                        dataset = IconDataset
+                        datapath = cf.data_path_icon
+                    case "synop":
+                        dataset = DataReaderSynop
+                        datapath = cf.data_path_obs
+                    case _:
+                        msg = f"Unsupported stream type {stream_info['type']}"
+                        f"for stream name '{stream_info['name']}'."
+                        raise ValueError(msg)
 
                 fname = pathlib.Path(fname)
                 # dont check if file exists since zarr stores might be directories
