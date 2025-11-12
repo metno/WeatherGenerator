@@ -45,6 +45,7 @@ inference = "weathergen.run_train:inference"
 evaluate = "weathergen.evaluate.run_evaluation:evaluate"
 plot_train = "weathergen.utils.plot_training:plot_train"
 export = "weathergen.evaluate.export_inference:export"
+create_verif = "weathergen.verif.__init__:main"
 
 [build-system]
 requires = ["hatchling"]
