@@ -1,0 +1,143 @@
+import argparse
+import numpy as np
+# from datetime import datetime, timedelta, timezone
+
+from pathlib import Path
+from weathergen.verif.verif_interpolator import verif_2D_interpolator
+
+def readarg():
+
+    parser = argparse.ArgumentParser(description='Create verif files from a zarr file and observation file')
+
+    parser.add_argument(
+        '-z',
+        '--zarr',
+        dest="zarrfile",
+        required=False,
+        default="/lustre/storeB/project/nwp/weathergen/experiments/era5_o96/validation_epoch00000_rank0000.zarr",
+        help='Zarr file (.zarr)'
+    )
+
+    parser.add_argument(
+        '-b',
+        '--obs',
+        dest="obsfile",
+        required=False,
+        default= '/lustre/storeB/project/nwp/weathergen/datasets/metno_observations_v3.nc',
+        help='Observation file (.nc)',
+    )
+
+    parser.add_argument(
+        '-o',
+        '--output',
+        dest="outfiles",
+        default="output/verif/%S/%V/verif_file_%d.nc",
+        required=False,
+        help='Template for the output nc filenames, default will be to create output/verif/%S/%V repertories where \
+              %S, %V, %d are replaced by the stream, variable and date'
+    )
+
+    parser.add_argument(
+        '-d',
+        '--date',
+        type=str,
+        dest='datefromto',
+        required=True,
+        help='from to date in format %Y%m%d%H:%Y%m%d%H or %Y%m%d:%Y%m%d, \
+              excluding the second date for instance 2024010100:2024020200'
+    )
+
+    # could have a default date but not sure what makes sense
+    # d = datetime.now(timezone.utc).strftime("%Y%m%d%H") + ":" + (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y%m%d%H")
+
+    parser.add_argument(
+        '-v',
+        '--variables',
+        default=['rr1', 'ta'],
+        dest="variables",
+        nargs='*',
+        help='Do verif for these variables. Default: rr1, ta'
+    )
+
+    parser.add_argument(
+        '-s',
+        '--streams',
+        default=['ERA5'],
+        dest="streams",
+        nargs='*',
+        help='Do verif for these streams. Default: ERA5'
+    )
+
+    parser.add_argument(
+        '-m',
+        '--method',
+        default='2d_interpolation',
+        dest="method",
+        choices=['2d_interpolation', 'lat_lon_interpolation'],
+        help='Interpolation method. Default: 2d_interpolation'
+    )
+
+    args = parser.parse_args()
+
+    # create output directories
+    streams = args.streams
+    variables = args.variables
+    date_start, date_end = args.datefromto.split(":")
+    print("start date", date_start)
+    print("end date", date_end)
+    if len(date_start) == 8:
+        date_start = date_start + "00"
+    if len(date_start) != 10:
+        raise ValueError(f"date not in the right format expect date1:date2 as\
+                          %Y%m%d%H:%Y%m%d%H or %Y%m%d:%Y%m%d, got date1 as {date_start}")
+    if len(date_end) == 8:
+        date_end = date_end + "00"
+    if len(date_end) != 10:
+        raise ValueError(f"date not in the right format expect date1:date2 as\
+                          %Y%m%d%H:%Y%m%d%H% or %Y%m%d:%Y%m%d, got date2 as {date_end}")
+
+    args.outfiles = args.outfiles.replace("%d", date_start + '_' + date_end)
+
+    return(args.zarrfile, args.obsfile, args.outfiles, streams, variables, date_start, date_end, args.method)
+
+def create_all_output_dir(streams, variables, outfiles):
+    ''' Create output directories for the verif files
+        Args:
+            streams (list[string])
+            variables (list[string])
+            outfiles (string): template for the output files
+        Outputs:
+            None
+    '''
+    for stream in streams:
+        for variable in variables:
+            pathdir = Path(outfiles.replace('%S', stream).replace('%V', variable)).parent
+            print(f"If not existing create directory {pathdir}")
+            pathdir.mkdir(exist_ok=True, parents=True)
+
+def main():
+    print("Start creating verif files")
+    zarrfile, obsfile, outfiles, streams, variables, date_start, date_end, method = readarg()
+    print("zarrfile:", zarrfile)
+    print("obsfile:", obsfile)
+    print("start date", date_start)
+    print("end date", date_end)
+
+
+    # create verif directories
+    create_all_output_dir(streams, variables, outfiles)
+
+    x = [[1,2], [3,4], [5,6], [1,3], [2,6], [3,5], [6,3]]
+    y = [[2,4], [2,5]]
+
+    x = np.array(x, dtype='float64')
+    print(x)
+    y = np.array(y, dtype='float64')
+    print(y)
+
+
+    interpolator = verif_2D_interpolator(x, y)
+    interpolator.prepare()
+
+    print("outputfile template:", outfiles)
+
