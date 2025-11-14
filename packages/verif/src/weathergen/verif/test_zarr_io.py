@@ -22,35 +22,93 @@ def convert_coordinates(coords):
     return xyz_coords
 
 
+def crosses(P, A, B, C, D, E):
+
+    eps = 0.01
+
+    AB = B - A
+    AC = C - A
+    BC = C - B
+    AP = P - A
+    BP = P - B
+
+    area_tot = np.linalg.norm(np.cross(AB, AC))
+    area_a = np.linalg.norm(np.cross(BC, BP))
+    area_b = np.linalg.norm(np.cross(AC, AP))
+    area_c = np.linalg.norm(np.cross(AB, AP))
+
+    if (1 - area_tot/(area_a + area_b + area_c) < eps):
+        return (area_a, area_b, area_c)
+
+    AC = D - A
+    BC = D - B
+
+    area_tot = np.linalg.norm(np.cross(AB, AC))
+    area_a = np.linalg.norm(np.cross(BC, BP))
+    area_b = np.linalg.norm(np.cross(AC, AP))
+
+    if (1 - area_tot/(area_a + area_b + area_c) < eps):
+        return (area_a, area_b, area_c)
+
+    AC = E - A
+    BC = E - B
+
+    area_tot = np.linalg.norm(np.cross(AB, AC))
+    area_a = np.linalg.norm(np.cross(BC, BP))
+    area_b = np.linalg.norm(np.cross(AC, AP))
+
+    return (area_a, area_b, area_c)
+
+
+def normalise(x):
+    return x[:]/np.sum(x[:])
+
+
 def compute_weights(obs_points, model_points, indices):
 
     weights = np.ndarray((obs_points.shape[0],3))
 
+    eps = 0.01
+
     for i, (obs, indix) in enumerate(zip(obs_points, indices)):
-        
-        vertex1 = model_points[indix[1]] - model_points[indix[0]]
-        vertex2 = model_points[indix[2]] - model_points[indix[0]]
-        vertexp = obs - model_points[indix[0]]
 
-        cross1 = np.cross(vertex1, vertex2)
-        area1  = np.linalg.norm(cross1)
+        AB = model_points[indix[1]] - model_points[indix[0]]
+        AC = model_points[indix[2]] - model_points[indix[0]]
+        BC = model_points[indix[2]] - model_points[indix[1]]
+        AP = obs                    - model_points[indix[0]]
+        BP = obs                    - model_points[indix[1]]
 
-        cross2 = np.cross(vertex1, vertexp)
-        area2  = np.linalg.norm(cross2)
+        area_tot     = np.linalg.norm(np.cross(AB, AC))
+        weights[i,0] = np.linalg.norm(np.cross(BC, BP))
+        weights[i,1] = np.linalg.norm(np.cross(AC, AP))
+        weights[i,2] = np.linalg.norm(np.cross(AB, AP))
 
-        cross3 = np.cross(vertex2, vertexp)
-        area3  = np.linalg.norm(cross3)
+        if (1 - area_tot/np.sum(weights[i,:]) < eps):
+            continue
 
-        vertex1 = model_points[indix[2]] - model_points[indix[1]]
-        vertexp = obs - model_points[indix[1]]
+        indix[2] = indix[3]
 
-        cross4 = np.cross(vertex1, vertexp)
-        area4  = np.linalg.norm(cross4)
+        AC = model_points[indix[2]] - model_points[indix[0]]
+        BC = model_points[indix[2]] - model_points[indix[1]]
 
-        weights[i,0] = area4/(area2+area3+area4)
-        weights[i,1] = area3/(area2+area3+area4)
-        weights[i,2] = area2/(area2+area3+area4)
-    
+        area_tot     = np.linalg.norm(np.cross(AB, AC))
+        weights[i,0] = np.linalg.norm(np.cross(BC, BP))
+        weights[i,1] = np.linalg.norm(np.cross(AC, AP))
+
+        if (1 - area_tot/np.sum(weights[i,:]) < eps):
+            continue
+
+        indix[2] = indix[4]
+
+        AC = model_points[indix[2]] - model_points[indix[0]]
+        BC = model_points[indix[2]] - model_points[indix[1]]
+
+        area_tot     = np.linalg.norm(np.cross(AB, AC))
+        weights[i,0] = np.linalg.norm(np.cross(BC, BP))
+        weights[i,1] = np.linalg.norm(np.cross(AC, AP))
+
+    weights = normalise(weights)
+
     return weights
 
 
@@ -130,7 +188,7 @@ with ZarrIO(zarrpath) as io:
     obs_coords = np.column_stack((obs_lat_lon.latitude.values, obs_lat_lon.longitude.values))
     obs_xyz = convert_coordinates(obs_coords)
 
-    
+
     print('zarr shape: ', zarr_xyz.shape)
     print('obs shape:  ', obs_xyz.shape)
     print()
@@ -140,7 +198,7 @@ with ZarrIO(zarrpath) as io:
     tree_end = time.time()
 
     query_start = time.time()
-    d, indices = tree.query(obs_xyz, k = 3)
+    d, indices = tree.query(obs_xyz, k = 5)
     query_end = time.time()
 
     weights_start = time.time()
@@ -148,21 +206,12 @@ with ZarrIO(zarrpath) as io:
     weights_end = time.time()
 
     weigh_start = time.time()
-
     weigh_temps = np.ndarray((obs_temps.shape))
-    for i, indix in enumerate(indices):
-
-        if np.isnan(obs_temps[i]):
-            weigh_temps[i] = np.nan
-        else:        
-            weigh_temps[i] = weights[i,0]*zarr_temps[indix[0]] \
-                           + weights[i,1]*zarr_temps[indix[1]] \
-                           + weights[i,2]*zarr_temps[indix[2]]
-
+    weigh_temps[:] = weights[:,0]*zarr_temps[indices[:,0]] + weights[:,1]*zarr_temps[indices[:,1]] + weights[:,2]*zarr_temps[indices[:,2]]
     weigh_end = time.time()
 
     tri_start = time.time()
-    triangulation = Delaunay(zarr_xyz)
+    triangulation = Delaunay(zarr_coords)
     tri_end = time.time()
 
     setup_start = time.time()
@@ -170,16 +219,24 @@ with ZarrIO(zarrpath) as io:
     setup_end = time.time()
 
     inter_start = time.time()
-    inter_temps = interpolator(obs_xyz)
+    inter_temps = interpolator(obs_coords)
     inter_end = time.time()
 
     print()
     print('obs_temps:         ', obs_temps[0])
     print('obs_temps:         ', obs_temps[1])
     print('obs_temps:         ', obs_temps[2])
+    print('obs_temps:         ', obs_temps[205])
+    print()
     print('weigh_temps:       ', weigh_temps[0])
     print('weigh_temps:       ', weigh_temps[1])
     print('weigh_temps:       ', weigh_temps[2])
+    print('weigh_temps:       ', weigh_temps[205])
+    print()
+    print('inter_temps:       ', inter_temps[0])
+    print('inter_temps:       ', inter_temps[1])
+    print('inter_temps:       ', inter_temps[2])
+    print('inter_temps:       ', inter_temps[205])
     print()
     print('zarr_temps 0,0:    ', zarr_temps[indices[0,0]])
     print('zarr_temps 0,1:    ', zarr_temps[indices[0,1]])
@@ -193,14 +250,20 @@ with ZarrIO(zarrpath) as io:
     print('zarr_temps 2,1:    ', zarr_temps[indices[2,1]])
     print('zarr_temps 2,2:    ', zarr_temps[indices[2,2]])
     print()
+    print('zarr_temps 205,0:  ', zarr_temps[indices[205,0]])
+    print('zarr_temps 205,1:  ', zarr_temps[indices[205,1]])
+    print('zarr_temps 205,2:  ', zarr_temps[indices[205,2]])
+    print()
 
     print()
-    print('obs:               ', obs_coords[0,0],obs_coords[0,1])
-    print('zarr 0:            ', zarr_coords[indices[0,0],0], zarr_coords[indices[0,0],1])
-    print('zarr 1:            ', zarr_coords[indices[0,1],0], zarr_coords[indices[0,1],1])
-    print('zarr 2:            ', zarr_coords[indices[0,2],0], zarr_coords[indices[0,2],1])
-    print('distances:         ', d[0,:])
+    print('obs  0:            ', obs_coords[0,0],obs_coords[0,1])
+    print('obs  1:            ', obs_coords[1,0],obs_coords[1,1])
+    print('obs  2:            ', obs_coords[2,0],obs_coords[2,1])
+    print('obs  205:          ', obs_coords[205,0],obs_coords[205,1])
     print('weights:           ', weights[0,:])
+    print('weights:           ', weights[1,:])
+    print('weights:           ', weights[2,:])
+    print('weights:           ', weights[205,:])
     print()
 
     print('convert time:       ', convert_end - convert_start)
@@ -213,10 +276,6 @@ with ZarrIO(zarrpath) as io:
     print('interpolation time: ', inter_end - inter_start)
 
 
-#    print('inter_temps 1:     ', inter_temps[0])
-#    print('inter_temps 2:     ', inter_temps[1])
-#    print('inter_temps 3:     ', inter_temps[2])
-
 
     with diana_lalala.open('w') as dianio:
         dianio.write('[NAME LALALA]\n')
@@ -228,14 +287,18 @@ with ZarrIO(zarrpath) as io:
         dianio.write("   %3.5f  %3.5f\n"%(zarr_coords[indices[0,0],0], zarr_coords[indices[0,0],1]))
         dianio.write("   %3.5f  %3.5f\n"%(zarr_coords[indices[0,1],0], zarr_coords[indices[0,1],1]))
         dianio.write("   %3.5f  %3.5f\n"%(zarr_coords[indices[0,2],0], zarr_coords[indices[0,2],1]))
-        dianio.write("   %3.5f  %3.5f\n"%(obs_coords[9,0], obs_coords[9,1]))
-        dianio.write("   %3.5f  %3.5f\n"%(zarr_coords[indices[9,0],0], zarr_coords[indices[9,0],1]))
-        dianio.write("   %3.5f  %3.5f\n"%(zarr_coords[indices[9,1],0], zarr_coords[indices[9,1],1]))
-        dianio.write("   %3.5f  %3.5f\n"%(zarr_coords[indices[9,2],0], zarr_coords[indices[9,2],1]))
-        dianio.write("   %3.5f  %3.5f\n"%(obs_coords[284,0], obs_coords[284,1]))
-        dianio.write("   %3.5f  %3.5f\n"%(zarr_coords[indices[284,0],0], zarr_coords[indices[284,0],1]))
-        dianio.write("   %3.5f  %3.5f\n"%(zarr_coords[indices[284,1],0], zarr_coords[indices[284,1],1]))
-        dianio.write("   %3.5f  %3.5f\n"%(zarr_coords[indices[284,2],0], zarr_coords[indices[284,2],1]))
+        dianio.write("   %3.5f  %3.5f\n"%(obs_coords[1,0], obs_coords[1,1]))
+        dianio.write("   %3.5f  %3.5f\n"%(zarr_coords[indices[1,0],0], zarr_coords[indices[1,0],1]))
+        dianio.write("   %3.5f  %3.5f\n"%(zarr_coords[indices[1,1],0], zarr_coords[indices[1,1],1]))
+        dianio.write("   %3.5f  %3.5f\n"%(zarr_coords[indices[1,2],0], zarr_coords[indices[1,2],1]))
+        dianio.write("   %3.5f  %3.5f\n"%(obs_coords[2,0], obs_coords[2,1]))
+        dianio.write("   %3.5f  %3.5f\n"%(zarr_coords[indices[2,0],0], zarr_coords[indices[2,0],1]))
+        dianio.write("   %3.5f  %3.5f\n"%(zarr_coords[indices[2,1],0], zarr_coords[indices[2,1],1]))
+        dianio.write("   %3.5f  %3.5f\n"%(zarr_coords[indices[2,2],0], zarr_coords[indices[2,2],1]))
+        dianio.write("   %3.5f  %3.5f\n"%(obs_coords[205,0], obs_coords[205,1]))
+        dianio.write("   %3.5f  %3.5f\n"%(zarr_coords[indices[205,0],0], zarr_coords[indices[205,0],1]))
+        dianio.write("   %3.5f  %3.5f\n"%(zarr_coords[indices[205,1],0], zarr_coords[indices[205,1],1]))
+        dianio.write("   %3.5f  %3.5f\n"%(zarr_coords[indices[205,2],0], zarr_coords[indices[205,2],1]))
 
 
     with diana_zarr.open('w') as dianio:

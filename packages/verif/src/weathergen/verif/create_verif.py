@@ -1,9 +1,14 @@
 import argparse
 import numpy as np
-# from datetime import datetime, timedelta, timezone
+import xarray as xr
+
+from time import time
 
 from pathlib import Path
+from weathergen.common.io import ZarrIO
 from weathergen.verif.verif_interpolator import verif_2D_interpolator
+
+# from datetime import datetime, timedelta, timezone
 
 def readarg():
 
@@ -127,17 +132,56 @@ def main():
     # create verif directories
     create_all_output_dir(streams, variables, outfiles)
 
-    x = [[1,2], [3,4], [5,6], [1,3], [2,6], [3,5], [6,3]]
-    y = [[2,4], [2,5]]
+    with ZarrIO(zarrfile) as zarrio:
 
-    x = np.array(x, dtype='float64')
-    print(x)
-    y = np.array(y, dtype='float64')
-    print(y)
+        item  = zarrio.get_data(sample="0", stream="ERA5", forecast_step="1")
+        xdata = item.prediction.as_xarray()
 
+        print()
+        print('zarr channels: ')
+        print(xdata.channel)
+        print()
 
-    interpolator = verif_2D_interpolator(x, y)
-    interpolator.prepare()
+        obs = xr.open_dataset(obsfile)
+
+        print()
+        print('obs coordinates: ')
+        print(obs)
+        print(obs.sel(time=xdata.valid_time.values[0]).wind_from_direction.values[0:30])
+        print()
+
+        zarr_coords = np.column_stack((xdata.ipoint.lat.values, xdata.ipoint.lon.values))
+
+        obs_lat_lon = obs.sel(time=xdata.valid_time.values[0])[['latitude','longitude']]
+        obs_coords = np.column_stack((obs_lat_lon.latitude.values, obs_lat_lon.longitude.values))
+
+        
+        setup_start = time()
+        interpolator = verif_2D_interpolator(zarr_coords, obs_coords)
+        setup_end = time()
+
+        prep_start = time()
+        interpolator.prepare()
+        prep_end = time()
+
+        zarr_temps = xdata.sel(channel='2t')[0,0,0,:,0].values
+        obs_temps = obs.sel(time=xdata.valid_time.values[0]).air_temperature.values
+
+        inter_start = time()
+        t = interpolator.interpolate(zarr_temps)
+        inter_end = time()
+
+    print()
+    print(t[0])
+    print(t[1])
+    print(t[2])
+    print(t[205])
+
+    print()
+    print('setup time: ', setup_end - setup_start)
+    print(' prep time: ', prep_end - prep_start)
+    print('inter time: ', inter_end - inter_start)
+    print()
 
     print("outputfile template:", outfiles)
 
