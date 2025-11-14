@@ -5,8 +5,14 @@ import xarray as xr
 from time import time
 
 from pathlib import Path
+
 from weathergen.common.io import ZarrIO
+
+from weathergen.verif.diana_io import diana_io
+
 from weathergen.verif.verif_interpolator import verif_2D_interpolator
+from weathergen.verif.verif_interpolator import verif_lat_lon_interpolator
+from weathergen.verif.verif_interpolator import verif_nearest_interpolator
 
 # from datetime import datetime, timedelta, timezone
 
@@ -137,18 +143,7 @@ def main():
         item  = zarrio.get_data(sample="0", stream="ERA5", forecast_step="1")
         xdata = item.prediction.as_xarray()
 
-        print()
-        print('zarr channels: ')
-        print(xdata.channel)
-        print()
-
         obs = xr.open_dataset(obsfile)
-
-        print()
-        print('obs coordinates: ')
-        print(obs)
-        print(obs.sel(time=xdata.valid_time.values[0]).wind_from_direction.values[0:30])
-        print()
 
         zarr_coords = np.column_stack((xdata.ipoint.lat.values, xdata.ipoint.lon.values))
 
@@ -156,6 +151,9 @@ def main():
         obs_coords = np.column_stack((obs_lat_lon.latitude.values, obs_lat_lon.longitude.values))
 
         
+        zarr_temps = xdata.sel(channel='2t')[0,0,0,:,0].values
+        obs_temps = obs.sel(time=xdata.valid_time.values[0]).air_temperature.values
+
         setup_start = time()
         interpolator = verif_2D_interpolator(zarr_coords, obs_coords)
         setup_end = time()
@@ -164,24 +162,71 @@ def main():
         interpolator.prepare()
         prep_end = time()
 
-        zarr_temps = xdata.sel(channel='2t')[0,0,0,:,0].values
-        obs_temps = obs.sel(time=xdata.valid_time.values[0]).air_temperature.values
+        inter_start = time()
+        t = interpolator.interpolate(zarr_temps)
+        inter_end = time()
+
+        print()
+        print(t[0])
+        print(t[1])
+        print(t[2])
+        print(t[205])
+
+        print()
+        print('setup time: ', setup_end - setup_start)
+        print(' prep time: ', prep_end - prep_start)
+        print('inter time: ', inter_end - inter_start)
+
+
+        setup_start = time()
+        interpolator = verif_lat_lon_interpolator(zarr_coords, obs_coords)
+        setup_end = time()
+
+        prep_start = time()
+        interpolator.prepare()
+        prep_end = time()
 
         inter_start = time()
         t = interpolator.interpolate(zarr_temps)
         inter_end = time()
 
-    print()
-    print(t[0])
-    print(t[1])
-    print(t[2])
-    print(t[205])
+        print()
+        print(t[0])
+        print(t[1])
+        print(t[2])
+        print(t[205])
 
-    print()
-    print('setup time: ', setup_end - setup_start)
-    print(' prep time: ', prep_end - prep_start)
-    print('inter time: ', inter_end - inter_start)
-    print()
+        print()
+        print('setup time: ', setup_end - setup_start)
+        print(' prep time: ', prep_end - prep_start)
+        print('inter time: ', inter_end - inter_start)
+
+
+        setup_start = time()
+        interpolator = verif_nearest_interpolator(zarr_coords, obs_coords)
+        setup_end = time()
+
+        prep_start = time()
+        interpolator.prepare()
+        prep_end = time()
+
+        inter_start = time()
+        t = interpolator.interpolate(zarr_temps)
+        inter_end = time()
+
+        print()
+        print(t[0])
+        print(t[1])
+        print(t[2])
+        print(t[205])
+
+        print()
+        print('setup time: ', setup_end - setup_start)
+        print(' prep time: ', prep_end - prep_start)
+        print('inter time: ', inter_end - inter_start)
+
+    Diana = diana_io(Path('wololo.txt'))
+    Diana.write(obs_coords)
 
     print("outputfile template:", outfiles)
 

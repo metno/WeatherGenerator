@@ -1,6 +1,8 @@
 
 import numpy as np
-from scipy.spatial import KDTree, Delaunay
+
+from scipy.spatial     import KDTree, Delaunay
+from scipy.interpolate import LinearNDInterpolator
 
 def convert_coordinates(coords):
     """
@@ -45,37 +47,33 @@ class verif_2D_interpolator(verif_interpolator):
         Do the setup required for interpolation
         """
 
-        self.grid_xyz = convert_coordinates(self.grid_points)
-        self.obs_xyz = convert_coordinates(self.obs_points)
+        grid_xyz = convert_coordinates(self.grid_points)
+        obs_xyz = convert_coordinates(self.obs_points)
 
-        tree = KDTree(self.grid_xyz)
-        _, self.indices = tree.query(self.obs_xyz, k = 5)
+        tree = KDTree(grid_xyz)
+        _, self.indices = tree.query(obs_xyz, k = 5)
 
-        self.compute_weights()
+        self.compute_weights(grid_xyz, obs_xyz)
 
 
-    def compute_weights(self):
+    def compute_weights(self, grid_xyz, obs_xyz):
         """
         Compute the weights of the three nearest grid points
         by computing the barycentric coordinates,
         assuming that the observations are close enough to the plane through the grid points.
         """
 
-        self.weights = np.ndarray((self.obs_xyz.shape[0],3))
-
-        print()
-        print(self.weights.shape)
-        print(type(self.weights))
+        self.weights = np.ndarray((obs_xyz.shape[0],3))
 
         eps = 0.01
 
-        for i, (obs, indix) in enumerate(zip(self.obs_xyz, self.indices)):
+        for i, (obs, indix) in enumerate(zip(obs_xyz, self.indices)):
 
-            AB = self.grid_xyz[indix[1]] - self.grid_xyz[indix[0]]
-            AC = self.grid_xyz[indix[2]] - self.grid_xyz[indix[0]]
-            BC = self.grid_xyz[indix[2]] - self.grid_xyz[indix[1]]
-            AP = obs                     - self.grid_xyz[indix[0]]
-            BP = obs                     - self.grid_xyz[indix[1]]
+            AB = grid_xyz[indix[1]] - grid_xyz[indix[0]]
+            AC = grid_xyz[indix[2]] - grid_xyz[indix[0]]
+            BC = grid_xyz[indix[2]] - grid_xyz[indix[1]]
+            AP = obs                - grid_xyz[indix[0]]
+            BP = obs                - grid_xyz[indix[1]]
 
             area_tot          = np.linalg.norm(np.cross(AB, AC))
             self.weights[i,0] = np.linalg.norm(np.cross(BC, BP))
@@ -87,8 +85,8 @@ class verif_2D_interpolator(verif_interpolator):
 
             indix[2] = indix[3]
 
-            AC = self.grid_xyz[indix[2]] - self.grid_xyz[indix[0]]
-            BC = self.grid_xyz[indix[2]] - self.grid_xyz[indix[1]]
+            AC = grid_xyz[indix[2]] - grid_xyz[indix[0]]
+            BC = grid_xyz[indix[2]] - grid_xyz[indix[1]]
 
             area_tot          = np.linalg.norm(np.cross(AB, AC))
             self.weights[i,0] = np.linalg.norm(np.cross(BC, BP))
@@ -99,8 +97,8 @@ class verif_2D_interpolator(verif_interpolator):
 
             indix[2] = indix[4]
 
-            AC = self.grid_xyz[indix[2]] - self.grid_xyz[indix[0]]
-            BC = self.grid_xyz[indix[2]] - self.grid_xyz[indix[1]]
+            AC = grid_xyz[indix[2]] - grid_xyz[indix[0]]
+            BC = grid_xyz[indix[2]] - grid_xyz[indix[1]]
 
             self.weights[i,0] = np.linalg.norm(np.cross(BC, BP))
             self.weights[i,1] = np.linalg.norm(np.cross(AC, AP))
@@ -115,21 +113,64 @@ class verif_2D_interpolator(verif_interpolator):
 
         wvalues = np.ndarray((self.obs_points.shape[0]))
 
-        print('weight 0: ', self.weights[0,0])
-        print('weight 1: ', self.weights[0,1])
-        print('weight 2: ', self.weights[0,2])
-
-        print('indice 0: ', self.indices[0,0])
-        print('indice 1: ', self.indices[0,1])
-        print('indice 2: ', self.indices[0,2])
-
-        print('value 0:  ', values[self.indices[0,0]])
-        print('value 1:  ', values[self.indices[0,1]])
-        print('value 2:  ', values[self.indices[0,2]])
-
         wvalues[:] = self.weights[:,0]*values[self.indices[:,0]]\
                    + self.weights[:,1]*values[self.indices[:,1]]\
                    + self.weights[:,2]*values[self.indices[:,2]]
 
         return wvalues
+
+
+
+class verif_lat_lon_interpolator(verif_interpolator):
+    """
+    Class that does approximate 2D interpolation
+    """
+
+    def prepare(self):
+        """
+        Do the setup required for interpolation
+        """
+
+        self.triangulation = Delaunay(self.grid_points)
+
+
+    def interpolate(self, values):
+        """
+        Interpolate values to points
+        """
+
+        interpolator = LinearNDInterpolator(self.triangulation, values)
+
+        return interpolator(self.obs_points)
+
+
+class verif_nearest_interpolator(verif_interpolator):
+    """
+    Class that does approximate 2D interpolation
+    """
+
+    def prepare(self):
+        """
+        Do the setup required for interpolation
+        """
+
+        grid_xyz = convert_coordinates(self.grid_points)
+        obs_xyz = convert_coordinates(self.obs_points)
+
+        tree = KDTree(grid_xyz)
+        _, self.indices = tree.query(obs_xyz, k = 1)
+
+
+
+    def interpolate(self, values):
+        """
+        Interpolate values to points
+        """
+
+        wvalues = np.ndarray((self.obs_points.shape[0]))
+
+        wvalues[:] = values[self.indices[:]]
+
+        return wvalues
+
 
