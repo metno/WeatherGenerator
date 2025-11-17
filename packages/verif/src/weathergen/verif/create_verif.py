@@ -54,7 +54,7 @@ def readarg():
         type=str,
         dest='datefromto',
         required=True,
-        help='from to date in format %Y%m%d%H:%Y%m%d%H or %Y%m%d:%Y%m%d, \
+        help='From to date in format %Y%m%d%H:%Y%m%d%H or %Y%m%d:%Y%m%d, \
               excluding the second date for instance 2024010100:2024020200'
     )
 
@@ -84,7 +84,7 @@ def readarg():
         '--method',
         default='2d_interpolation',
         dest="method",
-        choices=['2d_interpolation', 'lat_lon_interpolation'],
+        choices=['2d', 'lat_lon', 'nearest'],
         help='Interpolation method. Default: 2d_interpolation'
     )
 
@@ -109,7 +109,7 @@ def readarg():
 
     args.outfiles = args.outfiles.replace("%d", date_start + '_' + date_end)
 
-    return(args.zarrfile, args.obsfile, args.outfiles, streams, variables, date_start, date_end, args.method)
+    return(args)
 
 def create_all_output_dir(streams, variables, outfiles):
     ''' Create output directories for the verif files
@@ -128,83 +128,56 @@ def create_all_output_dir(streams, variables, outfiles):
 
 def main():
     print("Start creating verif files")
-    zarrfile, obsfile, outfiles, streams, variables, date_start, date_end, method = readarg()
-    print("zarrfile:", zarrfile)
-    print("obsfile:", obsfile)
-    print("start date", date_start)
-    print("end date", date_end)
+    args = readarg()
+    print("zarrfile:", args.zarrfile)
+    print("obsfile:", args.obsfile)
 
 
     # create verif directories
-    create_all_output_dir(streams, variables, outfiles)
+    create_all_output_dir(args.streams, args.variables, args.outfiles)
 
-    with ZarrIO(zarrfile) as zarrio:
+    with ZarrIO(args.zarrfile) as zarrio:
 
         item  = zarrio.get_data(sample="0", stream="ERA5", forecast_step="1")
         xdata = item.prediction.as_xarray()
 
-        obs = xr.open_dataset(obsfile)
+        obs = xr.open_dataset(args.obsfile)
 
         zarr_coords = np.column_stack((xdata.ipoint.lat.values, xdata.ipoint.lon.values))
 
         obs_lat_lon = obs.sel(time=xdata.valid_time.values[0])[['latitude','longitude']]
         obs_coords = np.column_stack((obs_lat_lon.latitude.values, obs_lat_lon.longitude.values))
 
-        
+
         zarr_temps = xdata.sel(channel='2t')[0,0,0,:,0].values
         obs_temps = obs.sel(time=xdata.valid_time.values[0]).air_temperature.values
 
-        setup_start = time()
-        interpolator = verif_2D_interpolator(zarr_coords, obs_coords)
-        setup_end = time()
+        if (args.method == '2d'):
 
-        prep_start = time()
-        interpolator.prepare()
-        prep_end = time()
+            print()
+            print('2D interpolation')
 
-        inter_start = time()
-        t = interpolator.interpolate(zarr_temps)
-        inter_end = time()
+            setup_start = time()
+            interpolator = verif_2D_interpolator(zarr_coords, obs_coords)
+            setup_end = time()
 
-        print()
-        print(t[0])
-        print(t[1])
-        print(t[2])
-        print(t[205])
+        elif (args.method == 'lat_lon'):
 
-        print()
-        print('setup time: ', setup_end - setup_start)
-        print(' prep time: ', prep_end - prep_start)
-        print('inter time: ', inter_end - inter_start)
+            print()
+            print('lat-lon interpolation')
 
+            setup_start = time()
+            interpolator = verif_lat_lon_interpolator(zarr_coords, obs_coords)
+            setup_end = time()
 
-        setup_start = time()
-        interpolator = verif_lat_lon_interpolator(zarr_coords, obs_coords)
-        setup_end = time()
+        elif (args.method == 'nearest'):
 
-        prep_start = time()
-        interpolator.prepare()
-        prep_end = time()
+            print()
+            print('nearest neighbour interpolation')
 
-        inter_start = time()
-        t = interpolator.interpolate(zarr_temps)
-        inter_end = time()
-
-        print()
-        print(t[0])
-        print(t[1])
-        print(t[2])
-        print(t[205])
-
-        print()
-        print('setup time: ', setup_end - setup_start)
-        print(' prep time: ', prep_end - prep_start)
-        print('inter time: ', inter_end - inter_start)
-
-
-        setup_start = time()
-        interpolator = verif_nearest_interpolator(zarr_coords, obs_coords)
-        setup_end = time()
+            setup_start = time()
+            interpolator = verif_nearest_interpolator(zarr_coords, obs_coords)
+            setup_end = time()
 
         prep_start = time()
         interpolator.prepare()
@@ -228,5 +201,5 @@ def main():
     Diana = diana_io(Path('wololo.txt'))
     Diana.write(obs_coords)
 
-    print("outputfile template:", outfiles)
+    print("outputfile template:", args.outfiles)
 
