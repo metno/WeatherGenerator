@@ -1,5 +1,6 @@
 from pathlib import Path
 
+
 class diana_io:
     """
     Class to print locations in Diana format
@@ -12,23 +13,20 @@ class diana_io:
 
         self.path = path
 
-
     def write(self, points):
         """
         Print points to Diana file
         """
 
-        with self.path.open('w') as dianio:
+        with self.path.open("w") as dianio:
+            dianio.write("[NAME ZARRCOORDS]\n")
+            dianio.write("\n")
+            dianio.write("[COLUMNS Lat:r Lon:r]\n")
+            dianio.write("\n")
+            dianio.write("[DATA]\n")
 
-            dianio.write('[NAME ZARRCOORDS]\n')
-            dianio.write('\n')
-            dianio.write('[COLUMNS Lat:r Lon:r]\n')
-            dianio.write('\n')
-            dianio.write('[DATA]\n')
-
-            for (lat,lon) in points:
-                dianio.write("   %3.5f  %3.5f\n"%(lat, lon))
-
+            for lat, lon in points:
+                dianio.write("   %3.5f  %3.5f\n" % (lat, lon))
 
 
 #        dianio.write("   %3.5f  %3.5f\n"%(obs_coords[0,0], obs_coords[0,1]))
