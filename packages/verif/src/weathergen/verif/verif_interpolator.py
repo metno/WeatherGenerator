@@ -9,7 +9,7 @@ def convert_coordinates(coords):
     Convert lat-lon coordinates to cartesian coordinates in a unit box
     """
 
-    xyz_coords = np.ndarray((coords.shape[0],3))
+    xyz_coords = np.ndarray((coords.shape[0],3), dtype='float32')
 
     xyz_coords[:,0] = np.cos(np.pi*coords[:,0]/180.0)*np.cos(np.pi*coords[:,1]/180.0)
     xyz_coords[:,1] = np.cos(np.pi*coords[:,0]/180.0)*np.sin(np.pi*coords[:,1]/180.0)
@@ -63,7 +63,7 @@ class verif_2D_interpolator(verif_interpolator):
         assuming that the observations are close enough to the plane through the grid points.
         """
 
-        self.weights = np.ndarray((obs_xyz.shape[0],3))
+        self.weights = np.ndarray((obs_xyz.shape[0],3), dtype='float32')
 
         eps = 0.01
 
@@ -111,7 +111,7 @@ class verif_2D_interpolator(verif_interpolator):
         Interpolate values to points
         """
 
-        wvalues = np.ndarray((self.obs_points.shape[0]))
+        wvalues = np.ndarray((self.obs_points.shape[0]), dtype='float32')
 
         wvalues[:] = self.weights[:,0]*values[self.indices[:,0]]\
                    + self.weights[:,1]*values[self.indices[:,1]]\

@@ -195,8 +195,77 @@ def main():
 
         print()
         print('setup time: ', setup_end - setup_start)
-        print(' prep time: ', prep_end - prep_start)
+        print(' prep time: ',  prep_end - prep_start)
         print('inter time: ', inter_end - inter_start)
+
+        print()
+        print('xdata')
+        print(xdata)
+        print()
+        print('2t')
+        print(zarr_temps.dtype)
+        print()
+        print()
+
+        print()
+        print('obs')
+        print(obs)
+        print()
+        print()
+
+        verif = xr.open_dataset("/home/rolfhm//lustre/storeB/project/nwp/bris/verification/nordic/1h/202206_202305/mslp/MEPS_2.5km.nc")
+
+        print()
+        print('verif')
+        print(verif)
+        print()
+        print()
+
+        obs_temp = obs.sel(time=xdata.valid_time.values[0])[['air_temperature']]
+
+        print()
+        print('obs temp')
+        print(obs_temp)
+        print(type(obs_temp))
+        print()
+        print('expand')
+        obs_temp = obs_temp.expand_dims({'lead_time':1}, axis=1)
+        obs_temp = obs_temp.assign_coords({'lead_time':xdata.sample.values})
+        print(obs_temp)
+        print()
+        print()
+        print('lead_time:')
+        print(obs_temp.lead_time)
+        print()
+        print('time:')
+        print(obs_temp.time)
+        print()
+        print('location:')
+        print(obs_temp.location)
+        print()
+        print()
+
+
+
+        xt = xr.DataArray(t, dims=['location'], coords={"location":obs.location}, name='fcst')
+
+        print()
+        print('xt')
+        print(xt)
+        print()
+        print(xt.sel(location=18700))
+        print()
+        print(xt.sel(location=40250))
+        print()
+
+        xs = xr.merge([obs_temp, xt])
+        xs = xs.rename({'air_temperature':'obs'})
+
+        print()
+        print()
+        print('xs')
+        print(xs)
+        print()
 
     Diana = diana_io(Path('wololo.txt'))
     Diana.write(obs_coords)
