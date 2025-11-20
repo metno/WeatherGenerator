@@ -138,7 +138,7 @@ class verif_lat_lon_interpolator(verif_interpolator):
 
         interpolator = LinearNDInterpolator(self.triangulation, values)
 
-        return interpolator(self.obs_points)
+        return interpolator(self.obs_points).astype(np.float32)
 
 
 class verif_nearest_interpolator(verif_interpolator):
@@ -162,7 +162,7 @@ class verif_nearest_interpolator(verif_interpolator):
         Interpolate values to points
         """
 
-        wvalues = np.ndarray((self.obs_points.shape[0]))
+        wvalues = np.ndarray((self.obs_points.shape[0]), dtype='float32')
 
         wvalues[:] = values[self.indices[:]]
 

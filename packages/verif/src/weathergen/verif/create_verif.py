@@ -27,7 +27,7 @@ def readarg():
         "--zarr",
         dest="zarrfile",
         required=False,
-        default="/lustre/storeB/project/nwp/weathergen/experiments/era5_o96/validation_epoch00000_rank0000.zarr",
+        default="data/validation_epoch00000_rank0000.zarr",
         help="Zarr file (.zarr)",
     )
 
@@ -36,7 +36,7 @@ def readarg():
         "--obs",
         dest="obsfile",
         required=False,
-        default="/lustre/storeB/project/nwp/weathergen/datasets/metno_observations_v3.nc",
+        default="data/metno_observations_v3.nc",
         help="Observation file (.nc)",
     )
 
@@ -134,28 +134,82 @@ def create_all_output_dir(streams, variables, outfiles):
             pathdir.mkdir(exist_ok=True, parents=True)
 
 
+def generate_time_coordinates(zarrio):
+    """
+    Read samples and steps from ZarrIO object
+    and convert to xarray data objects
+    to be used as coordinates in verrif dataset
+    """
+
+    verif_times = [np.datetime64('nat','h')]*len(zarrio.samples)
+    leadtimes = np.ndarray(len(zarrio.forecast_steps), dtype=np.float32)
+
+
+    for sample in zarrio.samples:
+        item = zarrio.get_data(sample=sample, stream="ERA5", forecast_step=1)
+        verif_times[int(sample)] = item.prediction.as_xarray().valid_time.values[0]
+
+
+    item = zarrio.get_data(sample=zarrio.samples[0], stream="ERA5", forecast_step=zarrio.forecast_steps[0])
+    zerotime = item.prediction.as_xarray().valid_time.values[0]
+
+    xrtime = xr.DataArray(
+        verif_times,
+        name = "time",
+        dims = ["time"],
+        coords = {"time":verif_times},
+        attrs = {"standard_name":"forecast_reference_time"})
+
+
+    for step in zarrio.forecast_steps:
+        item = zarrio.get_data(sample=zarrio.samples[0], stream="ERA5", forecast_step=step)
+        dt = item.prediction.as_xarray().valid_time.values[0] - zerotime
+
+        leadtimes[int(step) - 1] = dt.astype('timedelta64[h]').astype('f4')
+
+    xrleadtime = xr.DataArray(
+        leadtimes,
+        name = "leadtime",
+        dims = ["leadtime"],
+        coords = {"leadtime":leadtimes},
+        attrs = {"units":"hour"})
+
+    return xrtime, xrleadtime
+
+
 def main():
     print("Start creating verif files")
     args = readarg()
-    print("zarrfile:", args.zarrfile)
+    print("zarrfile:", args.zarrfile, args.zarrfile)
     print("obsfile:", args.obsfile)
+    print("outputfile template:", args.outfiles)
 
     # create verif directories
     create_all_output_dir(args.streams, args.variables, args.outfiles)
 
     with ZarrIO(args.zarrfile) as zarrio:
-        item = zarrio.get_data(sample="0", stream="ERA5", forecast_step="1")
+
+        print()
+        print('zarrio.samples:        ', zarrio.samples, type(zarrio.samples))
+        print('zarrio.streams:        ', zarrio.streams, type(zarrio.streams))
+        print('zarrio.forecast_steps: ', zarrio.forecast_steps, type(zarrio.forecast_steps))
+        print()
+
+        gt_start = time()
+        xrtime, xrleadtime = generate_time_coordinates(zarrio)
+        gt_end = time()
+
+        zc_start = time()
+        item = zarrio.get_data(sample=0, stream="ERA5", forecast_step=1)
         xdata = item.prediction.as_xarray()
-
-        obs = xr.open_dataset(args.obsfile)
-
         zarr_coords = np.column_stack((xdata.ipoint.lat.values, xdata.ipoint.lon.values))
+        zc_end = time()
 
+        oc_start = time()
+        obs = xr.open_dataset(args.obsfile)
         obs_lat_lon = obs.sel(time=xdata.valid_time.values[0])[["latitude", "longitude"]]
         obs_coords = np.column_stack((obs_lat_lon.latitude.values, obs_lat_lon.longitude.values))
-
-        zarr_temps = xdata.sel(channel="2t")[0, 0, 0, :, 0].values
-        obs_temps = obs.sel(time=xdata.valid_time.values[0]).air_temperature.values
+        oc_end = time()
 
         if args.method == "2d":
             print()
@@ -185,6 +239,9 @@ def main():
         interpolator.prepare()
         prep_end = time()
 
+
+        zarr_temps = xdata.sel(channel="2t")[0, 0, 0, :, 0].values
+
         inter_start = time()
         t = interpolator.interpolate(zarr_temps)
         inter_end = time()
@@ -196,80 +253,31 @@ def main():
         print(t[205])
 
         print()
+        print("   gt time: ", gt_end - gt_start)
+        print("   zc time: ", zc_end - zc_start)
+        print("   oc time: ", oc_end - oc_start)
         print("setup time: ", setup_end - setup_start)
         print(" prep time: ", prep_end - prep_start)
         print("inter time: ", inter_end - inter_start)
-
-        print()
-        print("xdata")
-        print(xdata)
-        print()
-        print("2t")
-        print(zarr_temps.dtype)
-        print()
         print()
 
-        print()
-        print("obs")
-        print(obs)
-        print()
-        print()
+        obs_temps = obs.sel(time=xdata.valid_time.values[0]).air_temperature.values
 
-        verif = xr.open_dataset(
-            "/home/rolfhm//lustre/storeB/project/nwp/bris/verification/nordic/1h/202206_202305/mslp/MEPS_2.5km.nc"
-        )
+        verif = xr.open_dataset("data/MEPS_2.5km.nc")
 
         print()
-        print("verif")
         print(verif)
-        print()
         print()
 
         obs_temp = obs.sel(time=xdata.valid_time.values[0])[["air_temperature"]]
 
-        print()
-        print("obs temp")
-        print(obs_temp)
-        print(type(obs_temp))
-        print()
-        print("expand")
-        obs_temp = obs_temp.expand_dims({"lead_time": 1}, axis=1)
-        obs_temp = obs_temp.assign_coords({"lead_time": xdata.sample.values})
-        print(obs_temp)
-        print()
-        print()
-        print("lead_time:")
-        print(obs_temp.lead_time)
-        print()
-        print("time:")
-        print(obs_temp.time)
-        print()
-        print("location:")
-        print(obs_temp.location)
-        print()
-        print()
 
         xt = xr.DataArray(t, dims=["location"], coords={"location": obs.location}, name="fcst")
-
-        print()
-        print("xt")
-        print(xt)
-        print()
-        print(xt.sel(location=18700))
-        print()
-        print(xt.sel(location=40250))
-        print()
 
         xs = xr.merge([obs_temp, xt])
         xs = xs.rename({"air_temperature": "obs"})
 
-        print()
-        print()
-        print("xs")
-        print(xs)
-        print()
 
     Diana = diana_io(Path("wololo.txt"))
     Diana.write(obs_coords)
 
-    print("outputfile template:", args.outfiles)
