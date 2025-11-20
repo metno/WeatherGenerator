@@ -75,7 +75,7 @@ def parse_args(args: list) -> argparse.Namespace:
         "--format",
         dest="output_format",
         type=str,
-        choices=["netcdf", "grib", "quaver"],
+        choices=["metno", "netcdf", "grib", "quaver"],
         help="Output file format (currently only netcdf supported)",
         required=True,
     )
@@ -83,7 +83,7 @@ def parse_args(args: list) -> argparse.Namespace:
     parser.add_argument(
         "--stream",
         type=str,
-        choices=["ERA5"],
+        choices=["ERA5", "CERRA"],
         help="Stream name to retrieve data for",
         required=True,
     )
@@ -153,6 +153,21 @@ def parse_args(args: list) -> argparse.Namespace:
         "--expver",
         type=str,
         help="Expver to include in the output filename (i.e. 'iuoo')",
+        required=False,
+    )
+
+    parser.add_argument(
+        "--proj4_str",
+        type=str,
+        help="Projection string of the output grid",
+        required=False,
+    )
+
+    parser.add_argument(
+        "--field_shape",
+        type=int,
+        help="Field shape of the output grid (num_y, num_x)",
+        nargs=2,
         required=False,
     )
 

@@ -70,6 +70,8 @@ def _get_file_extension(output_format: str) -> str:
         return "nc"
     elif output_format == "quaver":
         return "grib"
+    elif output_format == "metno":
+        return "nc"
     else:
         raise ValueError(
             f"Unsupported output format: {output_format},"
