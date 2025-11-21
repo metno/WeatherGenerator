@@ -148,9 +148,9 @@ def generate_time_coordinates(zarrio):
 
     # Initial times are stored as numpy.datetime64 objects in verif
     # Get the valid time of the first step for each sample
-    verif_times = [np.datetime64('nat','h')]*len(zarrio.samples)
+    verif_times = [np.datetime64("nat","h")]*len(zarrio.samples)
     for sample in zarrio.samples:
-        item = zarrio.get_data(sample=sample, stream="ERA5", forecast_step='1')
+        item = zarrio.get_data(sample=sample, stream="ERA5", forecast_step="1")
         verif_times[int(sample)] = (item.prediction.as_xarray().valid_time.values[0] - dt)
 
     xrtime = xr.DataArray(
@@ -160,7 +160,7 @@ def generate_time_coordinates(zarrio):
         coords = {"time":verif_times},
         attrs = {"standard_name":"forecast_reference_time"})
 
-    dt = dt.astype('timedelta64[h]')
+    dt = dt.astype("timedelta64[h]")
 
     # Lead times are stored as float32 in verif
     # Assume all time steps are the same,
@@ -238,11 +238,11 @@ def main():
         interpolator.prepare()
         prep_end = time()
 
-        lat_array = obs.latitude.astype('float32')
-        lat_array.name = 'lat'
-        lon_array = obs.longitude.astype('float32')
-        lon_array.name = 'lon'
-        alt_array = obs.altitude.astype('float32')
+        lat_array = obs.latitude.astype("float32")
+        lat_array.name = "lat"
+        lon_array = obs.longitude.astype("float32")
+        lon_array.name = "lon"
+        alt_array = obs.altitude.astype("float32")
 
         vmap = {"2t":"air_temperature"}
 
@@ -295,7 +295,7 @@ def main():
             print()
             print("outfile: ", outfile)
             print()
-            merged.to_netcdf(outfile, encoding={'time': {'units': 'seconds since 1970-01-01 00:00:00'}})
+            merged.to_netcdf(outfile, encoding={"time": {"units": "seconds since 1970-01-01 00:00:00"}})
 
         inter_end = time()
 
@@ -309,7 +309,7 @@ def main():
         print()
 
         print()
-        print('merged')
+        print("merged")
         print(merged)
         print()
 
