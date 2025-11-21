@@ -246,14 +246,18 @@ def main():
 
         lat_array = obs.latitude.astype('float32')
         lat_array.name = 'lat'
-        lon_array = obs.latitude.astype('float32')
+        lon_array = obs.longitude.astype('float32')
         lon_array.name = 'lon'
         alt_array = obs.altitude.astype('float32')
 
         vmap = {"2t":"air_temperature"}
 
         print()
-        print(xrtime)
+        print('lat array: ')
+        print(lat_array)
+        print()
+        print('lon array: ')
+        print(lon_array)
         print()
 
         inter_start = time()
