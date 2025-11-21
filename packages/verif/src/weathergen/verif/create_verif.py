@@ -44,7 +44,7 @@ def readarg():
         "-o",
         "--output",
         dest="outfiles",
-        default="output/verif/%S/%V/verif_file_%d.nc",
+        default="output/verif/%S/%V/verif_%S_%V_%M.nc",
         required=False,
         help="Template for the output nc filenames, default will be to create output/verif/%S/%V repertories where \
               %S, %V, %d are replaced by the stream, variable and date",
@@ -192,12 +192,6 @@ def main():
 
     with ZarrIO(args.zarrfile) as zarrio:
 
-        print()
-        print('zarrio.samples:        ', zarrio.samples, type(zarrio.samples))
-        print('zarrio.streams:        ', zarrio.streams, type(zarrio.streams))
-        print('zarrio.forecast_steps: ', zarrio.forecast_steps, type(zarrio.forecast_steps))
-        print()
-
         gt_start = time()
         xrtime, xrleadtime = generate_time_coordinates(zarrio)
         gt_end = time()
@@ -252,18 +246,10 @@ def main():
 
         vmap = {"2t":"air_temperature"}
 
-        print()
-        print('lat array: ')
-        print(lat_array)
-        print()
-        print('lon array: ')
-        print(lon_array)
-        print()
-
         inter_start = time()
         for v in args.variables:
 
-            outfile = args.outfiles.replace("%S", args.stream).replace("%V", v)
+            outfile = args.outfiles.replace("%S", args.stream).replace("%V", v).replace("%M", args.method)
 
             fcstdata = np.ndarray((len(zarrio.samples), len(zarrio.forecast_steps), obs_size), dtype=np.float32)
             obsdata = np.ndarray(fcstdata.shape, dtype=np.float32)
@@ -314,17 +300,6 @@ def main():
         inter_end = time()
 
         print()
-        print(fcstdata[0,0,0])
-        print(obsdata[0,0,0])
-        print(fcstdata[0,0,1])
-        print(obsdata[0,0,1])
-        print(fcstdata[0,0,2])
-        print(obsdata[0,0,2])
-        print(fcstdata[0,0,205])
-        print(obsdata[0,0,205])
-        print()
-
-        print()
         print("   gt time: ", gt_end - gt_start)
         print("   zc time: ", zc_end - zc_start)
         print("   oc time: ", oc_end - oc_start)
@@ -333,21 +308,10 @@ def main():
         print("inter time: ", inter_end - inter_start)
         print()
 
-        verif = xr.open_dataset("data/MEPS_2.5km.nc")
-
-        renamedict={'latitude':'lat', 'longitude':'lon'}
-
         print()
         print('merged')
         print(merged)
         print()
-
-        print()
-        print('verif')
-        print(verif)
-        print()
-
-
 
     Diana = diana_io(Path("wololo.txt"))
     Diana.write(obs_coords)
