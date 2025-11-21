@@ -26,8 +26,7 @@ def readarg():
         "-z",
         "--zarr",
         dest="zarrfile",
-        required=False,
-        default="data/validation_epoch00000_rank0000.zarr",
+        required=True,
         help="Zarr file (.zarr)",
     )
 
@@ -35,7 +34,7 @@ def readarg():
         "-b",
         "--obs",
         dest="obsfile",
-        required=False,
+        required=True,
         default="data/metno_observations_v3.nc",
         help="Observation file (.nc)",
     )
@@ -47,7 +46,7 @@ def readarg():
         default="output/verif/%S/%V/verif_%S_%V_%M.nc",
         required=False,
         help="Template for the output nc filenames, default will be to create output/verif/%S/%V repertories where \
-              %S, %V, %d are replaced by the stream, variable and date",
+              %S, %V, %d are replaced by the streams, variable and date",
     )
 
     parser.add_argument(
@@ -55,7 +54,8 @@ def readarg():
         "--date",
         type=str,
         dest="datefromto",
-        required=True,
+        required=False,
+        default=None,
         help="From to date in format %Y%m%d%H:%Y%m%d%H or %Y%m%d:%Y%m%d, \
               excluding the second date for instance 2024010100:2024020200",
     )
@@ -74,17 +74,17 @@ def readarg():
 
     parser.add_argument(
         "-s",
-        "--stream",
-        default="ERA5",
-        dest="stream",
+        "--streams",
+        default=None,
+        dest="streams",
         nargs="*",
-        help="Do verif for this stream. Default: ERA5",
+        help="Do verif for this streams. Default: Infer from .zarr file",
     )
 
     parser.add_argument(
         "-m",
         "--method",
-        default="2d_interpolation",
+        default="2d",
         dest="method",
         choices=["2d", "lat_lon", "nearest"],
         help="Interpolation method. Default: 2d_interpolation",
@@ -92,56 +92,38 @@ def readarg():
 
     args = parser.parse_args()
 
-    # create output directories
-    date_start, date_end = args.datefromto.split(":")
-    print("start date", date_start)
-    print("end date", date_end)
-    if len(date_start) == 8:
-        date_start = date_start + "00"
-    if len(date_start) != 10:
-        raise ValueError(
-            f"date not in the right format expect date1:date2 as\
-                          %Y%m%d%H:%Y%m%d%H or %Y%m%d:%Y%m%d, got date1 as {date_start}"
-        )
-    if len(date_end) == 8:
-        date_end = date_end + "00"
-    if len(date_end) != 10:
-        raise ValueError(
-            f"date not in the right format expect date1:date2 as\
-                          %Y%m%d%H:%Y%m%d%H% or %Y%m%d:%Y%m%d, got date2 as {date_end}"
-        )
-
-    args.outfiles = args.outfiles.replace("%d", date_start + "_" + date_end)
-
     return args
 
 
-def create_all_output_dir(stream, variables, outfiles):
-    """Create output directories for the verif files
+def create_output_paths(stream, variable, outfiles, method):
+    """
+    Create output directories for the verif files
+    and return path to output file
     Args:
-        stream (list[string])
+        stream (string)
         variables (list[string])
         outfiles (string): template for the output files
     Outputs:
         None
     """
-    for variable in variables:
-        pathdir = Path(outfiles.replace("%S", stream).replace("%V", variable)).parent
-        print(f"If not existing create directory {pathdir}")
-        pathdir.mkdir(exist_ok=True, parents=True)
+    outfile = Path(outfiles.replace("%S", stream).replace("%V", variable).replace("%M", method))
+    pathdir = outfile.parent
+    print(f"If not existing, create directory {pathdir}")
+    pathdir.mkdir(exist_ok=True, parents=True)
+    return outfile
 
 
-def generate_time_coordinates(zarrio):
+def generate_time_coordinates(zarrio, stream):
     """
     Read samples and steps from ZarrIO object
     and convert to xarray data objects
     to be used as coordinates in verrif dataset
     """
 
-    
-    item = zarrio.get_data(sample=0, stream="ERA5", forecast_step=1)
+
+    item = zarrio.get_data(sample=0, stream=stream, forecast_step=1)
     onetime = item.prediction.as_xarray().valid_time.values[0]
-    item = zarrio.get_data(sample=0, stream="ERA5", forecast_step=2)
+    item = zarrio.get_data(sample=0, stream=stream, forecast_step=2)
     twotime = item.prediction.as_xarray().valid_time.values[0]
 
     dt = (twotime - onetime)
@@ -150,7 +132,7 @@ def generate_time_coordinates(zarrio):
     # Get the valid time of the first step for each sample
     verif_times = [np.datetime64("nat","h")]*len(zarrio.samples)
     for sample in zarrio.samples:
-        item = zarrio.get_data(sample=sample, stream="ERA5", forecast_step="1")
+        item = zarrio.get_data(sample=sample, stream=stream, forecast_step="1")
         verif_times[int(sample)] = (item.prediction.as_xarray().valid_time.values[0] - dt)
 
     xrtime = xr.DataArray(
@@ -178,131 +160,171 @@ def generate_time_coordinates(zarrio):
 
     return xrtime, xrleadtime
 
+def get_streams(zarrio, arg_streams):
+    """
+    Determine the stream,
+    either by getting streams from argument and check if they are in the zarr file
+    or just use all the streams in zarrio
+    Args:
+        zarrio: ZarrIO object
+        arg_streams: (list[string])
+    Outputs:
+        streams: (list[string])
+    """
+    if arg_streams:
+        for stream in arg_streams:
+            if stream not in zarrio.streams:
+                raise ValueError(
+                    f'Stream {stream} is not present in .zarr file. zarrio.streams: {zarrio.streams}'
+                )
+        return arg_streams
+    else:
+        return zarrio.streams
+
+def get_obs_coordinates(obs):
+    """
+    Extract latitude, longitude and altitude
+    from observation dataset
+    Args:
+        obs: Dataset
+    Outputs:
+        lat: DataArray
+        lon: DataArray
+        alt: DataArray
+    """
+
+    lat = obs.latitude.astype("float32")
+    lat.name = "lat"
+
+    lon = obs.longitude.astype("float32")
+    lon.name = "lon"
+
+    alt = obs.altitude.astype("float32")
+
+    return lat, lon, alt
+
 
 def main():
+
     print("Start creating verif files")
+
     args = readarg()
-    print("zarrfile:", args.zarrfile, args.zarrfile)
+
+    print("zarrfile:", args.zarrfile)
     print("obsfile:", args.obsfile)
     print("outputfile template:", args.outfiles)
-    print("stream:", args.stream)
 
-    # create verif directories
-    create_all_output_dir(args.stream, args.variables, args.outfiles)
+
+    obs = xr.open_dataset(args.obsfile)
+
+    lat, lon, alt = get_obs_coordinates(obs)
+
+    obs_coords = np.column_stack((lat.values, lon.values))
 
     with ZarrIO(args.zarrfile) as zarrio:
 
-        gt_start = time()
-        xrtime, xrleadtime = generate_time_coordinates(zarrio)
-        gt_end = time()
+        streams = get_streams(zarrio, args.streams)
+        print("streams:", streams)
 
-        zc_start = time()
-        item = zarrio.get_data(sample=0, stream=args.stream, forecast_step=1)
-        xdata = item.prediction.as_xarray()
-        zarr_coords = np.column_stack((xdata.ipoint.lat.values, xdata.ipoint.lon.values))
-        zc_end = time()
+        for stream in streams:
 
-        oc_start = time()
-        obs = xr.open_dataset(args.obsfile)
-        obs_lat_lon = obs.sel(time=xdata.valid_time.values[0])[["latitude", "longitude"]]
-        obs_coords = np.column_stack((obs_lat_lon.latitude.values, obs_lat_lon.longitude.values))
-        oc_end = time()
+            print(stream)
 
-        obs_size = obs_coords.shape[0]
+            xrtime, xrleadtime = generate_time_coordinates(zarrio, stream)
 
-        if args.method == "2d":
-            print()
-            print("2D interpolation")
-
-            setup_start = time()
-            interpolator = verif_2D_interpolator(zarr_coords, obs_coords)
-            setup_end = time()
-
-        elif args.method == "lat_lon":
-            print()
-            print("lat-lon interpolation")
-
-            setup_start = time()
-            interpolator = verif_lat_lon_interpolator(zarr_coords, obs_coords)
-            setup_end = time()
-
-        elif args.method == "nearest":
-            print()
-            print("nearest neighbour interpolation")
-
-            setup_start = time()
-            interpolator = verif_nearest_interpolator(zarr_coords, obs_coords)
-            setup_end = time()
-
-        prep_start = time()
-        interpolator.prepare()
-        prep_end = time()
-
-        lat_array = obs.latitude.astype("float32")
-        lat_array.name = "lat"
-        lon_array = obs.longitude.astype("float32")
-        lon_array.name = "lon"
-        alt_array = obs.altitude.astype("float32")
-
-        vmap = {"2t":"air_temperature"}
-
-        inter_start = time()
-        for v in args.variables:
-
-            outfile = args.outfiles.replace("%S", args.stream).replace("%V", v).replace("%M", args.method)
-
-            fcstdata = np.ndarray((len(zarrio.samples), len(zarrio.forecast_steps), obs_size), dtype=np.float32)
-            obsdata = np.ndarray(fcstdata.shape, dtype=np.float32)
-
-            for sample in range(len(zarrio.samples)):
-                for step in range(len(zarrio.forecast_steps)):
-                    item = zarrio.get_data(sample=sample, stream=args.stream, forecast_step=step+1)
-                    xdata = item.prediction.as_xarray()
-                    fcstdata[sample,step,:] = interpolator.interpolate(xdata.sel(sample=sample,
-                                                                                 stream=args.stream,
-                                                                                 forecast_step=step+1,
-                                                                                 channel=v, 
-                                                                                 ens=0).values)
-
-                    obsdata[sample, step, :] = obs.data_vars["air_temperature"].sel(time=xdata.valid_time.values[0])
+            item = zarrio.get_data(sample=0, stream=stream, forecast_step=1)
+            xdata = item.prediction.as_xarray()
+            zarr_coords = np.column_stack((xdata.ipoint.lat.values, xdata.ipoint.lon.values))
 
 
-            temp_attrs = {
-                "long_name":"2 meter temperature",
-                "units":"K",
-                "Conventions":"verif_1.0.0"
+            if args.method == "2d":
+                print()
+                print("2D interpolation")
+
+                setup_start = time()
+                interpolator = verif_2D_interpolator(zarr_coords, obs_coords)
+                setup_end = time()
+
+            elif args.method == "lat_lon":
+                print()
+                print("lat-lon interpolation")
+
+                setup_start = time()
+                interpolator = verif_lat_lon_interpolator(zarr_coords, obs_coords)
+                setup_end = time()
+
+            elif args.method == "nearest":
+                print()
+                print("nearest neighbour interpolation")
+
+                setup_start = time()
+                interpolator = verif_nearest_interpolator(zarr_coords, obs_coords)
+                setup_end = time()
+
+            prep_start = time()
+            interpolator.prepare()
+            prep_end = time()
+
+            vmap = {"2t":"air_temperature"}
+
+            attrs_map = {
+            "2t":
+                {
+                    "long_name":"2 meter temperature",
+                    "units":"K",
+                    "Conventions":"verif_1.0.0"
+                }
             }
 
-            xrobsdata = xr.DataArray(obsdata, 
-                                     dims=["time", "leadtime", "location"], 
-                                     coords={"time": xrtime, "leadtime": xrleadtime,"location": obs.location}, 
-                                     name="obs",
-                                     attrs=temp_attrs)
-
-            xrfcstdata = xr.DataArray(fcstdata, 
-                                      dims=["time", "leadtime", "location"], 
-                                      coords={"time": xrtime, "leadtime": xrleadtime,"location": obs.location}, 
-                                      name="fcst",
-                                      attrs=temp_attrs)
+            inter_start = time()
+            for v in args.variables:
 
 
-            merged = xr.merge([xrfcstdata,
-                               xrobsdata, 
-                               lat_array, 
-                               lon_array, 
-                               alt_array])
+                fcstdata = np.ndarray((len(zarrio.samples), len(zarrio.forecast_steps), obs.location.shape[0]), dtype=np.float32)
+                obsdata = np.ndarray(fcstdata.shape, dtype=np.float32)
 
-            print()
-            print("outfile: ", outfile)
-            print()
-            merged.to_netcdf(outfile, encoding={"time": {"units": "seconds since 1970-01-01 00:00:00"}})
+                for sample in range(len(zarrio.samples)):
+                    for step in range(len(zarrio.forecast_steps)):
+                        item = zarrio.get_data(sample=sample, stream=stream, forecast_step=step+1)
+                        xdata = item.prediction.as_xarray()
+                        fcstdata[sample,step,:] = interpolator.interpolate(xdata.sel(sample=sample,
+                                                                                     stream=stream,
+                                                                                     forecast_step=step+1,
+                                                                                     channel=v,
+                                                                                     ens=0).values)
 
-        inter_end = time()
+                        obsdata[sample, step, :] = obs.data_vars[vmap[v]].sel(time=xdata.valid_time.values[0])
+
+
+                xrobsdata = xr.DataArray(obsdata,
+                                         dims=["time", "leadtime", "location"],
+                                         coords={"time": xrtime, "leadtime": xrleadtime,"location": obs.location},
+                                         name="obs",
+                                         attrs=attrs_map[v])
+
+                xrfcstdata = xr.DataArray(fcstdata,
+                                          dims=["time", "leadtime", "location"],
+                                          coords={"time": xrtime, "leadtime": xrleadtime,"location": obs.location},
+                                          name="fcst",
+                                          attrs=attrs_map[v])
+
+
+                merged = xr.merge([xrfcstdata,
+                                   xrobsdata,
+                                   lat,
+                                   lon,
+                                   alt])
+
+                outfile = create_output_paths(stream, v, args.outfiles, args.method)
+
+                print()
+                print("outfile: ", outfile)
+                print()
+                merged.to_netcdf(outfile, encoding={"time": {"units": "seconds since 1970-01-01 00:00:00"}})
+
+            inter_end = time()
 
         print()
-        print("   gt time: ", gt_end - gt_start)
-        print("   zc time: ", zc_end - zc_start)
-        print("   oc time: ", oc_end - oc_start)
         print("setup time: ", setup_end - setup_start)
         print(" prep time: ", prep_end - prep_start)
         print("inter time: ", inter_end - inter_start)
