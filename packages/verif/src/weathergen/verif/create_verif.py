@@ -240,26 +240,17 @@ def main():
             if args.method == "2d":
                 print()
                 print("2D interpolation")
-
-                setup_start = time()
                 interpolator = verif_2D_interpolator(zarr_coords, obs_coords)
-                setup_end = time()
 
             elif args.method == "lat_lon":
                 print()
                 print("lat-lon interpolation")
-
-                setup_start = time()
                 interpolator = verif_lat_lon_interpolator(zarr_coords, obs_coords)
-                setup_end = time()
 
             elif args.method == "nearest":
                 print()
                 print("nearest neighbour interpolation")
-
-                setup_start = time()
                 interpolator = verif_nearest_interpolator(zarr_coords, obs_coords)
-                setup_end = time()
 
             prep_start = time()
             interpolator.prepare()
@@ -325,7 +316,6 @@ def main():
             inter_end = time()
 
         print()
-        print("setup time: ", setup_end - setup_start)
         print(" prep time: ", prep_end - prep_start)
         print("inter time: ", inter_end - inter_start)
         print()
