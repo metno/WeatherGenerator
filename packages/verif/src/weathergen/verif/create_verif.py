@@ -8,6 +8,8 @@ from pathlib import Path
 
 from weathergen.common.io import ZarrIO
 
+from weathergen.evaluate.score import Scores
+
 from weathergen.verif.diana_io import diana_io
 
 from weathergen.verif.verif_interpolator import verif_2D_interpolator
@@ -261,6 +263,9 @@ def main():
         streams = get_streams(zarrio, args.streams)
         print("streams:", streams)
 
+
+        t_start = time()
+
         for stream in streams:
 
             print(stream)
@@ -299,6 +304,7 @@ def main():
                 }
             }
 
+            
             for v in args.variables:
 
                 fcstdata = np.ndarray((len(zarrio.samples), len(zarrio.forecast_steps), obs.location.shape[0]), dtype=np.float32)
@@ -308,19 +314,18 @@ def main():
                     for step in range(len(zarrio.forecast_steps)):
 
                         item = zarrio.get_data(sample=sample, stream=stream, forecast_step=step+1)
-                        xdata = item.prediction.as_xarray()
+                        newdata = item.prediction.as_xarray()
 
-                        pointmap = get_point_map(xdata, zarr_coords)
+                        ydata = Scores.sort_by_coords(newdata, xdata)
 
-                        fcstdata[sample,step,:] = interpolator.interpolate(xdata.sel(sample=sample,
+                        fcstdata[sample,step,:] = interpolator.interpolate(ydata.sel(sample=sample,
                                                                                      stream=stream,
                                                                                      forecast_step=step+1,
                                                                                      channel=v,
-                                                                                     ens=0).values,
-                                                                           pointmap)
+                                                                                     ens=0).values)
 
 
-                        obsdata[sample, step, :] = obs.data_vars[vmap[v]].sel(time=xdata.valid_time.values[0])
+                        obsdata[sample, step, :] = obs.data_vars[vmap[v]].sel(time=ydata.valid_time.values[0])
 
 
                 xrobsdata = xr.DataArray(obsdata,
@@ -348,6 +353,12 @@ def main():
                 print("outfile: ", outfile)
                 print()
                 merged.to_netcdf(outfile, encoding={"time": {"units": "seconds since 1970-01-01 00:00:00"}})
+
+        t_end = time()
+
+        print()
+        print("all the time: ", t_end - t_start)
+        print()
 
         print()
         print("merged")
