@@ -103,18 +103,25 @@ class verif_2D_interpolator(verif_interpolator):
 
         self.weights = self.weights / self.weights.sum(axis=1)[:, np.newaxis]
 
-    def interpolate(self, values):
+    def interpolate(self, values, intmap = None):
         """
         Interpolate values to points
         """
 
         wvalues = np.ndarray((self.obs_points.shape[0]), dtype="float32")
 
-        wvalues[:] = (
-            self.weights[:, 0] * values[self.indices[:, 0]]
-            + self.weights[:, 1] * values[self.indices[:, 1]]
-            + self.weights[:, 2] * values[self.indices[:, 2]]
-        )
+        if intmap is None:
+            wvalues[:] = (
+                self.weights[:, 0] * values[self.indices[:, 0]]
+                + self.weights[:, 1] * values[self.indices[:, 1]]
+                + self.weights[:, 2] * values[self.indices[:, 2]]
+            )
+        else:
+            wvalues[:] = (
+                self.weights[:, 0] * values[intmap[self.indices[:, 0]]]
+                + self.weights[:, 1] * values[intmap[self.indices[:, 1]]]
+                + self.weights[:, 2] * values[intmap[self.indices[:, 2]]]
+            )
 
         return wvalues
 
@@ -131,12 +138,20 @@ class verif_lat_lon_interpolator(verif_interpolator):
 
         self.triangulation = Delaunay(self.grid_points)
 
-    def interpolate(self, values):
+    def interpolate(self, values, intmap):
         """
         Interpolate values to points
         """
 
-        interpolator = LinearNDInterpolator(self.triangulation, values)
+        newvalues = np.empty_like(values)
+
+        if intmap is None:
+            newvalues = values
+        else:
+            for i in range(len(values)):
+                newvalues[i] = values[intmap[i]]
+
+        interpolator = LinearNDInterpolator(self.triangulation, newvalues)
 
         return interpolator(self.obs_points).astype(np.float32)
 
@@ -157,13 +172,16 @@ class verif_nearest_interpolator(verif_interpolator):
         tree = KDTree(grid_xyz)
         _, self.indices = tree.query(obs_xyz, k=1)
 
-    def interpolate(self, values):
+    def interpolate(self, values, intmap = None):
         """
         Interpolate values to points
         """
 
         wvalues = np.ndarray((self.obs_points.shape[0]), dtype='float32')
 
-        wvalues[:] = values[self.indices[:]]
+        if intmap is None:
+            wvalues[:] = values[self.indices[:]]
+        else:
+            wvalues[:] = values[intmap[self.indices[:]]]
 
         return wvalues

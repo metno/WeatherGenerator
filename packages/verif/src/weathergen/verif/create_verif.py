@@ -204,6 +204,39 @@ def get_obs_coordinates(obs):
     return lat, lon, alt
 
 
+def get_point_map(xdata, old_coords):
+    """
+    Map point to point using lat-lon
+    """
+
+    new_coords = np.column_stack((xdata.ipoint.lat.values, xdata.ipoint.lon.values))
+
+    pointmap = np.ndarray(old_coords.shape[0], dtype=np.int32)
+
+    oldlist = list(map(tuple, old_coords.tolist()))
+    newlist = list(map(tuple, new_coords.tolist()))
+
+    n = old_coords.shape[0]
+
+    for i in range(len(pointmap)):
+
+        ni = max(0, i - 9)
+        nf = min(n, i + 10)
+
+        try:
+            pointmap[i] = ni + newlist[ni:nf].index(oldlist[i])
+        except:
+            print("             i: ", i)
+            print("            ni: ", ni)
+            print("            nf: ", nf)
+            print("    oldlist[i]: ", oldlist[i])
+            print("newlist[ni:nf]: ", newlist[ni:nf])
+            print()
+            exit()
+
+    return pointmap
+
+
 def main():
 
     print("Start creating verif files")
@@ -216,6 +249,8 @@ def main():
 
 
     obs = xr.open_dataset(args.obsfile)
+
+    print(obs)
 
     lat, lon, alt = get_obs_coordinates(obs)
 
@@ -234,9 +269,8 @@ def main():
 
             item = zarrio.get_data(sample=0, stream=stream, forecast_step=1)
             xdata = item.prediction.as_xarray()
+
             zarr_coords = np.column_stack((xdata.ipoint.lat.values, xdata.ipoint.lon.values))
-
-
             if args.method == "2d":
                 print()
                 print("2D interpolation")
@@ -252,9 +286,7 @@ def main():
                 print("nearest neighbour interpolation")
                 interpolator = verif_nearest_interpolator(zarr_coords, obs_coords)
 
-            prep_start = time()
             interpolator.prepare()
-            prep_end = time()
 
             vmap = {"2t":"air_temperature"}
 
@@ -267,22 +299,26 @@ def main():
                 }
             }
 
-            inter_start = time()
             for v in args.variables:
-
 
                 fcstdata = np.ndarray((len(zarrio.samples), len(zarrio.forecast_steps), obs.location.shape[0]), dtype=np.float32)
                 obsdata = np.ndarray(fcstdata.shape, dtype=np.float32)
 
                 for sample in range(len(zarrio.samples)):
                     for step in range(len(zarrio.forecast_steps)):
+
                         item = zarrio.get_data(sample=sample, stream=stream, forecast_step=step+1)
                         xdata = item.prediction.as_xarray()
+
+                        pointmap = get_point_map(xdata, zarr_coords)
+
                         fcstdata[sample,step,:] = interpolator.interpolate(xdata.sel(sample=sample,
                                                                                      stream=stream,
                                                                                      forecast_step=step+1,
                                                                                      channel=v,
-                                                                                     ens=0).values)
+                                                                                     ens=0).values,
+                                                                           pointmap)
+
 
                         obsdata[sample, step, :] = obs.data_vars[vmap[v]].sel(time=xdata.valid_time.values[0])
 
@@ -312,13 +348,6 @@ def main():
                 print("outfile: ", outfile)
                 print()
                 merged.to_netcdf(outfile, encoding={"time": {"units": "seconds since 1970-01-01 00:00:00"}})
-
-            inter_end = time()
-
-        print()
-        print(" prep time: ", prep_end - prep_start)
-        print("inter time: ", inter_end - inter_start)
-        print()
 
         print()
         print("merged")
