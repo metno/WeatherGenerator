@@ -143,6 +143,7 @@ def get_model_results(run_id: str, mini_epoch: int, rank: int) -> Path:
             f"exist or is not a directory."
         )
 
+    #zarr_path = f"/lustre/storeB/users/cristianl/kmupf50t/validation_epoch{epoch:05d}_rank{rank:04d}.zarr"
     return zarr_path
 
 

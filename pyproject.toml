@@ -29,6 +29,7 @@ dependencies = [
  "weathergen-common",
  "weathergen-evaluate",
  "weathergen-readers-extra",
+ "weathergen-verif",
 ]
 
 
@@ -45,6 +46,8 @@ inference = "weathergen.run_train:inference"
 evaluate = "weathergen.evaluate.run_evaluation:evaluate"
 plot_train = "weathergen.utils.plot_training:plot_train"
 export = "weathergen.evaluate.export.export_inference:export"
+export = "weathergen.evaluate.export_inference:export"
+create_verif = "weathergen.verif.create_verif:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -218,6 +221,7 @@ weathergen-evaluate = { workspace = true }
 weathergen-metrics = { workspace = true }
 weathergen-readers-extra = { workspace = true }
 
+weathergen-verif = { workspace = true }
 
 flash-attn = [
 # The build of Cathal O'Brien is not compatible with the libc build on santis.
@@ -254,5 +258,7 @@ members = [
    "packages/readers_extra",
 # Explicitly not depending on 'packages/dashboard' : this causes issues when deploying
 # the streamlit dashboard.
+   "packages/common",
+   "packages/verif",
 ]
 
