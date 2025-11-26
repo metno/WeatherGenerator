@@ -115,7 +115,9 @@ def get_model_results(run_id: str, epoch: int, rank: int) -> Path:
     Get the path to the model results zarr store from a given run_id and epoch.
     """
     run_results = Path(_load_private_conf(None)["path_shared_working_dir"]) / f"results/{run_id}"
+    print()
     zarr_path = run_results / f"validation_epoch{epoch:05d}_rank{rank:04d}.zarr"
+    #zarr_path = f"/lustre/storeB/users/cristianl/kmupf50t/validation_epoch{epoch:05d}_rank{rank:04d}.zarr"
     if not zarr_path.exists() or not zarr_path.is_dir():
         raise FileNotFoundError(f"Zarr file {zarr_path} does not exist or is not a directory.")
     return zarr_path

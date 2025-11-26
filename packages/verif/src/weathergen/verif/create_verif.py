@@ -28,7 +28,9 @@ def readarg():
         "-z",
         "--zarr",
         dest="zarrfile",
-        required=True,
+        required=False,
+        default="/lustre/storeB/project/nwp/weathergen/experiments/era5_o96/validation_epoch00000_rank0000.zarr",
+         #/lustre/storeB/users/cristianl/kmupf50t/validation_epoch{epoch:05d}_rank{rank:04d}.zarr"
         help="Zarr file (.zarr)",
     )
 
@@ -36,8 +38,9 @@ def readarg():
         "-b",
         "--obs",
         dest="obsfile",
-        required=True,
-        default="data/metno_observations_v3.nc",
+        required=False,
+        # default="data/metno_observations_v3.nc",
+        default="/lustre/storeB/project/nwp/weathergen/datasets/metno_observations_v3.nc",
         help="Observation file (.nc)",
     )
 
@@ -80,7 +83,7 @@ def readarg():
         default=None,
         dest="streams",
         nargs="*",
-        help="Do verif for this streams. Default: Infer from .zarr file",
+        help="Do verif for this streams. Default: Infer from .zarr file", # ex. ERA5, CERRA
     )
 
     parser.add_argument(
