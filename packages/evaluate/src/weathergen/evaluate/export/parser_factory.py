@@ -1,6 +1,7 @@
 from omegaconf import OmegaConf
 
 from weathergen.evaluate.export.cf_utils import CfParser
+from weathergen.evaluate.export.parsers.metno_parser import MetnoParser
 from weathergen.evaluate.export.parsers.netcdf_parser import NetcdfParser
 from weathergen.evaluate.export.parsers.quaver_parser import QuaverParser
 
@@ -30,6 +31,7 @@ class CfParserFactory:
         _parser_map = {
             "netcdf": (NetcdfParser, ["grid_type"]),
             "quaver": (QuaverParser, ["grid_type", "channels", "template"]),
+            "metno": (MetnoParser, ["channels", "field_shape", "proj4_str"]),
         }
 
         fmt = kwargs.get("output_format")
