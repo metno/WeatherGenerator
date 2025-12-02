@@ -22,7 +22,7 @@ def normalise(x):
     return x[:] / np.sum(x[:])
 
 
-class verif_interpolator:
+class Verif_interpolator:
     """
     Interpolator class that's either a wrapper for scipys LinearNDInterpolator
     or uses the handmade approximate 2D linear interpolator
@@ -37,7 +37,7 @@ class verif_interpolator:
         self.obs_points = obs_points
 
 
-class verif_2D_interpolator(verif_interpolator):
+class Verif_2D_interpolator(Verif_interpolator):
     """
     Class that does approximate 2D interpolation
     """
@@ -126,7 +126,7 @@ class verif_2D_interpolator(verif_interpolator):
         return wvalues
 
 
-class verif_lat_lon_interpolator(verif_interpolator):
+class Verif_lat_lon_interpolator(Verif_interpolator):
     """
     Class that does approximate 2D interpolation
     """
@@ -138,7 +138,7 @@ class verif_lat_lon_interpolator(verif_interpolator):
 
         self.triangulation = Delaunay(self.grid_points)
 
-    def interpolate(self, values, intmap):
+    def interpolate(self, values, intmap = None):
         """
         Interpolate values to points
         """
@@ -156,7 +156,7 @@ class verif_lat_lon_interpolator(verif_interpolator):
         return interpolator(self.obs_points).astype(np.float32)
 
 
-class verif_nearest_interpolator(verif_interpolator):
+class Verif_nearest_interpolator(Verif_interpolator):
     """
     Class that does approximate 2D interpolation
     """

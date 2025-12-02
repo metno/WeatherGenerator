@@ -1,0 +1,35 @@
+# Default config file
+# mapping variables from zarr and observation files
+# to verif files
+
+- name:       "2t"
+  attributes: {
+    units:       "K",
+    long_name:   "2 meter temperature",
+    conventions: "verif_1.0.0"}
+  zarr_name:  "2t"
+  zarr_units: "K"
+  obs_name:   "air_temperature"
+  obs_units:  "K"
+
+- name:       "sp"
+  attributes: {
+    units:       "Pa",
+    long_name:   "Surface pressure",
+    conventions: "verif_1.0.0"}
+  zarr_name:  "sp"
+  zarr_units: "Pa"
+  obs_name:   "surface_air_pressure"
+  obs_units:  "Pa"
+
+
+- name:       "mslp"
+  attributes: {
+    units:       "Pa",
+    long_name:   "Mean sea level pressure",
+    conventions: "verif_1.0.0"}
+  zarr_name:  "msl"
+  zarr_units: "Pa"
+  obs_name:   "surface_air_pressure"
+  obs_units:  "Pa"
+

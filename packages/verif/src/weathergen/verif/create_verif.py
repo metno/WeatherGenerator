@@ -1,6 +1,7 @@
 import argparse
 import numpy as np
 import xarray as xr
+import yaml
 
 from time import time
 
@@ -12,9 +13,12 @@ from weathergen.evaluate.score import Scores
 
 from weathergen.verif.diana_io import diana_io
 
-from weathergen.verif.verif_interpolator import verif_2D_interpolator
-from weathergen.verif.verif_interpolator import verif_lat_lon_interpolator
-from weathergen.verif.verif_interpolator import verif_nearest_interpolator
+from weathergen.verif.verif_config import Variables
+from weathergen.verif.verif_processers import Processer
+
+from weathergen.verif.verif_interpolator import Verif_2D_interpolator
+from weathergen.verif.verif_interpolator import Verif_lat_lon_interpolator
+from weathergen.verif.verif_interpolator import Verif_nearest_interpolator
 
 # from datetime import datetime, timedelta, timezone
 
@@ -239,6 +243,16 @@ def get_point_map(xdata, old_coords):
     return pointmap
 
 
+def convert_to_mslp(p, h, T):
+
+    L = 0.0065    # Temperature lapse rate (K/m)
+    g = 9.80665   # Gravitational acceleration (m/s**2)
+    M = 0.0289644 # Molar mass of dry air (kg/mol)
+    R = 8.31447   # Universal gas constant (J/mol*K)
+
+    return p*(1-(L*h)/T)**(-(g*M)/(R*L))
+
+
 def main():
 
     print("Start creating verif files")
@@ -251,18 +265,19 @@ def main():
 
 
     obs = xr.open_dataset(args.obsfile)
+    lat, lon, alt = get_obs_coordinates(obs)
+    obs_coords = np.column_stack((lat.values, lon.values))
 
     print(obs)
+    print(type(obs))
 
-    lat, lon, alt = get_obs_coordinates(obs)
-
-    obs_coords = np.column_stack((lat.values, lon.values))
+    config_file = Path(__file__).parent/"verif_config.yaml"
+    variables = Variables(config_file)
 
     with ZarrIO(args.zarrfile) as zarrio:
 
         streams = get_streams(zarrio, args.streams)
         print("streams:", streams)
-
 
         t_start = time()
 
@@ -275,70 +290,51 @@ def main():
             item = zarrio.get_data(sample=0, stream=stream, forecast_step=1)
             xdata = item.prediction.as_xarray()
 
+            print()
+            print(xdata)
+            print(xdata.channel)
+            print()
+
             zarr_coords = np.column_stack((xdata.ipoint.lat.values, xdata.ipoint.lon.values))
             if args.method == "2d":
                 print()
                 print("2D interpolation")
-                interpolator = verif_2D_interpolator(zarr_coords, obs_coords)
+                interpolator = Verif_2D_interpolator(zarr_coords, obs_coords)
 
             elif args.method == "lat_lon":
                 print()
                 print("lat-lon interpolation")
-                interpolator = verif_lat_lon_interpolator(zarr_coords, obs_coords)
+                interpolator = Verif_lat_lon_interpolator(zarr_coords, obs_coords)
 
             elif args.method == "nearest":
                 print()
                 print("nearest neighbour interpolation")
-                interpolator = verif_nearest_interpolator(zarr_coords, obs_coords)
+                interpolator = Verif_nearest_interpolator(zarr_coords, obs_coords)
 
             interpolator.prepare()
 
-            vmap = {"2t":"air_temperature"}
+            data_shape = (len(zarrio.samples), len(zarrio.forecast_steps), obs.location.shape[0])
 
-            attrs_map = {
-            "2t":
-                {
-                    "long_name":"2 meter temperature",
-                    "units":"K",
-                    "Conventions":"verif_1.0.0"
-                }
-            }
+            for v in variables.variables:
 
-            
-            for v in args.variables:
-
-                fcstdata = np.ndarray((len(zarrio.samples), len(zarrio.forecast_steps), obs.location.shape[0]), dtype=np.float32)
+                fcstdata = np.ndarray(data_shape, dtype=np.float32)
                 obsdata = np.ndarray(fcstdata.shape, dtype=np.float32)
 
-                for sample in range(len(zarrio.samples)):
-                    for step in range(len(zarrio.forecast_steps)):
+                p = Processer(zarrio, obs, stream, interpolator)
 
-                        item = zarrio.get_data(sample=sample, stream=stream, forecast_step=step+1)
-                        newdata = item.prediction.as_xarray()
-
-                        ydata = Scores.sort_by_coords(newdata, xdata)
-
-                        fcstdata[sample,step,:] = interpolator.interpolate(ydata.sel(sample=sample,
-                                                                                     stream=stream,
-                                                                                     forecast_step=step+1,
-                                                                                     channel=v,
-                                                                                     ens=0).values)
-
-
-                        obsdata[sample, step, :] = obs.data_vars[vmap[v]].sel(time=ydata.valid_time.values[0])
-
+                p.get_data(v, fcstdata, obsdata)
 
                 xrobsdata = xr.DataArray(obsdata,
                                          dims=["time", "leadtime", "location"],
                                          coords={"time": xrtime, "leadtime": xrleadtime,"location": obs.location},
                                          name="obs",
-                                         attrs=attrs_map[v])
+                                         attrs=v.attributes)
 
                 xrfcstdata = xr.DataArray(fcstdata,
                                           dims=["time", "leadtime", "location"],
                                           coords={"time": xrtime, "leadtime": xrleadtime,"location": obs.location},
                                           name="fcst",
-                                          attrs=attrs_map[v])
+                                          attrs=v.attributes)
 
 
                 merged = xr.merge([xrfcstdata,
@@ -347,7 +343,7 @@ def main():
                                    lon,
                                    alt])
 
-                outfile = create_output_paths(stream, v, args.outfiles, args.method)
+                outfile = create_output_paths(stream, v.name, args.outfiles, args.method)
 
                 print()
                 print("outfile: ", outfile)
@@ -365,6 +361,4 @@ def main():
         print(merged)
         print()
 
-    Diana = diana_io(Path("wololo.txt"))
-    Diana.write(obs_coords)
 
