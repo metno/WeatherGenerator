@@ -104,3 +104,23 @@ class Wind_processer(Processer):
 
         return np.sqrt(np.square(u) + np.square(v))
 
+
+class Processer_factory():
+
+    def __init__(self, zarrio:ZarrIO, obs:xr.DataArray, stream: str, interpolator: Verif_interpolator):
+
+        self.zarrio = zarrio
+        self.obs = obs
+        self.stream = stream
+        self.interpolator = interpolator
+
+    def get_processer(self, name: str) -> Processer:
+
+        if (name == "mslp"):
+            return MSLP_processer(self.zarrio, self.obs, self.stream, self.interpolator)
+        elif (name == "wind"):
+            return Wind_processer(self.zarrio, self.obs, self.stream, self.interpolator)
+        else:
+            return Processer(self.zarrio, self.obs, self.stream, self.interpolator)
+
+

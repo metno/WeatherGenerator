@@ -15,9 +15,7 @@ from weathergen.verif.diana_io import diana_io
 
 from weathergen.verif.verif_config import Variables
 
-from weathergen.verif.verif_processers import Processer
-from weathergen.verif.verif_processers import MSLP_processer
-from weathergen.verif.verif_processers import Wind_processer
+from weathergen.verif.verif_processers import Processer_factory
 
 from weathergen.verif.verif_interpolator import Verif_2D_interpolator
 from weathergen.verif.verif_interpolator import Verif_lat_lon_interpolator
@@ -308,19 +306,16 @@ def main():
 
             data_shape = (len(zarrio.samples), len(zarrio.forecast_steps), obs.location.shape[0])
 
+            processers = Processer_factory(zarrio, obs, stream, interpolator)
+
             for v in variables.variables:
 
                 vt_start = time()
 
                 fcstdata = np.ndarray(data_shape, dtype=np.float32)
-                obsdata  = np.ndarray(fcstdata.shape, dtype=np.float32)
+                obsdata  = np.ndarray(data_shape, dtype=np.float32)
 
-                if (v.name == "mslp"):
-                    p = MSLP_processer(zarrio, obs, stream, interpolator)
-                elif (v.name == "wind"):
-                    p = Wind_processer(zarrio, obs, stream, interpolator)
-                else:
-                    p = Processer(zarrio, obs, stream, interpolator)
+                p = processers.get_processer(v.name)
 
                 p.get_data(v, fcstdata, obsdata)
 
