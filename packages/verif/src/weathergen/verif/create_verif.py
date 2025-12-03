@@ -126,7 +126,7 @@ def generate_time_coordinates(zarrio, stream):
     """
 
 
-    item = zarrio.get_data(sample=0, stream=stream, forecast_step=1)
+    item = zarrio.get_data(sample=0, stream=stream, forecast_step=0)
     onetime = item.prediction.as_xarray().valid_time.values[0]
     item = zarrio.get_data(sample=0, stream=stream, forecast_step=2)
     twotime = item.prediction.as_xarray().valid_time.values[0]
@@ -267,14 +267,29 @@ def main():
     with ZarrIO(args.zarrfile) as zarrio:
 
         streams = get_streams(zarrio, args.streams)
+        print()
         print("streams:", streams)
+
+        print()
+        print(zarrio)
+        print()
+        print(zarrio.streams)
+        print()
+        print(zarrio.samples)
+        print()
+        print(zarrio.forecast_steps)
+        print()
+        print(zarrio.data_root)
+        print()
+        print(dir(zarrio))
+        print()
+        item = zarrio.get_data(sample=0, stream='ERA5', forecast_step=0)
 
         t_start = time()
 
         for stream in streams:
 
             print(stream)
-            print()
 
             xrtime, xrleadtime = generate_time_coordinates(zarrio, stream)
 
@@ -308,9 +323,11 @@ def main():
 
             processers = Processer_factory(zarrio, obs, stream, interpolator)
 
-            for v in variables.variables:
+            for v in variables:
 
                 vt_start = time()
+
+                print(v.name)
 
                 fcstdata = np.ndarray(data_shape, dtype=np.float32)
                 obsdata  = np.ndarray(data_shape, dtype=np.float32)
