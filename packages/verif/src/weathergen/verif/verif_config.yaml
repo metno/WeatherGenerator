@@ -22,7 +22,6 @@
   obs_name:   "surface_air_pressure"
   obs_units:  "Pa"
 
-
 - name:       "mslp"
   attributes: {
     units:       "Pa",
@@ -32,4 +31,14 @@
   zarr_units: "Pa"
   obs_name:   "surface_air_pressure"
   obs_units:  "Pa"
+
+- name:       "wind"
+  attributes: {
+    units:       "m/s",
+    long_name:   "wind speed",
+    conventions: "verif_1.0.0"}
+  zarr_name:  "10u, 10v"
+  zarr_units: "m/s"
+  obs_name:   "wind_speed"
+  obs_units:  "m/s"
 

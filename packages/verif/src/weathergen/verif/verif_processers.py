@@ -18,7 +18,6 @@ class Processer:
         self.interpolator = interpolator
 
         self.xdata = zarrio.get_data(sample=0, stream=stream, forecast_step=1).prediction.as_xarray()
-        self.data_shape = (len(zarrio.samples), len(zarrio.forecast_steps), obs.location.shape[0])
 
     def get_data(self, v:Variable, fcstdata, obsdata):
 
@@ -44,3 +43,64 @@ class Processer:
                                                        forecast_step=step,
                                                        channel=name,
                                                        ens=0).values)
+
+class MSLP_processer(Processer):
+
+    def get_obsdata(self, obs:xr.DataArray, name: str, time: np.datetime64):
+        return self.compute_mslp(obs, time)
+
+    def compute_mslp(self, obs:xr.DataArray, time: np.datetime64):
+
+        g   = 9.80665 # Gravitational acceleration (m/s**2)
+        R   = 8.31447 # Universal gas constant (J/mol*K)
+
+        a   = 0.0065  # Temperature lapse rate (K/m)
+        Ch  = 0.0012  # (K/Pa)
+
+        A   = 17.625
+        B   = 243.03
+        C   = 6.1094
+
+        P   = obs.data_vars["surface_air_pressure"].sel(time=time)
+        T   = obs.data_vars["air_temperature"].sel(time=time)
+        rh  = obs.data_vars["relative_humidity"].sel(time=time)
+
+        altitude = obs.altitude
+
+        e = rh * 6.11 * np.power(10.0, ((7.5 * (T - 273.15))/(T - 38.85)))
+
+        dewpoint = np.where(~np.isnan(e),
+                            B * np.log(e/C)/(A - np.log(e/C)),
+                            T - 276.15)
+
+        e = np.where(np.isnan(e), 0, e)
+
+        Tv = T / (1. - 0.379 * (6.11 * np.power(10.,((7.5 * dewpoint)/(237.7 + dewpoint))) / P))
+
+#        mslp = np.where(altitude >= 50.,
+#                        P * np.exp((g * altitude / R) / (T + 0.5 * a * altitude + e * Ch)),
+#                        P + P * altitude / (29.27 * Tv))
+
+        mslp = P + P * altitude / (29.27 * Tv)
+
+        return mslp
+
+
+class Wind_processer(Processer):
+
+    def get_fcstdata(self, ydata:xr.DataArray, name: str, sample: int,  step: int):
+
+        u = self.interpolator.interpolate(ydata.sel(sample=sample,
+                                          stream=self.stream,
+                                          forecast_step=step,
+                                          channel="10u",
+                                          ens=0).values)
+
+        v = self.interpolator.interpolate(ydata.sel(sample=sample,
+                                          stream=self.stream,
+                                          forecast_step=step,
+                                          channel="10v",
+                                          ens=0).values)
+
+        return np.sqrt(np.square(u) + np.square(v))
+

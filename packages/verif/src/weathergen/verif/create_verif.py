@@ -14,13 +14,14 @@ from weathergen.evaluate.score import Scores
 from weathergen.verif.diana_io import diana_io
 
 from weathergen.verif.verif_config import Variables
+
 from weathergen.verif.verif_processers import Processer
+from weathergen.verif.verif_processers import MSLP_processer
+from weathergen.verif.verif_processers import Wind_processer
 
 from weathergen.verif.verif_interpolator import Verif_2D_interpolator
 from weathergen.verif.verif_interpolator import Verif_lat_lon_interpolator
 from weathergen.verif.verif_interpolator import Verif_nearest_interpolator
-
-# from datetime import datetime, timedelta, timezone
 
 
 def readarg():
@@ -114,7 +115,7 @@ def create_output_paths(stream, variable, outfiles, method):
     """
     outfile = Path(outfiles.replace("%S", stream).replace("%V", variable).replace("%M", method))
     pathdir = outfile.parent
-    print(f"If not existing, create directory {pathdir}")
+    print(f"Output directory: {pathdir}")
     pathdir.mkdir(exist_ok=True, parents=True)
     return outfile
 
@@ -243,16 +244,6 @@ def get_point_map(xdata, old_coords):
     return pointmap
 
 
-def convert_to_mslp(p, h, T):
-
-    L = 0.0065    # Temperature lapse rate (K/m)
-    g = 9.80665   # Gravitational acceleration (m/s**2)
-    M = 0.0289644 # Molar mass of dry air (kg/mol)
-    R = 8.31447   # Universal gas constant (J/mol*K)
-
-    return p*(1-(L*h)/T)**(-(g*M)/(R*L))
-
-
 def main():
 
     print("Start creating verif files")
@@ -268,8 +259,9 @@ def main():
     lat, lon, alt = get_obs_coordinates(obs)
     obs_coords = np.column_stack((lat.values, lon.values))
 
+    print()
     print(obs)
-    print(type(obs))
+    print()
 
     config_file = Path(__file__).parent/"verif_config.yaml"
     variables = Variables(config_file)
@@ -284,6 +276,7 @@ def main():
         for stream in streams:
 
             print(stream)
+            print()
 
             xrtime, xrleadtime = generate_time_coordinates(zarrio, stream)
 
@@ -317,12 +310,20 @@ def main():
 
             for v in variables.variables:
 
-                fcstdata = np.ndarray(data_shape, dtype=np.float32)
-                obsdata = np.ndarray(fcstdata.shape, dtype=np.float32)
+                vt_start = time()
 
-                p = Processer(zarrio, obs, stream, interpolator)
+                fcstdata = np.ndarray(data_shape, dtype=np.float32)
+                obsdata  = np.ndarray(fcstdata.shape, dtype=np.float32)
+
+                if (v.name == "mslp"):
+                    p = MSLP_processer(zarrio, obs, stream, interpolator)
+                elif (v.name == "wind"):
+                    p = Wind_processer(zarrio, obs, stream, interpolator)
+                else:
+                    p = Processer(zarrio, obs, stream, interpolator)
 
                 p.get_data(v, fcstdata, obsdata)
+
 
                 xrobsdata = xr.DataArray(obsdata,
                                          dims=["time", "leadtime", "location"],
@@ -343,12 +344,14 @@ def main():
                                    lon,
                                    alt])
 
+                print()
                 outfile = create_output_paths(stream, v.name, args.outfiles, args.method)
 
-                print()
-                print("outfile: ", outfile)
-                print()
                 merged.to_netcdf(outfile, encoding={"time": {"units": "seconds since 1970-01-01 00:00:00"}})
+
+                vt_end = time()
+
+                print(v.name, "time: ", vt_end - vt_start) 
 
         t_end = time()
 
