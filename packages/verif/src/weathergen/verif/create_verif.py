@@ -116,27 +116,19 @@ def create_output_paths(stream, variable, outfiles, method):
     pathdir.mkdir(exist_ok=True, parents=True)
     return outfile
 
-def generate_time_coordinates(zarrio, stream):
+def generate_time_coordinates(xdata: xr.DataArray, zarrio: ZarrIO, stream: str):
     """
     Read samples and steps from ZarrIO object
     and convert to xarray data objects
     to be used as coordinates in verrif dataset
     """
 
-
-    item = zarrio.get_data(sample=0, stream=stream, forecast_step=1)
-    onetime = item.prediction.as_xarray().valid_time.values[0]
-    item = zarrio.get_data(sample=0, stream=stream, forecast_step=2)
-    twotime = item.prediction.as_xarray().valid_time.values[0]
-
-    dt = (twotime - onetime)
-
     # Initial times are stored as numpy.datetime64 objects in verif
     # Get the valid time of the first step for each sample
     verif_times = [np.datetime64("nat","h")]*len(zarrio.samples)
     for sample in zarrio.samples:
-        item = zarrio.get_data(sample=sample, stream=stream, forecast_step="1")
-        verif_times[int(sample)] = (item.prediction.as_xarray().valid_time.values[0] - dt)
+        item = zarrio.get_data(sample=sample, stream=stream, forecast_step=1)
+        verif_times[int(sample)] = item.prediction.as_xarray().source_interval_start.values[0]
 
     xrtime = xr.DataArray(
         verif_times,
@@ -145,6 +137,7 @@ def generate_time_coordinates(zarrio, stream):
         coords = {"time":verif_times},
         attrs = {"standard_name":"forecast_reference_time"})
 
+    dt = xdata.source_interval_end.values[0] - xdata.source_interval_start.values[0]
     dt = dt.astype("timedelta64[h]")
 
     # Lead times are stored as float32 in verif
@@ -319,9 +312,9 @@ def main():
 
             print("stream: ", stream)
 
-            xrtime, xrleadtime = generate_time_coordinates(zarrio, stream)
-
             xdata = zarrio.get_data(sample=0, stream=stream, forecast_step=1).prediction.as_xarray()
+
+            xrtime, xrleadtime = generate_time_coordinates(xdata, zarrio, stream)
 
             variables = get_variables(xdata, config_file, args.variables, stream)
 
