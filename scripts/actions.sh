@@ -7,6 +7,12 @@ case "$1" in
   sync)
     (
       cd "$SCRIPT_DIR" || exit 1
+      # If we are running on a mac, use the cpu extra
+      if [[ "$(uname)" == "Darwin" ]]; then
+        uv sync --all-packages --extra cpu
+        exit 0
+      fi
+      # Otherwise, use the gpu extra
       uv sync --all-packages --extra gpu
     )
     ;;
@@ -31,7 +37,10 @@ case "$1" in
         && \
       uv run --no-project --with "ruff==0.12.2" \
        ruff check  --target-version py312  \
-       src/ scripts/ packages/
+       src/ scripts/ packages/ \
+        && \
+      uv run --no-project --with "pylint==4.0.3" \
+       pylint src/ packages/
     )
     ;;
   type-check)
@@ -46,6 +55,16 @@ case "$1" in
       # Fail for errors on weathergen-common:
       if [ $? -ne 0 ]; then
         echo "Type checking failed for weathergen-common."
+        exit 1
+      fi
+
+      # weathergen-metrics
+      uv sync --project packages/metrics --no-install-workspace
+      uv pip list
+      uv run --project packages/metrics --frozen pyrefly check packages/metrics
+      # Fail for errors on weathergen-metrics:
+      if [ $? -ne 0 ]; then
+        echo "Type checking failed for weathergen-metrics."
         exit 1
       fi
 

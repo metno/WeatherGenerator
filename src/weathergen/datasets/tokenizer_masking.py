@@ -31,10 +31,12 @@ class TokenizerMasking(Tokenizer):
     def __init__(self, healpix_level: int, masker: Masker):
         super().__init__(healpix_level)
         self.masker = masker
+        self.rng = None
+        self.token_size = None
 
     def reset_rng(self, rng) -> None:
         """
-        Reset rng after epoch to ensure proper randomization
+        Reset rng after mini_epoch to ensure proper randomization
         """
         self.masker.reset_rng(rng)
         self.rng = rng
@@ -64,9 +66,9 @@ class TokenizerMasking(Tokenizer):
 
         # return empty if there is no data or we are in diagnostic mode
         if is_diagnostic or rdata.data.shape[1] == 0 or len(rdata.data) < 2:
-            source_tokens_cells = torch.tensor([])
+            source_tokens_cells = [torch.tensor([])]
             source_tokens_lens = torch.zeros([self.num_healpix_cells_source], dtype=torch.int32)
-            source_centroids = torch.tensor([])
+            source_centroids = [torch.tensor([])]
             return (source_tokens_cells, source_tokens_lens, source_centroids)
 
         # tokenize all data first
