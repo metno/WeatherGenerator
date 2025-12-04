@@ -2,6 +2,7 @@ import numpy as np
 
 from scipy.spatial import KDTree, Delaunay
 from scipy.interpolate import LinearNDInterpolator
+from pyresample import geometry, kd_tree
 
 
 def convert_coordinates(coords):
@@ -185,3 +186,50 @@ class Verif_nearest_interpolator(Verif_interpolator):
             wvalues[:] = values[intmap[self.indices[:]]]
 
         return wvalues
+
+class Verif_pyresample_interpolator(Verif_interpolator):
+    """
+    Interpolator using pyresample's kd_tree resampling.
+    """
+
+    def __init__(self, grid_points, obs_points, method="nearest"):
+        super().__init__(grid_points, obs_points)
+        self.method = method
+
+    def prepare(self):
+        """
+        Prepare pyresample geometry objects for interpolation.
+        """
+
+        # grid_points and obs_points are (N, 2) arrays: lat, lon
+        self.grid_def = geometry.SwathDefinition(lons=self.grid_points[:, 1], lats=self.grid_points[:, 0])
+        self.obs_def = geometry.SwathDefinition(lons=self.obs_points[:, 1], lats=self.obs_points[:, 0])
+
+    def interpolate(self, values, intmap=None):
+        """
+        Interpolate values to observation points using pyresample.
+        """
+        if intmap is not None:
+            values = values[intmap]
+        if self.method == "nearest":
+            result = kd_tree.resample_nearest(
+                self.grid_def, values, self.obs_def,
+                radius_of_influence=50000,
+                fill_value=np.nan
+            )
+        elif self.method == "bilinear":
+            result = kd_tree.resample_bilinear(
+                self.grid_def, values, self.obs_def,
+                radius_of_influence=50000,
+                fill_value=np.nan
+            )
+        elif self.method == "gauss":
+            result = kd_tree.resample_gauss(
+                self.grid_def, values, self.obs_def,
+                radius_of_influence=50000,
+                sigmas=25000,
+                fill_value=np.nan
+            )
+        else:
+            raise ValueError(f"Unknown pyresample method: {self.method}")
+        return result.astype(np.float32)

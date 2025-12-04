@@ -2,6 +2,9 @@ import argparse
 import numpy as np
 import xarray as xr
 import yaml
+import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
 
 from time import time
 
@@ -20,6 +23,7 @@ from weathergen.verif.verif_processers import Processer_factory
 from weathergen.verif.verif_interpolator import Verif_2D_interpolator
 from weathergen.verif.verif_interpolator import Verif_lat_lon_interpolator
 from weathergen.verif.verif_interpolator import Verif_nearest_interpolator
+from weathergen.verif.verif_interpolator import Verif_pyresample_interpolator
 
 
 def readarg():
@@ -91,8 +95,15 @@ def readarg():
         "--method",
         default="2d",
         dest="method",
-        choices=["2d", "lat_lon", "nearest"],
+        choices=["2d", "lat_lon", "nearest", "pyresample"],
         help="Interpolation method. Default: 2d_interpolation",
+    )
+
+    parser.add_argument(
+        "--pyresample-method",
+        default="nearest",
+        choices=["nearest", "bilinear", "gauss"],
+        help="Pyresample interpolation method (nearest, bilinear, gauss). Default: nearest",
     )
 
     args = parser.parse_args()
@@ -242,6 +253,35 @@ def get_point_map(xdata, old_coords):
     return pointmap
 
 
+def plot_norway_points(grid_coords, obs_coords, nearest_grid_coords=None):
+    """
+    Plot grid and observation points on a map centered on Norway.
+    If nearest_grid_coords is provided, plot those in green and draw lines from each obs to its nearest grid point.
+    """
+    fig = plt.figure(figsize=(10, 12))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    ax.set_extent([4, 32, 57, 72], crs=ccrs.PlateCarree())  # Norway bounding box
+
+    ax.add_feature(cfeature.COASTLINE)
+    ax.add_feature(cfeature.BORDERS)
+    ax.add_feature(cfeature.LAND, facecolor='lightgray')
+    ax.add_feature(cfeature.OCEAN, facecolor='lightblue')
+    ax.add_feature(cfeature.LAKES, facecolor='lightblue')
+    ax.add_feature(cfeature.RIVERS, edgecolor='blue')
+
+    ax.scatter(grid_coords[:, 1], grid_coords[:, 0], c='blue', s=10, label='Grid Points', alpha=0.5)
+    ax.scatter(obs_coords[:, 1], obs_coords[:, 0], c='red', s=20, label='Observation Points', alpha=0.7)
+    if nearest_grid_coords is not None:
+        ax.scatter(nearest_grid_coords[:, 1], nearest_grid_coords[:, 0], c='green', s=30, label='Nearest Grid Points', alpha=0.7)
+        # Draw lines from each observation to its nearest grid point
+        for obs, nearest in zip(obs_coords, nearest_grid_coords):
+            ax.plot([obs[1], nearest[1]], [obs[0], nearest[0]], c='gray', linewidth=0.8, alpha=0.6)
+
+    plt.legend()
+    plt.title('Grid, Observation, and Nearest Points - Norway')
+    plt.show()
+
+
 def main():
 
     print("Start creating verif files")
@@ -287,6 +327,9 @@ def main():
             print()
 
             zarr_coords = np.column_stack((xdata.ipoint.lat.values, xdata.ipoint.lon.values))
+            obs_coords = np.column_stack((lat.values, lon.values))
+
+            # Create and prepare interpolator
             if args.method == "2d":
                 print()
                 print("2D interpolation")
@@ -301,8 +344,25 @@ def main():
                 print()
                 print("nearest neighbour interpolation")
                 interpolator = Verif_nearest_interpolator(zarr_coords, obs_coords)
+            elif args.method == "pyresample":
+                interpolator = Verif_pyresample_interpolator(zarr_coords, obs_coords, args.pyresample_method)
 
             interpolator.prepare()
+
+            # --- Write coordinates to Diana files ---
+            diana_io(Path(f"output/verif/{stream}_grid_coords.diana")).write(zarr_coords)
+            diana_io(Path(f"output/verif/{stream}_obs_coords.diana")).write(obs_coords)
+            nearest_grid_coords = None
+            if args.method == "nearest" or (args.method == "pyresample" and args.pyresample_method == "nearest"):
+                nearest_indices = interpolator.indices.flatten()
+                nearest_grid_coords = zarr_coords[nearest_indices]
+                diana_io(Path(f"output/verif/{stream}_nearest_grid_coords.diana")).write(nearest_grid_coords)
+            # ------------------------------------------
+
+            # --- Plot points on map for visual check (only for nearest methods) ---
+            if nearest_grid_coords is not None:
+                plot_norway_points(zarr_coords, obs_coords, nearest_grid_coords)
+            # ----------------------------------------------------------------------
 
             data_shape = (len(zarrio.samples), len(zarrio.forecast_steps), obs.location.shape[0])
 
