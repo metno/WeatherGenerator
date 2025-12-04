@@ -71,7 +71,7 @@ def readarg():
     parser.add_argument(
         "-v",
         "--variables",
-        default=["2t"],
+        default=None,
         dest="variables",
         nargs="*",
         help="Do verif for these variables. Default: 2t",
@@ -99,7 +99,6 @@ def readarg():
 
     return args
 
-
 def create_output_paths(stream, variable, outfiles, method):
     """
     Create output directories for the verif files
@@ -116,7 +115,6 @@ def create_output_paths(stream, variable, outfiles, method):
     print(f"Output directory: {pathdir}")
     pathdir.mkdir(exist_ok=True, parents=True)
     return outfile
-
 
 def generate_time_coordinates(zarrio, stream):
     """
@@ -179,12 +177,59 @@ def get_streams(zarrio, arg_streams):
     if arg_streams:
         for stream in arg_streams:
             if stream not in zarrio.streams:
-                raise ValueError(
+                raise Exception(
                     f'Stream {stream} is not present in .zarr file. zarrio.streams: {zarrio.streams}'
                 )
         return arg_streams
     else:
         return zarrio.streams
+
+def get_variables(xdata: xr.DataArray, config_file: Path, arg_variables: list, stream: str) -> list:
+    """
+    Go through argument variables,
+    check if they are in the config_file and return
+    a list ov variables.
+    If no arguments are given,
+    return list of variables found in file.
+    """
+
+    config_variables = Variables(config_file)
+
+    config_names = (cv.name for cv in config_variables)
+
+    variables = []
+    if arg_variables:
+
+        # Check if there's a config for requested variables
+        for av in arg_variables:
+            if not av in config_names:
+                raise Exception(
+                    f'Variable {av} does not have an entry in the config file'
+                )
+
+        # Add requested variables to list of variables
+        for cv in config_variables:
+            if cv.name in arg_variables:
+                variables += [cv]
+
+    else:
+        variables = [v for v in config_variables]
+
+    #Check what variables exist in zarr file
+    vvars = []
+    for v in variables:
+        if isinstance(v.zarr_name, str):
+            if v.zarr_name in xdata.channel.values:
+                vvars += [v]
+        else:
+            if (len(set(v.zarr_name).intersection(xdata.channel.values)) == len(v.zarr_name)):
+                vvars += [v]
+    variables = vvars
+
+    if not variables:
+        raise Exception("No variables with configuration found in zarr file.")
+
+    return variables
 
 def get_obs_coordinates(obs):
     """
@@ -267,24 +312,18 @@ def main():
     with ZarrIO(args.zarrfile) as zarrio:
 
         streams = get_streams(zarrio, args.streams)
-        print()
-        print("streams:", streams)
 
         t_start = time()
 
         for stream in streams:
 
-            print(stream)
+            print("stream: ", stream)
 
             xrtime, xrleadtime = generate_time_coordinates(zarrio, stream)
 
-            item = zarrio.get_data(sample=0, stream=stream, forecast_step=1)
-            xdata = item.prediction.as_xarray()
+            xdata = zarrio.get_data(sample=0, stream=stream, forecast_step=1).prediction.as_xarray()
 
-            print()
-            print(xdata)
-            print(xdata.channel)
-            print()
+            variables = get_variables(xdata, config_file, args.variables, stream)
 
             zarr_coords = np.column_stack((xdata.ipoint.lat.values, xdata.ipoint.lon.values))
             if args.method == "2d":
@@ -348,7 +387,7 @@ def main():
 
                 vt_end = time()
 
-                print(v.name, "time: ", vt_end - vt_start) 
+                print(v.name, "time: ", vt_end - vt_start)
 
         t_end = time()
 
