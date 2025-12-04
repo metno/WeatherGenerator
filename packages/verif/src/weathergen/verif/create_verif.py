@@ -17,9 +17,7 @@ from weathergen.verif.verif_config import Variables
 
 from weathergen.verif.verif_processers import Processer_factory
 
-from weathergen.verif.verif_interpolator import Verif_2D_interpolator
-from weathergen.verif.verif_interpolator import Verif_lat_lon_interpolator
-from weathergen.verif.verif_interpolator import Verif_nearest_interpolator
+from weathergen.verif.verif_interpolator import Interpolator_factory
 
 
 def readarg():
@@ -171,7 +169,7 @@ def get_streams(zarrio, arg_streams):
         for stream in arg_streams:
             if stream not in zarrio.streams:
                 raise Exception(
-                    f'Stream {stream} is not present in .zarr file. zarrio.streams: {zarrio.streams}'
+                    f"Stream {stream} is not present in .zarr file. zarrio.streams: {zarrio.streams}"
                 )
         return arg_streams
     else:
@@ -300,7 +298,8 @@ def main():
     print()
 
     config_file = Path(__file__).parent/"verif_config.yaml"
-    variables = Variables(config_file)
+
+    method_factory = Interpolator_factory(args.method)
 
     with ZarrIO(args.zarrfile) as zarrio:
 
@@ -319,21 +318,8 @@ def main():
             variables = get_variables(xdata, config_file, args.variables, stream)
 
             zarr_coords = np.column_stack((xdata.ipoint.lat.values, xdata.ipoint.lon.values))
-            if args.method == "2d":
-                print()
-                print("2D interpolation")
-                interpolator = Verif_2D_interpolator(zarr_coords, obs_coords)
 
-            elif args.method == "lat_lon":
-                print()
-                print("lat-lon interpolation")
-                interpolator = Verif_lat_lon_interpolator(zarr_coords, obs_coords)
-
-            elif args.method == "nearest":
-                print()
-                print("nearest neighbour interpolation")
-                interpolator = Verif_nearest_interpolator(zarr_coords, obs_coords)
-
+            interpolator = method_factory.get_interpolator(zarr_coords, obs_coords)
             interpolator.prepare()
 
             data_shape = (len(zarrio.samples), len(zarrio.forecast_steps), obs.location.shape[0])
@@ -344,7 +330,7 @@ def main():
 
                 vt_start = time()
 
-                print(v.name)
+                print("variable: ", v.name)
 
                 fcstdata = np.ndarray(data_shape, dtype=np.float32)
                 obsdata  = np.ndarray(data_shape, dtype=np.float32)
@@ -373,7 +359,6 @@ def main():
                                    lon,
                                    alt])
 
-                print()
                 outfile = create_output_paths(stream, v.name, args.outfiles, args.method)
 
                 merged.to_netcdf(outfile, encoding={"time": {"units": "seconds since 1970-01-01 00:00:00"}})
@@ -381,6 +366,7 @@ def main():
                 vt_end = time()
 
                 print(v.name, "time: ", vt_end - vt_start)
+                print()
 
         t_end = time()
 

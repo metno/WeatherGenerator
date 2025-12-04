@@ -185,3 +185,28 @@ class Verif_nearest_interpolator(Verif_interpolator):
             wvalues[:] = values[intmap[self.indices[:]]]
 
         return wvalues
+
+class Interpolator_factory():
+
+    def __init__(self, method: str):
+
+        valid_methods = ("2d", "lat_lon", "nearest")
+
+        if (method not in valid_methods):
+            raise Exception(f"{method} is not a valid method.")
+
+        self.method = method
+
+    def get_interpolator(self, zarr_coords: np.ndarray, obs_coords: np.ndarray) -> Verif_interpolator:
+
+        if self.method == "2d":
+            print("2D interpolation")
+            return Verif_2D_interpolator(zarr_coords, obs_coords)
+
+        elif self.method == "lat_lon":
+            print("lat-lon interpolation")
+            return Verif_lat_lon_interpolator(zarr_coords, obs_coords)
+
+        elif self.method == "nearest":
+            print("nearest neighbour interpolation")
+            return Verif_nearest_interpolator(zarr_coords, obs_coords)
