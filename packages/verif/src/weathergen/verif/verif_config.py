@@ -32,7 +32,8 @@ class Variables:
         with open(filename, 'r') as stream:
             self.schema = yaml.safe_load(stream)
 
-        print(self.schema)
+    def __iter__(self):
+        return self.variables.__iter__()
 
     @property
     def variables(self):

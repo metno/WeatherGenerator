@@ -20,10 +20,7 @@ from weathergen.verif.verif_config import Variables
 
 from weathergen.verif.verif_processers import Processer_factory
 
-from weathergen.verif.verif_interpolator import Verif_2D_interpolator
-from weathergen.verif.verif_interpolator import Verif_lat_lon_interpolator
-from weathergen.verif.verif_interpolator import Verif_nearest_interpolator
-from weathergen.verif.verif_interpolator import Verif_pyresample_interpolator
+from weathergen.verif.verif_interpolator import Interpolator_factory
 
 
 def readarg():
@@ -43,8 +40,9 @@ def readarg():
         "-b",
         "--obs",
         dest="obsfile",
-        required=True,
-        default="data/metno_observations_v3.nc",
+        required=False,
+        # default="data/metno_observations_v3.nc",
+        default="/lustre/storeB/project/nwp/weathergen/datasets/metno_observations_v3.nc",
         help="Observation file (.nc)",
     )
 
@@ -87,7 +85,7 @@ def readarg():
         default=None,
         dest="streams",
         nargs="*",
-        help="Do verif for this streams. Default: Infer from .zarr file",
+        help="Do verif for this streams. Default: Infer from .zarr file", # ex. ERA5, CERRA
     )
 
     parser.add_argument(
@@ -95,21 +93,13 @@ def readarg():
         "--method",
         default="2d",
         dest="method",
-        choices=["2d", "lat_lon", "nearest", "pyresample"],
+        choices=["2d", "lat_lon", "nearest", "pyresample_nearest", "pyresample_bilinear", "pyresample_gauss"],
         help="Interpolation method. Default: 2d_interpolation",
-    )
-
-    parser.add_argument(
-        "--pyresample-method",
-        default="nearest",
-        choices=["nearest", "bilinear", "gauss"],
-        help="Pyresample interpolation method (nearest, bilinear, gauss). Default: nearest",
     )
 
     args = parser.parse_args()
 
     return args
-
 
 def create_output_paths(stream, variable, outfiles, method):
     """
@@ -128,7 +118,6 @@ def create_output_paths(stream, variable, outfiles, method):
     pathdir.mkdir(exist_ok=True, parents=True)
     return outfile
 
-
 def generate_time_coordinates(zarrio, stream):
     """
     Read samples and steps from ZarrIO object
@@ -136,20 +125,24 @@ def generate_time_coordinates(zarrio, stream):
     to be used as coordinates in verrif dataset
     """
 
-
-    item = zarrio.get_data(sample=0, stream=stream, forecast_step=1)
-    onetime = item.prediction.as_xarray().valid_time.values[0]
-    item = zarrio.get_data(sample=0, stream=stream, forecast_step=2)
-    twotime = item.prediction.as_xarray().valid_time.values[0]
-
-    dt = (twotime - onetime)
-
     # Initial times are stored as numpy.datetime64 objects in verif
     # Get the valid time of the first step for each sample
     verif_times = [np.datetime64("nat","h")]*len(zarrio.samples)
     for sample in zarrio.samples:
-        item = zarrio.get_data(sample=sample, stream=stream, forecast_step="1")
-        verif_times[int(sample)] = (item.prediction.as_xarray().valid_time.values[0] - dt)
+        item = zarrio.get_data(sample=sample, stream=stream, forecast_step=1)
+        if "source_interval_start" in item.prediction.as_xarray().coords and "source_interval_end" in item.prediction.as_xarray().coords:
+            source_interval_start = item.prediction.as_xarray().source_interval_start.values[0]
+            source_interval_end = item.prediction.as_xarray().source_interval_end.values[0]
+            verif_times[int(sample)] = source_interval_start
+            dt = source_interval_end - source_interval_start
+        else:
+            item = zarrio.get_data(sample=sample, stream=stream, forecast_step=1)
+            onetime = item.prediction.as_xarray().valid_time.values[0]
+            item = zarrio.get_data(sample=sample, stream=stream, forecast_step=2)
+            twotime = item.prediction.as_xarray().valid_time.values[0]
+            item = zarrio.get_data(sample=sample, stream=stream, forecast_step="1")
+            verif_times[int(sample)] = (item.prediction.as_xarray().valid_time.values[0] - dt)
+            dt = (twotime - onetime)
 
     xrtime = xr.DataArray(
         verif_times,
@@ -158,6 +151,7 @@ def generate_time_coordinates(zarrio, stream):
         coords = {"time":verif_times},
         attrs = {"standard_name":"forecast_reference_time"})
 
+    
     dt = dt.astype("timedelta64[h]")
 
     # Lead times are stored as float32 in verif
@@ -190,12 +184,59 @@ def get_streams(zarrio, arg_streams):
     if arg_streams:
         for stream in arg_streams:
             if stream not in zarrio.streams:
-                raise ValueError(
-                    f'Stream {stream} is not present in .zarr file. zarrio.streams: {zarrio.streams}'
+                raise Exception(
+                    f"Stream {stream} is not present in .zarr file. zarrio.streams: {zarrio.streams}"
                 )
         return arg_streams
     else:
         return zarrio.streams
+
+def get_variables(xdata: xr.DataArray, config_file: Path, arg_variables: list, stream: str) -> list:
+    """
+    Go through argument variables,
+    check if they are in the config_file and return
+    a list ov variables.
+    If no arguments are given,
+    return list of variables found in file.
+    """
+
+    config_variables = Variables(config_file)
+
+    config_names = (cv.name for cv in config_variables)
+
+    variables = []
+    if arg_variables:
+
+        # Check if there's a config for requested variables
+        for av in arg_variables:
+            if not av in config_names:
+                raise Exception(
+                    f'Variable {av} does not have an entry in the config file'
+                )
+
+        # Add requested variables to list of variables
+        for cv in config_variables:
+            if cv.name in arg_variables:
+                variables += [cv]
+
+    else:
+        variables = [v for v in config_variables]
+
+    #Check what variables exist in zarr file
+    vvars = []
+    for v in variables:
+        if isinstance(v.zarr_name, str):
+            if v.zarr_name in xdata.channel.values:
+                vvars += [v]
+        else:
+            if (len(set(v.zarr_name).intersection(xdata.channel.values)) == len(v.zarr_name)):
+                vvars += [v]
+    variables = vvars
+
+    if not variables:
+        raise Exception("No variables with configuration found in zarr file.")
+
+    return variables
 
 def get_obs_coordinates(obs):
     """
@@ -253,10 +294,11 @@ def get_point_map(xdata, old_coords):
     return pointmap
 
 
-def plot_norway_points(grid_coords, obs_coords, nearest_grid_coords=None):
+def plot_norway_points(grid_coords, obs_coords, nearest_grid_coords=None, interpolated_values=None):
     """
     Plot grid and observation points on a map centered on Norway.
     If nearest_grid_coords is provided, plot those in green and draw lines from each obs to its nearest grid point.
+    If interpolated_values is provided, color nearest grid points orange if their value is NaN.
     """
     fig = plt.figure(figsize=(10, 12))
     ax = plt.axes(projection=ccrs.PlateCarree())
@@ -272,7 +314,12 @@ def plot_norway_points(grid_coords, obs_coords, nearest_grid_coords=None):
     ax.scatter(grid_coords[:, 1], grid_coords[:, 0], c='blue', s=10, label='Grid Points', alpha=0.5)
     ax.scatter(obs_coords[:, 1], obs_coords[:, 0], c='red', s=20, label='Observation Points', alpha=0.7)
     if nearest_grid_coords is not None:
-        ax.scatter(nearest_grid_coords[:, 1], nearest_grid_coords[:, 0], c='green', s=30, label='Nearest Grid Points', alpha=0.7)
+        # Default: all nearest grid points green
+        colors = ['green'] * nearest_grid_coords.shape[0]
+        if interpolated_values is not None:
+            # Color orange if interpolated value is NaN
+            colors = ['orange' if np.isnan(val) else 'green' for val in interpolated_values]
+        ax.scatter(nearest_grid_coords[:, 1], nearest_grid_coords[:, 0], c=colors, s=30, label='Nearest Grid Points', alpha=0.7)
         # Draw lines from each observation to its nearest grid point
         for obs, nearest in zip(obs_coords, nearest_grid_coords):
             ax.plot([obs[1], nearest[1]], [obs[0], nearest[0]], c='gray', linewidth=0.8, alpha=0.6)
@@ -302,58 +349,29 @@ def main():
     print()
 
     config_file = Path(__file__).parent/"verif_config.yaml"
-    variables = Variables(config_file)
+
+    method_factory = Interpolator_factory(args.method)
 
     with ZarrIO(args.zarrfile) as zarrio:
 
         streams = get_streams(zarrio, args.streams)
-        print("streams:", streams)
 
         t_start = time()
 
         for stream in streams:
-
-            print(stream)
-            print()
-
-            xrtime, xrleadtime = generate_time_coordinates(zarrio, stream)
-
-            item = zarrio.get_data(sample=0, stream=stream, forecast_step=1)
-            xdata = item.prediction.as_xarray()
-
-            print()
-            print(xdata)
-            print(xdata.channel)
-            print()
-
+            # Load a sample to get grid coordinates
+            sample = zarrio.samples[0]
+            xdata = zarrio.get_data(sample=sample, stream=stream, forecast_step=1).prediction.as_xarray()
             zarr_coords = np.column_stack((xdata.ipoint.lat.values, xdata.ipoint.lon.values))
-            obs_coords = np.column_stack((lat.values, lon.values))
 
-            # Create and prepare interpolator
-            if args.method == "2d":
-                print()
-                print("2D interpolation")
-                interpolator = Verif_2D_interpolator(zarr_coords, obs_coords)
-
-            elif args.method == "lat_lon":
-                print()
-                print("lat-lon interpolation")
-                interpolator = Verif_lat_lon_interpolator(zarr_coords, obs_coords)
-
-            elif args.method == "nearest":
-                print()
-                print("nearest neighbour interpolation")
-                interpolator = Verif_nearest_interpolator(zarr_coords, obs_coords)
-            elif args.method == "pyresample":
-                interpolator = Verif_pyresample_interpolator(zarr_coords, obs_coords, args.pyresample_method)
-
+            interpolator = method_factory.get_interpolator(zarr_coords, obs_coords)
             interpolator.prepare()
 
             # --- Write coordinates to Diana files ---
             diana_io(Path(f"output/verif/{stream}_grid_coords.diana")).write(zarr_coords)
             diana_io(Path(f"output/verif/{stream}_obs_coords.diana")).write(obs_coords)
             nearest_grid_coords = None
-            if args.method == "nearest" or (args.method == "pyresample" and args.pyresample_method == "nearest"):
+            if args.method == "nearest" or args.method == "pyresample_nearest":
                 nearest_indices = interpolator.indices.flatten()
                 nearest_grid_coords = zarr_coords[nearest_indices]
                 diana_io(Path(f"output/verif/{stream}_nearest_grid_coords.diana")).write(nearest_grid_coords)
@@ -368,9 +386,11 @@ def main():
 
             processers = Processer_factory(zarrio, obs, stream, interpolator)
 
-            for v in variables.variables:
+            for v in variables:
 
                 vt_start = time()
+
+                print("variable: ", v.name)
 
                 fcstdata = np.ndarray(data_shape, dtype=np.float32)
                 obsdata  = np.ndarray(data_shape, dtype=np.float32)
@@ -399,14 +419,14 @@ def main():
                                    lon,
                                    alt])
 
-                print()
                 outfile = create_output_paths(stream, v.name, args.outfiles, args.method)
 
                 merged.to_netcdf(outfile, encoding={"time": {"units": "seconds since 1970-01-01 00:00:00"}})
 
                 vt_end = time()
 
-                print(v.name, "time: ", vt_end - vt_start) 
+                print(v.name, "time: ", vt_end - vt_start)
+                print()
 
         t_end = time()
 

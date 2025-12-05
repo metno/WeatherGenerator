@@ -204,6 +204,11 @@ class Verif_pyresample_interpolator(Verif_interpolator):
         # grid_points and obs_points are (N, 2) arrays: lat, lon
         self.grid_def = geometry.SwathDefinition(lons=self.grid_points[:, 1], lats=self.grid_points[:, 0])
         self.obs_def = geometry.SwathDefinition(lons=self.obs_points[:, 1], lats=self.obs_points[:, 0])
+        if self.method == "pyresample_nearest":
+            # Compute nearest indices for each observation
+            from scipy.spatial import cKDTree
+            tree = cKDTree(self.grid_points)
+            _, self.indices = tree.query(self.obs_points, k=1)
 
     def interpolate(self, values, intmap=None):
         """
@@ -211,19 +216,19 @@ class Verif_pyresample_interpolator(Verif_interpolator):
         """
         if intmap is not None:
             values = values[intmap]
-        if self.method == "nearest":
+        if self.method == "pyresample_nearest":
             result = kd_tree.resample_nearest(
                 self.grid_def, values, self.obs_def,
                 radius_of_influence=50000,
                 fill_value=np.nan
             )
-        elif self.method == "bilinear":
+        elif self.method == "pyresample_bilinear":
             result = kd_tree.resample_bilinear(
                 self.grid_def, values, self.obs_def,
                 radius_of_influence=50000,
                 fill_value=np.nan
             )
-        elif self.method == "gauss":
+        elif self.method == "pyresample_gauss":
             result = kd_tree.resample_gauss(
                 self.grid_def, values, self.obs_def,
                 radius_of_influence=50000,
@@ -233,3 +238,31 @@ class Verif_pyresample_interpolator(Verif_interpolator):
         else:
             raise ValueError(f"Unknown pyresample method: {self.method}")
         return result.astype(np.float32)
+
+class Interpolator_factory():
+
+    def __init__(self, method: str):
+
+        valid_methods = ("2d", "lat_lon", "nearest", "pyresample_nearest", "pyresample_bilinear", "pyresample_gauss")
+
+        if (method not in valid_methods):
+            raise Exception(f"{method} is not a valid method.")
+
+        self.method = method
+
+    def get_interpolator(self, zarr_coords: np.ndarray, obs_coords: np.ndarray) -> Verif_interpolator:
+        if self.method == "2d":
+            print("2D interpolation")
+            return Verif_2D_interpolator(zarr_coords, obs_coords)
+        elif self.method == "lat_lon":
+            print("lat-lon interpolation")
+            return Verif_lat_lon_interpolator(zarr_coords, obs_coords)
+
+        elif self.method == "nearest":
+            print("nearest neighbour interpolation")
+            return Verif_nearest_interpolator(zarr_coords, obs_coords)
+        elif self.method.startswith("pyresample"):
+            print("pyresample interpolation")
+            return Verif_pyresample_interpolator(zarr_coords, obs_coords, method=self.method)
+        else:
+            raise Exception(f"{self.method} is not implemented.")

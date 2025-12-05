@@ -37,7 +37,7 @@
     units:       "m/s",
     long_name:   "wind speed",
     conventions: "verif_1.0.0"}
-  zarr_name:  "10u, 10v"
+  zarr_name:  ["10u","10v"]
   zarr_units: "m/s"
   obs_name:   "wind_speed"
   obs_units:  "m/s"

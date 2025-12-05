@@ -32,11 +32,11 @@ class Processer:
                 fcstdata[sample, step, :] = self.get_fcstdata(ydata, v.zarr_name, sample, step+1)
 
 
-    def get_obsdata(self, obs:xr.DataArray, name: str, time: np.datetime64):
+    def get_obsdata(self, obs:xr.DataArray, name: str, time: np.datetime64) -> np.ndarray:
 
         return obs.data_vars[name].sel(time=time)
 
-    def get_fcstdata(self, ydata:xr.DataArray, name: str, sample: int,  step: int):
+    def get_fcstdata(self, ydata:xr.DataArray, name: str, sample: int,  step: int) -> np.ndarray:
 
         return self.interpolator.interpolate(ydata.sel(sample=sample,
                                                        stream=self.stream,
@@ -46,10 +46,10 @@ class Processer:
 
 class MSLP_processer(Processer):
 
-    def get_obsdata(self, obs:xr.DataArray, name: str, time: np.datetime64):
+    def get_obsdata(self, obs:xr.DataArray, name: str, time: np.datetime64) -> np.ndarray:
         return self.compute_mslp(obs, time)
 
-    def compute_mslp(self, obs:xr.DataArray, time: np.datetime64):
+    def compute_mslp(self, obs:xr.DataArray, time: np.datetime64) -> np.ndarray:
 
         g   = 9.80665 # Gravitational acceleration (m/s**2)
         R   = 8.31447 # Universal gas constant (J/mol*K)
@@ -88,7 +88,7 @@ class MSLP_processer(Processer):
 
 class Wind_processer(Processer):
 
-    def get_fcstdata(self, ydata:xr.DataArray, name: str, sample: int,  step: int):
+    def get_fcstdata(self, ydata:xr.DataArray, name: str, sample: int,  step: int) -> np.ndarray:
 
         u = self.interpolator.interpolate(ydata.sel(sample=sample,
                                           stream=self.stream,
