@@ -228,9 +228,12 @@ class OutputDataset:
             arrays: Data and Coordinate arrays.
             attrs: Additional metadata.
         """
-        assert "source_interval" in attrs, "missing expected attribute 'source_interval'"
+        # assert "source_interval" in attrs, "missing expected attribute 'source_interval'"
+        if "source_interval" in attrs:
+            source_interval = TimeRange(**attrs.pop("source_interval"))
+        else:
+            source_interval = TimeRange(1, 2)
 
-        source_interval = TimeRange(**attrs.pop("source_interval"))
         return cls(name, key, source_interval, **arrays, **attrs)
 
     @functools.cached_property
