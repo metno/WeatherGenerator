@@ -4,7 +4,7 @@ This test must run on a GPU machine.
 It performs a training and inference of the Weather Generator model.
 
 Command:
-uv run pytest  ./integration_tests/small1.py
+uv run pytest  ./integration_tests/small1_test.py
 """
 
 import json
