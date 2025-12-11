@@ -147,7 +147,7 @@ class MetnoParser(CfParser):
         for name,attrs in self.config.dimensions.items():
             if name in ds:
                 for k,v in attrs.items():
-                    ds[name].attrd[k] = v
+                    ds[name].attrs[k] = v
 
         return ds
 
