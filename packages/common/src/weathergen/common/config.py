@@ -132,28 +132,38 @@ def _get_model_config_file_read_name(path: Path, run_id: str, mini_epoch: int | 
     return path / run_id / f"model_{run_id}{mini_epoch_str}.json"
 
 
-def get_model_results(run_id: str, mini_epoch: int, rank: int) -> Path:
+def get_model_results(run_id: str, mini_epoch: int, rank: int, zarr_dir: str = "results") -> Path:
     """
     Get the path to the model results zarr store from a given run_id and mini_epoch.
+    
+    Args:
+        run_id: Run identifier
+        mini_epoch: Epoch number
+        rank: Rank number
+        zarr_dir: Directory relative to shared working dir (e.g., 'experiments/era5_o96_cerra')
     """
-    run_results = Path(_load_private_conf(None)["path_shared_working_dir"]) / f"results/{run_id}"
-
+    base_path = Path(_load_private_conf(None)["path_shared_working_dir"])
+    run_results = base_path / zarr_dir / run_id
+    
     print(f"look for results in {run_results} path")
-    zarr_path_new = run_results / f"validation_chkpt{mini_epoch:05d}_rank{rank:04d}.zarr"
-    zarr_path_old = run_results / f"validation_epoch{mini_epoch:05d}_rank{rank:04d}.zarr"
-
+    
+    zarr_filename_new = f"validation_chkpt{mini_epoch:05d}_rank{rank:04d}.zarr"
+    zarr_filename_old = f"validation_epoch{mini_epoch:05d}_rank{rank:04d}.zarr"
+    
+    zarr_path_new = run_results / zarr_filename_new
+    zarr_path_old = run_results / zarr_filename_old
+    
     if zarr_path_new.exists() or zarr_path_new.is_dir():
-        zarr_path = zarr_path_new
+        return zarr_path_new
     elif zarr_path_old.exists() or zarr_path_old.is_dir():
-        zarr_path = zarr_path_old
+        return zarr_path_old
     else:
         raise FileNotFoundError(
             f"Zarr file with run_id {run_id}, mini_epoch {mini_epoch} and rank {rank} does not "
-            f"exist or is not a directory."
+            f"exist or is not a directory in {run_results}"
         )
 
     #zarr_path = f"/lustre/storeB/users/cristianl/kmupf50t/validation_epoch{epoch:05d}_rank{rank:04d}.zarr"
-    return zarr_path
 
 
 def _apply_fixes(config: Config) -> Config:

@@ -314,21 +314,21 @@ def main():
                 obsdata = np.ndarray(fcstdata.shape, dtype=np.float32)
 
                 for sample in range(len(zarrio.samples)):
-                    for step in range(len(zarrio.forecast_steps)):
+                    for step_idx, fstep in enumerate(zarrio.forecast_steps):
 
-                        item = zarrio.get_data(sample=sample, stream=stream, forecast_step=step+1)
+                        item = zarrio.get_data(sample=sample, stream=stream, forecast_step=fstep)
                         newdata = item.prediction.as_xarray()
 
                         ydata = Scores.sort_by_coords(newdata, xdata)
 
-                        fcstdata[sample,step,:] = interpolator.interpolate(ydata.sel(sample=sample,
+                        fcstdata[sample,step_idx,:] = interpolator.interpolate(ydata.sel(sample=sample,
                                                                                      stream=stream,
-                                                                                     forecast_step=step+1,
+                                                                                     forecast_step=fstep,
                                                                                      channel=v,
                                                                                      ens=0).values)
 
 
-                        obsdata[sample, step, :] = obs.data_vars[vmap[v]].sel(time=ydata.valid_time.values[0])
+                        obsdata[sample, step_idx, :] = obs.data_vars[vmap[v]].sel(time=ydata.valid_time.values[0])
 
 
                 xrobsdata = xr.DataArray(obsdata,

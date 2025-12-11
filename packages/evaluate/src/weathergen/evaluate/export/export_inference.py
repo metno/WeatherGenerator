@@ -143,6 +143,13 @@ def parse_args(args: list) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--zarr-dir",
+        type=str,
+        default="results",
+        help="Directory path relative to shared working dir where zarr files are stored (e.g., 'experiments/era5_o96_cerra')",
+    )
+
+    parser.add_argument(
         "--template",
         type=str,
         help="Path to GRIB template file",
@@ -169,6 +176,7 @@ def parse_args(args: list) -> argparse.Namespace:
         help="Field shape of the output grid (num_y, num_x)",
         nargs=2,
         required=False,
+    )
     parser.add_argument(
         "--regrid-degree",
         type=float,

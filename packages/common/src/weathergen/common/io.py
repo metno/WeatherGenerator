@@ -20,7 +20,7 @@ import xarray as xr
 import zarr
 from numpy import datetime64
 from numpy.typing import NDArray
-from zarr.storage import LocalStore
+from zarr.storage import DirectoryStore
 
 # experimental value, should be inferred more intelligently
 CHUNK_N_SAMPLES = 16392
@@ -228,10 +228,11 @@ class OutputDataset:
             arrays: Data and Coordinate arrays.
             attrs: Additional metadata.
         """
-        # assert "source_interval" in attrs, "missing expected attribute 'source_interval'"
-
-        # source_interval = TimeRange(**attrs.pop("source_interval"))
-        source_interval = TimeRange(1, 2)
+        # Extract source_interval from attrs if present, otherwise use default
+        if "source_interval" in attrs:
+            source_interval = TimeRange(**attrs.pop("source_interval"))
+        else:
+            source_interval = TimeRange(1, 2)
         return cls(name, key, source_interval, **arrays, **attrs)
 
     @functools.cached_property
@@ -319,17 +320,17 @@ class ZarrIO:
     def __init__(self, store_path: pathlib.Path):
         self._store_path = store_path
         self.data_root: zarr.Group | None = None
-        self._store: LocalStore | None = None
+        self._store: DirectoryStore | None = None
 
     def __enter__(self) -> typing.Self:
-        self._store = LocalStore(self._store_path)
-        self.data_root = zarr.group(store=self._store)
+        self._store = DirectoryStore(str(self._store_path))
+        self.data_root = zarr.open_group(store=self._store, mode='r+')
 
         return self
 
     def __exit__(self, exc_type, exc_value, exc_tb):
-        if self._store is not None:
-            self._store.close()
+        # DirectoryStore in zarr 2.x doesn't have close method
+        pass
 
     def write_zarr(self, item: OutputItem):
         """Write one output item to the zarr store."""
@@ -410,7 +411,7 @@ class ZarrIO:
         try:
             sample, example_sample = next(self.data_root.groups())
             stream, example_stream = next(example_sample.groups())
-            fstep = 1
+            fstep = 0  # Check fstep 0 to determine forecast_offset
         except StopIteration as e:
             msg = f"Data store at: {self._store_path} is empty."
             raise FileNotFoundError(msg) from e
