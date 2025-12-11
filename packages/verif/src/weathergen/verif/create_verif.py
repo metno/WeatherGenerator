@@ -8,7 +8,7 @@ from pathlib import Path
 
 from weathergen.common.io import ZarrIO
 
-from weathergen.evaluate.score import Scores
+from weathergen.evaluate.scores.score import Scores
 
 from weathergen.verif.diana_io import diana_io
 
