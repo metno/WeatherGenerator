@@ -27,12 +27,14 @@ _logger = logging.getLogger(__name__)
 
 
 class DataReaderSynop(DataReaderTimestep):
-    "Generic parser for station data in NetCDF format. The file must have 2 dimensions: time and location.
+    """
+    Generic parser for station data in NetCDF format. The file must have 2 dimensions: time and location.
         - Data variables must have dimensions in the following order (time, location). The names of the dimension can be anything.
         - Geoinfo variables must have dimension (location,)
         - Any variable with missing values must have the _FillValue attribute set
         - A latitude and longitude variable with dimension (location,) must be provided. The units must be degrees and the variable name can be configured.
-        - A variable called time must be provided and have dimension (time,). Units must follow CF-conventions and the variable must have a units attribute."
+        - A variable called time must be provided and have dimension (time,). Units must follow CF-conventions and the variable must have a units attribute.
+    """
 
 
     def __init__(
@@ -58,8 +60,13 @@ class DataReaderSynop(DataReaderTimestep):
 
         np32 = np.float32
 
+        print(f"[DataReaderSynop] filename = {filename}")
+        print(f"[DataReaderSynop] stream_info keys = {list(stream_info.keys())}")
+
         # open dataset to peak that it is compatible with requested parameters
         ds = xr.open_dataset(filename, engine="netcdf4")
+        print(f"[DataReaderSynop] ds.dims = {ds.dims}")
+        print(f"[DataReaderSynop] ds.variables = {list(ds.variables)}")
 
         # If there is no overlap with the time range, the dataset will be empty
         if tw_handler.t_start >= ds.time.max() or tw_handler.t_end <= ds.time.min():
@@ -94,7 +101,7 @@ class DataReaderSynop(DataReaderTimestep):
             self.ds = ds
             self.len = len(ds)
 
-#        self.offset_data_channels = 4
+        self.offset_data_channels = 4
         self.fillvalue = ds["air_temperature"][0, 0].values.item()
         self.channels_file = [k for k in self.ds.keys()]
 
@@ -107,8 +114,13 @@ class DataReaderSynop(DataReaderTimestep):
         self.geoinfo_channels = stream_info.get("geoinfos", [])
         self.geoinfo_idx = [self.channels_file.index(ch) for ch in self.geoinfo_channels]
         # cache geoinfos
+        print(f"[DataReaderSynop] geoinfo_channels = {self.geoinfo_channels}")
         self.geoinfo_data = np.stack([np.array(ds[ch], dtype=np32) for ch in self.geoinfo_channels])
         self.geoinfo_data = self.geoinfo_data.transpose()
+
+        for ch in self.geoinfo_channels:
+            print(f"[DataReaderSynop] geoinfo '{ch}' in dataset:", ch in ds)
+
 
         # select/filter requested source channels
         self.source_idx = self.select_channels(ds, "source")
@@ -117,6 +129,9 @@ class DataReaderSynop(DataReaderTimestep):
         # select/filter requested target channels
         self.target_idx = self.select_channels(ds, "target")
         self.target_channels = [self.channels_file[i] for i in self.target_idx]
+
+        print(f"[DataReaderSynop] source_channels = {self.source_channels}")
+        print(f"[DataReaderSynop] target_channels = {self.target_channels}")
 
         ds_name = stream_info["name"]
         _logger.info(f"{ds_name}: source channels: {self.source_channels}")

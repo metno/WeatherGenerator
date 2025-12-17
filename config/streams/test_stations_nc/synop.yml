@@ -1,0 +1,35 @@
+# obs_types
+# 0 : polar orbiting satellites
+# 1 : geostationay satellites
+# 2 : conventional observations
+
+SurfaceCombined :
+  type : station
+  filenames : ['metno_observations_v3.nc']
+  source : ['air_temperature', 'precipitation_amount_1h', 'relative_humidity', 'surface_air_pressure', 'wind_from_direction', 'wind_speed', 'wind_speed_of_gust']
+  target : ['air_temperature', 'precipitation_amount_1h', 'relative_humidity', 'surface_air_pressure', 'wind_from_direction', 'wind_speed', 'wind_speed_of_gust']
+  geoinfo: ['altitude', 'is_wmo_station']
+  latitude_name: 'latitude'
+  longitude_name: 'longitude'
+  loss_weight : 1.0
+  masking_rate : 0.6
+  masking_rate_none : 0.05
+  token_size : 64
+  tokenize_spacetime : True
+  max_num_targets: -1
+  embed : 
+    net : transformer
+    num_tokens : 1
+    num_heads : 2
+    dim_embed : 256
+    num_blocks : 2
+  embed_target_coords : 
+    net : linear
+    dim_embed : 256
+  target_readout :
+    type : 'obs_value'  # token or obs_value
+    num_layers : 2
+    num_heads : 4
+  pred_head : 
+    ens_size : 1
+    num_layers : 1
