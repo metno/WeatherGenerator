@@ -8,7 +8,7 @@ SurfaceCombined :
   filenames : ['metno_observations_v3.nc']
   source : ['air_temperature', 'precipitation_amount_1h', 'relative_humidity', 'surface_air_pressure', 'wind_from_direction', 'wind_speed', 'wind_speed_of_gust']
   target : ['air_temperature', 'precipitation_amount_1h', 'relative_humidity', 'surface_air_pressure', 'wind_from_direction', 'wind_speed', 'wind_speed_of_gust']
-  geoinfo: ['altitude', 'is_wmo_station']
+  geoinfos: ['altitude', 'is_wmo_station']
   latitude_name: 'latitude'
   longitude_name: 'longitude'
   loss_weight : 1.0
