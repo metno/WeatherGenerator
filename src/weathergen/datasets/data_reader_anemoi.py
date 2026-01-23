@@ -35,7 +35,7 @@ class DataReaderAnemoi(DataReaderTimestep):
     def __init__(
         self,
         tw_handler: TimeWindowHandler,
-        filename: Path,
+        filename: Path | dict,
         stream_info: dict,
     ) -> None:
         """
@@ -44,7 +44,7 @@ class DataReaderAnemoi(DataReaderTimestep):
         Parameters
         ----------
         filename :
-            filename (and path) of dataset
+            filename (and path) of dataset, or anemoi-dataset config (dict)
         stream_info :
             information about stream
 
@@ -54,7 +54,11 @@ class DataReaderAnemoi(DataReaderTimestep):
         """
 
         # open  dataset to peak that it is compatible with requested parameters
-        ds0: Dataset = anemoi_datasets.open_dataset(filename)
+        if isinstance(filename, dict):
+            ds0: Dataset = anemoi_datasets.open_dataset(**filename)
+        else:
+            ds0: Dataset = anemoi_datasets.open_dataset(filename)
+
         # If there is no overlap with the time range, the dataset will be empty
         if tw_handler.t_start >= ds0.dates[-1] or tw_handler.t_end <= ds0.dates[0]:
             name = stream_info["name"]
