@@ -11,6 +11,7 @@ import logging
 import pathlib
 
 import numpy as np
+import omegaconf
 import torch
 
 from weathergen.common.config import Config
@@ -25,7 +26,7 @@ from weathergen.datasets.data_reader_base import (
 from weathergen.datasets.data_reader_fesom import DataReaderFesom
 from weathergen.datasets.data_reader_obs import DataReaderObs
 from weathergen.datasets.data_reader_synop import DataReaderSynop
-from weathergen.datasets.icon_dataset import IconDataset
+#from weathergen.datasets.icon_dataset import IconDataset
 from weathergen.datasets.masking import Masker
 from weathergen.datasets.stream_data import StreamData, spoof
 from weathergen.datasets.tokenizer_masking import TokenizerMasking
@@ -156,6 +157,13 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
                         dataset = DataReaderAnemoi
                     case "fesom":
                         dataset = DataReaderFesom
+                        datapath = cf.data_path_fesom
+#                    case "icon":
+#                        dataset = IconDataset
+#                        datapath = cf.data_path_icon
+                    case "station":
+                        dataset = DataReaderSynop
+                        datapath = cf.data_path_obs
                     case type_name:
                         dataset = get_extra_reader(type_name)
                         if dataset is None:
@@ -188,6 +196,31 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
                             f"stream '{stream_info['name']}': {filenames}."
                         )
                         raise FileNotFoundError(msg)
+
+                # Resolve filename safely
+                datapath = pathlib.Path(datapath)
+                filename = stream_info.get("filenames")
+                if type(filename) is omegaconf.dictconfig.DictConfig:
+                    # Convert OmegaConf DictConfig to dict
+                    filename = dict(filename)
+                    # Prepend datapath to each dataset
+                    for entry in filename['join']:
+                        entry['dataset'] = str(datapath / entry['dataset'])
+                elif type(filename) is omegaconf.listconfig.ListConfig:
+                    fname = pathlib.Path(fname)
+                    # dont check if file exists since zarr stores might be directories
+                    if fname.exists():
+                        # check if fname is a valid path to allow for simple overwriting
+                        filename = fname
+                    else:
+                        filename = pathlib.Path(datapath) / fname
+    
+                        if not filename.exists():  # see above
+                            msg = (
+                                f"Did not find input data for {stream_info['type']} "
+                                f"stream '{stream_info['name']}': {filename}."
+                            )
+                            raise FileNotFoundError(msg)
 
                     # The same dataset can exist on different locations in the filesystem,
                     # so we need to choose here.
