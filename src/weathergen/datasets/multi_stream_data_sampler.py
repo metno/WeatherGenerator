@@ -164,16 +164,6 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
                     case "station":
                         dataset = DataReaderSynop
                         datapath = cf.data_path_obs
-                    case type_name:
-                        dataset = get_extra_reader(type_name)
-                        if dataset is None:
-                            msg = f"Unsupported stream type {stream_info['type']}"
-                            f"for stream name '{stream_info['name']}'."
-                            raise ValueError(msg)
-                        datapath = cf.data_path_fesom
-                    case "icon":
-                        dataset = IconDataset
-                        datapath = cf.data_path_icon
                     case "station":
                         dataset = DataReaderSynop
                         datapath = cf.data_path_obs
