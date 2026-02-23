@@ -30,6 +30,9 @@ class RegionLibrary:
         "belgium": (49, 52, 2, 7),
         "europe": (35, 70, -10, 40),
         "nordic": (52.30, 73.86, -11.76, 41.76),
+        "norway_north": (66.1, 71.4, 11.0, 31.8),
+        "norway_middle": (63.2, 68.6, 7.5, 18.2),
+        "norway_south": (57.7, 63.8, 4, 12.6)
     }
 
 
