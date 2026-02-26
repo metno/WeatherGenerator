@@ -144,95 +144,85 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             # list of sources for current stream
             self.streams_datasets[stream_info["name"]] = []
 
-            for fname in stream_info["filenames"]:
-                kwargs = {
+            kwargs = {
                     "tw_handler": self.time_window_handler,
                     "stream_info": stream_info,
                 }
-                dataset: type[AnyDataReader] | None = None
-                match stream_info["type"]:
-                    case "obs":
-                        dataset = DataReaderObs
-                    case "anemoi":
-                        dataset = DataReaderAnemoi
-                    case "fesom":
-                        dataset = DataReaderFesom
-                        datapath = cf.data_path_fesom
-#                    case "icon":
-#                        dataset = IconDataset
-#                        datapath = cf.data_path_icon
-                    case "station":
-                        dataset = DataReaderSynop
-                        datapath = cf.data_path_obs
-                    case "station":
-                        dataset = DataReaderSynop
-                        datapath = cf.data_path_obs
-                    case _:
-                        msg = f"Unsupported stream type {stream_info['type']}"
-                        f"for stream name '{stream_info['name']}'."
-                        raise ValueError(msg)
 
-                fname = pathlib.Path(fname)
-                # dont check if file exists since zarr stores might be directories
-                if fname.exists():
-                    # check if fname is a valid path to allow for simple overwriting
-                    filename = fname
-                else:
-                    filenames = [pathlib.Path(path) / fname for path in cf.data_paths]
-
-                    if not any(filename.exists() for filename in filenames):  # see above
+            #
+            dataset: type[AnyDataReader] | None = None
+            match stream_info["type"]:
+                case "obs":
+                    dataset = DataReaderObs
+                case "anemoi":
+                    dataset = DataReaderAnemoi
+                case "fesom":
+                    dataset = DataReaderFesom
+                case "station":
+                    dataset = DataReaderSynop
+                case _:
+                    msg = f"Unsupported stream type {stream_info['type']}"
+                    f"for stream name '{stream_info['name']}'."
+                    raise ValueError(msg)
+            #
+            filename = stream_info.get("filenames")
+            if type(filename) is omegaconf.dictconfig.DictConfig:
+                # Convert OmegaConf DictConfig to dict
+                filename = dict(filename)
+                # Prepend datapath to each dataset
+                for entry in filename['join']:
+                    datapath=None
+                    for path in cf.data_paths:
+                        filename_tmp = pathlib.Path(path) / entry['dataset'] 
+                        if filename_tmp.exists():
+                            datapath=pathlib.Path(path)
+                            break
+                    if datapath is None:
                         msg = (
                             f"Did not find input data for {stream_info['type']} "
-                            f"stream '{stream_info['name']}': {filenames}."
+                            f"stream '{stream_info['name']}'"
                         )
                         raise FileNotFoundError(msg)
 
-                # Resolve filename safely
-                datapath = pathlib.Path(datapath)
-                filename = stream_info.get("filenames")
-                if type(filename) is omegaconf.dictconfig.DictConfig:
-                    # Convert OmegaConf DictConfig to dict
-                    filename = dict(filename)
-                    # Prepend datapath to each dataset
-                    for entry in filename['join']:
-                        entry['dataset'] = str(datapath / entry['dataset'])
-                elif type(filename) is omegaconf.listconfig.ListConfig:
-                    fname = pathlib.Path(fname)
-                    # dont check if file exists since zarr stores might be directories
-                    if fname.exists():
-                        # check if fname is a valid path to allow for simple overwriting
-                        filename = fname
-                    else:
-                        filename = pathlib.Path(datapath) / fname
-    
-                        if not filename.exists():  # see above
-                            msg = (
-                                f"Did not find input data for {stream_info['type']} "
-                                f"stream '{stream_info['name']}': {filename}."
-                            )
-                            raise FileNotFoundError(msg)
-
-                    # The same dataset can exist on different locations in the filesystem,
-                    # so we need to choose here.
-                    filename = filenames[0]
-
-                ds_type = stream_info["type"]
-                if is_root():
-                    logger.info(
-                        f"Opening dataset with type: {ds_type}"
-                        + f" from stream config {stream_info['name']}.",
+                    entry['dataset'] = str(datapath / entry['dataset'])
+            elif type(filename) is omegaconf.listconfig.ListConfig:
+                if len(filename) > 1:
+                    msg = (
+                        f"Multiple filenames found for {stream_info['type']} "
+                        f"stream '{stream_info['name']}'"
+                        f"Only the first one will be used"
                     )
-                ds = dataset(filename=filename, **kwargs)
+                datapath=None
+                for path in cf.data_paths:
+                    filename_tmp = pathlib.Path(path) / filename[0]
+                    if filename_tmp.exists():
+                        datapath=pathlib.Path(path)
+                        break
+                if datapath is None:
+                    msg = (
+                        f"Did not find input data for {stream_info['type']} "
+                        f"stream '{stream_info['name']}'"
+                    )
+                    raise FileNotFoundError(msg)
+                filename = str( datapath / filename[0]) 
 
-                stream_info[str(self._stage) + "_source_channels"] = ds.source_channels
-                stream_info[str(self._stage) + "_target_channels"] = ds.target_channels
-                stream_info["target_channel_weights"] = (
-                    ds.target_channel_weights
-                    if ds.target_channel_weights is not None
-                    else [1.0 for _ in ds.target_channels]
+            ds_type = stream_info["type"]
+            if is_root():
+                logger.info(
+                    f"Opening dataset with type: {ds_type}"
+                    + f" from stream config {stream_info['name']}.",
                 )
+            ds = dataset(filename=filename, **kwargs)
 
-                self.streams_datasets[stream_info["name"]] += [ds]
+            stream_info[str(self._stage) + "_source_channels"] = ds.source_channels
+            stream_info[str(self._stage) + "_target_channels"] = ds.target_channels
+            stream_info["target_channel_weights"] = (
+                ds.target_channel_weights
+                if ds.target_channel_weights is not None
+                else [1.0 for _ in ds.target_channels]
+            )
+
+            self.streams_datasets[stream_info["name"]] += [ds]
 
         # length of dataset; check the repeat data flag and adjust len accordingly
         self.len = int(index_range.end - index_range.start)

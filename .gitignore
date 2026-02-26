@@ -227,3 +227,11 @@ results
 reports
 config/streams/metno_test
 *.cristian.*yml
+config/streams/metno_offgrid_e0/
+config/streams/metno_test_bak/
+config/streams/metno_test_fsteps/
+config/streams/metno_test_fsteps_bak/
+config/streams/metno_test_fsteps_inference/
+config/streams/metno_test_inference/
+src/weathergen/datasets/*.bak
+
