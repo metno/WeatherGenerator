@@ -25,7 +25,6 @@ from weathergen.evaluate.plotting.plot_utils import (
     bar_plot_metric_region,
     heat_maps_metric_region,
     plot_metric_region,
-    quantile_plot_metric_region,
     ratio_plot_metric_region,
     score_card_metric_region,
 )
@@ -33,7 +32,6 @@ from weathergen.evaluate.plotting.plotter import (
     BarPlots,
     LinePlots,
     Plotter,
-    QuantilePlots,
     ScoreCards,
 )
 from weathergen.evaluate.scores.score import VerifiedData, get_score
@@ -596,7 +594,7 @@ def plot_summary(cfg: dict, scores_dict: dict, summary_dir: Path):
     plotter = LinePlots(plot_cfg, summary_dir)
     sc_plotter = ScoreCards(plot_cfg, summary_dir)
     br_plotter = BarPlots(plot_cfg, summary_dir)
-    quantile_plotter = QuantilePlots(plot_cfg, summary_dir)
+    # quantile_plotter = QuantilePlots(plot_cfg, summary_dir)
     plotting_log_emitted = False
     for region in regions:
         for metric in metrics:
@@ -614,10 +612,10 @@ def plot_summary(cfg: dict, scores_dict: dict, summary_dir: Path):
                 if not plotting_log_emitted:
                     _logger.info(f"Saving bar plots to: {summary_dir}")
                 bar_plot_metric_region(metric, region, runs, scores_dict, br_plotter)
-            if metric == "qq_analysis":
-                if not plotting_log_emitted:
-                    _logger.info(f"Saving quantile plots to: {summary_dir}")
-                quantile_plot_metric_region(metric, region, runs, scores_dict, quantile_plotter)
+            # if metric == "qq_analysis":
+            #     if not plotting_log_emitted:
+            #         _logger.info(f"Saving quantile plots to: {summary_dir}")
+            #     quantile_plot_metric_region(metric, region, runs, scores_dict, quantile_plotter)
             plotting_log_emitted = True
 
 
