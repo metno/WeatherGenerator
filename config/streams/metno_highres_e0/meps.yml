@@ -1,0 +1,53 @@
+# (C) Copyright 2024 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+#config = {
+#  "dataset": {
+#    "join": [
+#      {"dataset": "/leonardo_work/AIFAC_5C0_154/tnipen00/datasets/meps-2p5km-2020-2025-1y-topo-v1.zarr", "interpolate_frequency": "6h"},
+#      {"dataset":  "/leonardo_work/AIFAC_5C0_154/weathergen/data/aifs-meps-2.5km-2020-2025-6h-v7.zarr"}
+#    ]
+#  }
+#}
+
+MEPS :
+  type : anemoi
+  stream_id : 1
+  filenames:
+      join:
+          - dataset: 'meps-2p5km-2020-2025-1y-topo-v1.zarr' 
+            interpolate_frequency: '6h'
+          - dataset: 'aifs-meps-2.5km-2020-2025-6h-v7.zarr' 
+            #  filenames : ['aifs-meps-2.5km-2020-2025-6h-v7.zarr']
+  source : ['10u', '10v', '2t', 'msl', 'q_1000', 'q_300', 'q_500', 'q_700', 'q_850', 'q_925', 'skt', 'sp', 't_1000', 't_300', 't_500', 't_700', 't_850', 't_925', 'tcw', 'tp', 'u_1000', 'u_300', 'u_500', 'u_700', 'u_850', 'u_925', 'v_1000', 'v_300', 'v_500', 'v_700', 'v_850', 'v_925', 'z_1000', 'z_300', 'z_500', 'z_700', 'z_850', 'z_925']
+  #  target :  ['10u', '10v', '2t', 'msl', 'sp', 'tp', 'z_500'] 
+  target : ['10u', '10v', '2t', 'msl', 'q_1000', 'q_300', 'q_500', 'q_700', 'q_850', 'q_925', 'skt', 'sp', 't_1000', 't_300', 't_500', 't_700', 't_850', 't_925', 'tcw', 'tp', 'u_1000', 'u_300', 'u_500', 'u_700', 'u_850', 'u_925', 'v_1000', 'v_300', 'v_500', 'v_700', 'v_850', 'v_925', 'z_1000', 'z_300', 'z_500', 'z_700', 'z_850', 'z_925']
+  #  geoinfo_channels : ['z', 'lsm', 'SFX.AVG_ZS', 'SFX.FRAC_NATURE', 'SFX.FRAC_SEA', 'SFX.FRAC_TOWN', 'SFX.FRAC_WATER', 'SFX.MAX_ZS', 'SFX.MIN_ZS', 'SFX.SIL_ZS', 'SFX.Z0', 'SFX.Z0H', 'SFX.ZS', 'SFX.ZS_ASPECT_12500M_SIGRATIO1', 'SFX.ZS_SLOPE_12500M_SIGRATIO1', 'SFX.ZS_SN_DERIVATIVE_12500M_SIGRATIO1', 'SFX.ZS_STD_12500M', 'SFX.ZS_SX_RADIUS12500_AZIMUTH180', 'SFX.ZS_TPI_12500M', 'SFX.ZS_VALLEY_DIR_12500M', 'SFX.ZS_VALLEY_NORM_12500M', 'SFX.ZS_WE_DERIVATIVE_12500M_SIGRATIO1' ]
+  geoinfo_channels : ['z', 'lsm', "SFX.AVG_ZS", "SFX.COVER006", "SFX.FRAC_NATURE", "SFX.FRAC_NATURE_TPI_12500M", "SFX.FRAC_SEA", "SFX.FRAC_TOWN", "SFX.FRAC_WATER", "SFX.MAX_ZS", "SFX.MIN_ZS", "SFX.SIL_ZS", "SFX.Z0", "SFX.Z0H", "SFX.ZS", "SFX.ZS_ASPECT_12500M_SIGRATIO1", "SFX.ZS_ASPECT_17500M_SIGRATIO1", "SFX.ZS_ASPECT_75000M_SIGRATIO1", "SFX.ZS_SLOPE_12500M_SIGRATIO1", "SFX.ZS_SLOPE_17500M_SIGRATIO1", "SFX.ZS_SLOPE_75000M_SIGRATIO1", "SFX.ZS_SN_DERIVATIVE_12500M_SIGRATIO1", "SFX.ZS_SN_DERIVATIVE_17500M_SIGRATIO1", "SFX.ZS_SN_DERIVATIVE_75000M_SIGRATIO1", "SFX.ZS_STD_12500M", "SFX.ZS_STD_17500M", "SFX.ZS_STD_75000M", "SFX.ZS_SX_RADIUS12500_AZIMUTH180", "SFX.ZS_TPI_12500M", "SFX.ZS_VALLEY_DIR_12500M", "SFX.ZS_VALLEY_DIR_17500M", "SFX.ZS_VALLEY_DIR_75000M", "SFX.ZS_VALLEY_NORM_12500M", "SFX.ZS_VALLEY_NORM_17500M", "SFX.ZS_VALLEY_NORM_75000M", "SFX.ZS_WE_DERIVATIVE_12500M_SIGRATIO1", "SFX.ZS_WE_DERIVATIVE_17500M_SIGRATIO1", "SFX.ZS_WE_DERIVATIVE_75000M_SIGRATIO1" ]
+  loss_weight : 1.
+  masking_rate : 0.6
+  masking_rate_none : 0.05
+  token_size : 512
+  #  max_num_targets: 4096
+  embed : 
+    net : transformer
+    num_tokens : 1
+    num_heads : 2
+    dim_embed : 256
+    num_blocks : 2
+  embed_target_coords :
+    net : linear
+    dim_embed : 256
+  target_readout :
+    type : 'obs_value'
+    num_layers : 2
+    num_heads : 4
+  pred_head :
+    ens_size : 1
+    num_layers : 1
