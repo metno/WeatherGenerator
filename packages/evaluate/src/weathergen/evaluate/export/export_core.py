@@ -56,6 +56,7 @@ def get_fsteps(fsteps, fname_zarr: str):
             List of forecast steps to be used for data retrieval.
     """
     with zarrio_reader(fname_zarr) as zio:
+        print(zio.forecast_steps)
         zio_forecast_steps = sorted([int(step) for step in zio.forecast_steps])
     return zio_forecast_steps if fsteps is None else sorted([int(fstep) for fstep in fsteps])
 
