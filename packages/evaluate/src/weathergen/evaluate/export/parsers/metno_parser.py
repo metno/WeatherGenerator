@@ -187,7 +187,13 @@ class MetnoParser(CfParser):
         n_hours = self.fstep_hours.astype("int64")
         forecast_step = ds["forecast_step"] * n_hours
 
-        times = ds.valid_time.astype("datetime64[s]").astype("float64").values[:, 0]
+        times = ds.valid_time.astype("datetime64[s]").astype("float64").values[:]
+
+        if len(times.shape) == 1:
+            # Add a fake time dimension
+            times = times[None, :]
+        # Pick the time from the first location
+        times = times[:, 0]
 
         coords = {"time": times, "x": x, "y": y}
         if has_ens:
@@ -250,7 +256,7 @@ class MetnoParser(CfParser):
         for name in self.template.variables:
             var = self.template[name]
             if var.dims == ("y", "x") and name not in new_ds:
-                ds[name] = (("y", "x"), var.values[:], attrs)
+                new_ds[name] = (("y", "x"), var.values[:], attrs)
 
         return new_ds
 
