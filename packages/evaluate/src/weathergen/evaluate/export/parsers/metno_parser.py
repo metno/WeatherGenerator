@@ -265,6 +265,10 @@ class MetnoParser(CfParser):
             return "air_temperature_2m"
         elif channel == "10si":
             return "wind_speed_10m"
+        elif channel == "10u":
+            return "u_wind_at_10m"
+        elif channel == "10v":
+            return "v_wind_at_10m"
         else:
             return channel
 
