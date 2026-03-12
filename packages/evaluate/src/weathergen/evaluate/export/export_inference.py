@@ -171,6 +171,14 @@ def parse_args(args: list) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--metno-template",
+        type=str,
+        help="Path to NetCDF template file",
+        required=False,
+        dest="metno_template",
+    )
+
+    parser.add_argument(
         "--quaver-template-grid-type",
         type=str,
         help="Grid type to include in the output filename (i.e. 'O96/N320')",
@@ -298,7 +306,6 @@ def export_from_args(args: list) -> None:
             f"Processing {kwargs['samples'] if kwargs['samples'] is not None else 'all'} samples \
 and {kwargs['fsteps'] if kwargs['fsteps'] is not None else 'all'} forecast steps."
         )
-
         export_model_outputs(dtype, config, **kwargs)
 
         _logger.info(f"Finished processing {dtype} for run ID {args.run_id}.")
