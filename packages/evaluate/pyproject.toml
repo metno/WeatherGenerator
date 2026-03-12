@@ -17,8 +17,8 @@ dependencies = [
     "weathergen-metrics",
     "eccodes==2.44.0", 
     "eccodeslib==2.44.0.7", 
-    "eckitlib==1.32.3.7", 
-    "earthkit-data==0.17.0",
+    "eckitlib==1.32.3.7",
+    "earthkit-data==0.18.2", # Adjusted dependency to make evaluation work on leonardo
     "earthkit-utils==0.1.2",
     "imageio[ffmpeg]>=2.37.2",
     ]
