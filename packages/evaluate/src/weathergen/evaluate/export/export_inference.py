@@ -233,7 +233,6 @@ def export_from_args(args: list) -> None:
             f"Starting processing {dtype} for run ID {args.run_id}. "
             f"Detected {args.samples} samples and {args.fsteps} forecast steps."
         )
-
         export_model_outputs(dtype, config, **kwargs)
 
         _logger.info(f"Finished processing {dtype} for run ID {args.run_id}.")

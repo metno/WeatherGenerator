@@ -31,6 +31,7 @@ def get_data_worker(args: tuple) -> xr.DataArray:
     fname_zarr = get_model_results(run_id, epoch, rank)
     with zarrio_reader(fname_zarr) as zio:
         out = zio.get_data(sample, stream, fstep)
+        breakpoint()
         if dtype == "target":
             data = out.target
         elif dtype == "prediction":
