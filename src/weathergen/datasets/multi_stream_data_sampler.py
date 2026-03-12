@@ -26,6 +26,7 @@ from weathergen.datasets.data_reader_base import (
     TIndex,
 )
 from weathergen.datasets.data_reader_obs import DataReaderObs
+from weathergen.datasets.data_reader_synop import DataReaderSynop
 from weathergen.datasets.masking import Masker
 from weathergen.datasets.stream_data import StreamData, spoof
 from weathergen.datasets.tokenizer_masking import TokenizerMasking
@@ -211,7 +212,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
     def _calc_baseperms(self, fsm: int) -> np.typing.NDArray:
         """This calculates the base permutation array and
-        depends on fsm so must be repeated for __init__ and reset"""
+        depends on fsm so must be repeated for __init__ and reset"""metno_develop_202606_svg
         perms_len = int(self.index_range.end - self.index_range.start)
         perms_len -= (fsm + self.output_offset) * (self.time_step // self.step_timedelta)
 
@@ -235,6 +236,8 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                     dataset = DataReaderObs
                 case "anemoi":
                     dataset = DataReaderAnemoi
+                case "station":
+                    dataset = DataReaderSynop
                 case type_name:
                     dataset = get_extra_reader(type_name)
                     if dataset is None:
