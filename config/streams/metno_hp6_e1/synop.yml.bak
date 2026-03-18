@@ -1,0 +1,39 @@
+# obs_types
+# 0 : polar orbiting satellites
+# 1 : geostationay satellites
+# 2 : conventional observations
+
+SurfaceCombined :
+  type : station
+  filenames : ['metno_observations_v4.nc']
+  stream_id : 3
+  #  source : ['air_temperature', 'precipitation_amount_1h', 'relative_humidity', 'surface_air_pressure', 'wind_from_direction', 'wind_speed', 'wind_speed_of_gust']
+  source : []
+  target : ['air_temperature', 'precipitation_amount_1h', 'relative_humidity', 'surface_air_pressure', 'wind_from_direction', 'wind_speed', 'wind_speed_of_gust']
+  #  geoinfos : ['altitude', 'is_wmo_station']
+  #  geoinfos : ['altitude']
+  geoinfos : ['altitude', "SFX.AVG_ZS", "SFX.COVER006", "SFX.FRAC_NATURE", "SFX.FRAC_NATURE_TPI_12500M", "SFX.FRAC_SEA", "SFX.FRAC_TOWN", "SFX.FRAC_WATER", "SFX.MAX_ZS", "SFX.MIN_ZS", "SFX.SIL_ZS", "SFX.Z0", "SFX.Z0H", "SFX.ZS", "SFX.ZS_ASPECT_12500M_SIGRATIO1", "SFX.ZS_ASPECT_17500M_SIGRATIO1", "SFX.ZS_ASPECT_75000M_SIGRATIO1", "SFX.ZS_SLOPE_12500M_SIGRATIO1", "SFX.ZS_SLOPE_17500M_SIGRATIO1", "SFX.ZS_SLOPE_75000M_SIGRATIO1", "SFX.ZS_SN_DERIVATIVE_12500M_SIGRATIO1", "SFX.ZS_SN_DERIVATIVE_17500M_SIGRATIO1", "SFX.ZS_SN_DERIVATIVE_75000M_SIGRATIO1", "SFX.ZS_STD_12500M", "SFX.ZS_STD_17500M", "SFX.ZS_STD_75000M", "SFX.ZS_SX_RADIUS12500_AZIMUTH180", "SFX.ZS_TPI_12500M", "SFX.ZS_VALLEY_DIR_12500M", "SFX.ZS_VALLEY_DIR_17500M", "SFX.ZS_VALLEY_DIR_75000M", "SFX.ZS_VALLEY_NORM_12500M", "SFX.ZS_VALLEY_NORM_17500M", "SFX.ZS_VALLEY_NORM_75000M", "SFX.ZS_WE_DERIVATIVE_12500M_SIGRATIO1", "SFX.ZS_WE_DERIVATIVE_17500M_SIGRATIO1", "SFX.ZS_WE_DERIVATIVE_75000M_SIGRATIO1" ]
+  latitude_name: 'latitude'
+  longitude_name: 'longitude'
+  loss_weight : 1.0
+  masking_rate : 0.6
+  masking_rate_none : 0.05
+  token_size : 64
+  tokenize_spacetime : True
+  max_num_targets: -1
+  embed : 
+    net : transformer
+    num_tokens : 1
+    num_heads : 2
+    dim_embed : 256
+    num_blocks : 2
+  embed_target_coords : 
+    net : linear
+    dim_embed : 256
+  target_readout :
+    type : 'obs_value'  # token or obs_value
+    num_layers : 2
+    num_heads : 4
+  pred_head : 
+    ens_size : 1
+    num_layers : 1

@@ -75,7 +75,7 @@ def parse_args(args: list) -> argparse.Namespace:
         "--format",
         dest="output_format",
         type=str,
-        choices=["netcdf", "grib", "quaver"],
+        choices=["netcdf", "grib", "quaver", "metno"],
         help="Output file format (currently only netcdf supported)",
         required=True,
     )
@@ -83,7 +83,6 @@ def parse_args(args: list) -> argparse.Namespace:
     parser.add_argument(
         "--stream",
         type=str,
-        choices=["ERA5", "IMERG_ANEMOI"],
         help="Stream name to retrieve data for",
         required=True,
     )
@@ -148,6 +147,14 @@ def parse_args(args: list) -> argparse.Namespace:
         help="Path to GRIB template file",
         required=False,
         dest="quaver_template_folder",
+    )
+
+    parser.add_argument(
+        "--metno-template",
+        type=str,
+        help="Path to NetCDF template file",
+        required=False,
+        dest="metno_template",
     )
 
     parser.add_argument(
