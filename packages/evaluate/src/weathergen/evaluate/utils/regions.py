@@ -23,6 +23,13 @@ class RegionLibrary:
     Predefined bounding boxes for known regions.
     """
 
+    NORDIC_PROJECTION: ClassVar[ccrs.Projection] = ccrs.LambertConformal(
+        central_longitude=15.0,
+        central_latitude=63.0,
+        standard_parallels=(63.0, 63.0),
+        # globe=ccrs.Globe(semimajor_axis=6.371e6, semiminor_axis=6.371e6),
+    )
+
     REGIONS: ClassVar[dict[str, tuple[float, float, float, float, ccrs.Projection]]] = {
         "global": (-90.0, 90.0, -180.0, 180.0, ccrs.Robinson()),
         "nhem": (0.0, 90.0, -180.0, 180.0, ccrs.PlateCarree()),
@@ -40,6 +47,10 @@ class RegionLibrary:
         "uwc-west": (39.0, 63.0, -26.0, 41.0, ccrs.PlateCarree()),
         "arome": (37.0, 56.0, -12.0, 16.0, ccrs.PlateCarree()),
         "icon": (42.0, 51.0, -1.0, 18.0, ccrs.PlateCarree()),
+        "nordic": (52.30, 73.86, -11.76, 41.76, NORDIC_PROJECTION),
+        "norway_north": (66.1, 71.4, 11.0, 31.8, NORDIC_PROJECTION),
+        "norway_middle": (63.2, 68.6, 7.5, 18.2, NORDIC_PROJECTION),
+        "norway_south": (57.7, 63.8, 4, 12.6, NORDIC_PROJECTION),
     }
 
 
