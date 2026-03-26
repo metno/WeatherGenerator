@@ -98,7 +98,7 @@ class MetnoParser(CfParser):
 
         _logger.info(f"Retrieved {len(da_fs)} forecast steps for type {self.data_type}.")
         _logger.info(f"Saved sample data to {self.output_format} in {self.output_dir}.")
-        breakpoint()
+
         if da_fs:
             da_fs = self.concatenate(da_fs, dim="forecast_step", sortby_dim="forecast_step")
             da_fs = self.regrid(da_fs)
@@ -232,7 +232,6 @@ class MetnoParser(CfParser):
 
         # sample, stream, forecast_step, ipoint, channel, ens
         all_values = ds.values[0, 0, :, :, :, :]
-        breakpoint()
 
         # Add variables
         for i, channel in enumerate(ds.channel.to_numpy()):
