@@ -256,7 +256,11 @@ torch = [
   { index = "pytorch-cpu", marker = "sys_platform == 'darwin'", extra="gpu"},
 ]
 # branch = "feature/any-zarr-version-in-pyproject/"
-anemoi-datasets = { git = "https://github.com/tjhunter/anemoi-datasets", tag = "0.0.1"}
+#anemoi-datasets = { git = "https://github.com/tjhunter/anemoi-datasets", tag = "0.0.1"} # can't orientate streams with different length
+# > /leonardo/home/userexternal/aneuvill/sw/WeatherGenerator/.venv/lib/python3.12/site-packages/anemoi/datasets/data/forwards.py(416)check_same_lengths()
+# -> raise ValueError(f"Incompatible lengths: {d1._len} and {d2._len}")
+anemoi-datasets = { git = "https://github.com/ecmwf/anemoi-datasets", branch = "feature/any-zarr-version-in-pyproject"}
+#anemoi-datasets = { git = "https://github.com/ecmwf/anemoi-datasets", rev = "ab8cd71"}
 
 [tool.pytest.ini_options]
 log_cli = true
