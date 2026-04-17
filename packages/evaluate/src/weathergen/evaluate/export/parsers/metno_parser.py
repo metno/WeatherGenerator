@@ -206,16 +206,14 @@ class MetnoParser(CfParser):
 
         has_ens = Nmembers > 1
 
-        n_hours = self.fstep_hours.astype("int64")
-        forecast_step = ds["forecast_step"] * n_hours
-
-        times = ds.valid_time.astype("datetime64[s]").astype("float64").values[:]
-
-        if len(times.shape) == 1:
-            # Add a fake time dimension
-            times = times[None, :]
-        # Pick the time from the first location
-        times = times[:, 0]
+        valid_times = ds.valid_time
+        if "forecast_step" in valid_times.dims:
+            times = valid_times.isel(ipoint=0).astype("datetime64[s]").astype("float64").values
+        else:
+            # Fallback for single-step inputs where valid_time may only depend on ipoint.
+            times = np.array(
+                [valid_times.isel(ipoint=0).astype("datetime64[s]").astype("float64").item()]
+            )
 
         coords = {"time": times, "x": x, "y": y}
         if has_ens:
@@ -229,7 +227,7 @@ class MetnoParser(CfParser):
         new_ds["time"].attrs["units"] = "seconds since 1970-01-01T00:00:00 +00:00"
         new_ds["forecast_reference_time"] = ([], times[0], {}, {"dtype": "double"})
         new_ds["forecast_reference_time"].attrs["units"] = "seconds since 1970-01-01T00:00:00 +00:00"
-        if has_ens > 1:
+        if has_ens:
             new_ds["ensemble_member"].attrs["standard_name"] = "realization"
 
         olat = self.template.latitude.values[:]
@@ -251,6 +249,11 @@ class MetnoParser(CfParser):
         ilat = ds.lat.values[:]
         ilon = ds.lon.values[:]
         Isort = self.get_sorting(ilat, ilon, olat.flatten(), olon.flatten())
+
+        if Npoints != len(Isort):
+            raise ValueError(
+                f"Point count mismatch between input ({Npoints}) and template ({len(Isort)})."
+            )
 
         # forecast_step, ipoint, channel, ensemble_member
         all_values = ds.values
