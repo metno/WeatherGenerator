@@ -219,7 +219,7 @@ class MetnoParser(CfParser):
 
         coords = {"time": times, "x": x, "y": y}
         if has_ens:
-             coords["ensemble_member"] = range(Nmembers)
+            coords["ensemble_member"] = range(Nmembers)
 
         # Attributes on coordinate variables
         new_ds = xr.Dataset(coords)
@@ -240,7 +240,7 @@ class MetnoParser(CfParser):
         lat_attrs = {"units": "degree_north", "standard_name": "latitude", "grid_mapping": "projection"}
         lon_attrs = {"units": "degree_east", "standard_name": "longitude", "grid_mapping": "projection"}
         new_ds["latitude"] = (("y", "x"), olat, lat_attrs)
-        new_ds["longitude"] = (("y", "x"), olat, lon_attrs)
+        new_ds["longitude"] = (("y", "x"), olon, lon_attrs)
 
         # Set up projection variable
         proj_var_name = get_proj_name(self.template)
@@ -279,7 +279,7 @@ class MetnoParser(CfParser):
         for name in self.template.variables:
             var = self.template[name]
             if var.dims == ("y", "x") and name not in new_ds:
-                new_ds[name] = (("y", "x"), var.values[:], attrs)
+                new_ds[name] = (("y", "x"), var.values[:], var.attrs)
 
         return new_ds
 
