@@ -91,8 +91,13 @@ class MetnoParser(CfParser):
         for result in fstep_iterator_results:
             if result is None:
                 continue
-
-            result = result.as_xarray()
+            # result is already a materialized xarray DataArray (built in the worker).
+            if not isinstance(result, xr.DataArray):
+                # Use squeeze to remove singleton dimensions (e.g., sample or stream) that may be present
+                # If the input has shape (1, 1, forecast_step, ipoint, channel, ensemble_member),
+                # squeeze() will remove the first two axes (sample, stream) if their size is 1.
+                # This means only forecast_step, ipoint, channel, ensemble_member remain for further processing.
+                result = result.as_xarray().squeeze()
             result = result.sel(channel=self.channels)
             da_fs.append(result)
 
@@ -174,10 +179,27 @@ class MetnoParser(CfParser):
 
         return data
 
-    def regrid(self, ds: xr.Dataset) -> xr.Dataset:
-        Nsamples, Nstreams, Nsteps, Npoints, Nchannels, Nmembers = ds.shape
-        assert Nsamples == 1, Nsamples
-        assert Nstreams == 1, Nstreams
+    def regrid(self, ds: xr.DataArray) -> xr.Dataset:
+        # The export worker returns one sample/stream at a time and concatenates over
+        # forecast steps, so expected dims are:
+        # - without ensemble:   (forecast_step, ipoint, channel)
+        # - with ensemble:      (forecast_step, ipoint, channel, ensemble_member)
+        if "forecast_step" not in ds.dims:
+            ds = ds.expand_dims("forecast_step")
+
+        if "ensemble_member" not in ds.dims:
+            ds = ds.expand_dims("ensemble_member")
+
+        ds = ds.transpose("forecast_step", "ipoint", "channel", "ensemble_member")
+
+        # After this, ds.values will have shape (Nsteps, Npoints, Nchannels, Nmembers).
+        # The original data may have had 6 dimensions: (sample, stream, forecast_step, ipoint, channel, ensemble_member).
+        # Here, the sample and stream dimensions are omitted because the export worker processes one sample/stream at a time
+        # and concatenates over forecast steps, so only the relevant dimensions for output are kept.
+        Nsteps = ds.sizes["forecast_step"]
+        Npoints = ds.sizes["ipoint"]
+        Nchannels = ds.sizes["channel"]
+        Nmembers = ds.sizes["ensemble_member"]
 
         x = self.template.x.values[:]
         y = self.template.y.values[:]
@@ -230,19 +252,20 @@ class MetnoParser(CfParser):
         ilon = ds.lon.values[:]
         Isort = self.get_sorting(ilat, ilon, olat.flatten(), olon.flatten())
 
-        # sample, stream, forecast_step, ipoint, channel, ens
-        all_values = ds.values[0, 0, :, :, :, :]
+        # forecast_step, ipoint, channel, ensemble_member
+        all_values = ds.values
 
         # Add variables
         for i, channel in enumerate(ds.channel.to_numpy()):
             _logger.info(f"Processing {channel}")
-            values = all_values[:, Isort, i]
-            if has_ens > 1:
+            values = all_values[:, Isort, i, :]
+            if has_ens:
                 new_shape = [len(times), Nmembers, len(y), len(x)]
                 dims =  ["time", "ensemble_member", "y", "x"]
             else:
                 new_shape = [len(times), len(y), len(x)]
                 dims =  ["time", "y", "x"]
+                values = values[..., 0]
 
             values = np.reshape(values, new_shape)
             attrs = {"coordinates": "longitude latitude"}
