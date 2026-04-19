@@ -229,3 +229,8 @@ models
 results
 reports
 config/streams/metno_highres_e*/
+config/streams/metno_*/
+runs_plot_train.yml.*
+config/evaluate/eval_config_test.yml
+config/runs_plot_train.yml
+

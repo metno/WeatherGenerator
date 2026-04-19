@@ -89,7 +89,13 @@ class DataReaderSynop(DataReaderTimestep):
             self.len = len(ds)
 
         self.offset_data_channels = 4
-        self.fillvalue = ds["air_temperature"][0, 0].values.item()
+#        self.fillvalue = ds["air_temperature"][0, 0].values.item()
+#        self.fillvalue = ds["2t"][0, 0].values.item()
+        var_name = next(
+            name for name, da in ds.data_vars.items()
+            if da.ndim >= 2
+        )
+        self.fillvalue = ds[var_name][0, 0].values.item()
         self.channels_file = [k for k in self.ds.keys()]
 
         # caches lats and lons
