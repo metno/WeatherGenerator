@@ -69,8 +69,30 @@ class VerifParser(CfParser):
         self.obs_coords = np.column_stack((lat.values, lon.values))
         self.zarr_coords = None
 
+        # Verif format requires these specific channels for preprocessing and derived variables
         required_channels = ["10u", "10v", "sp", "2t", "msl"]
-        self.channels = list(set(self.channels) & set(required_channels))
+        
+        # Store available channels from the data
+        available_channels = set(self.channels) if self.channels else set()
+        required_set = set(required_channels)
+        
+        # Only use channels that exist in the data
+        self.channels = list(available_channels & required_set)
+        
+        # Warn about missing required channels
+        missing = required_set - available_channels
+        if missing:
+            _logger.warning(
+                f"Verif format requires channels {required_channels}, but the data only has {sorted(available_channels)}. "
+                f"Missing channels: {sorted(missing)}. Processing will continue with available channels only."
+            )
+        
+        if not self.channels:
+            raise ValueError(
+                f"None of the required verif channels {required_channels} are available in the data. "
+                f"Available channels: {sorted(available_channels)}"
+            )
+        
         self.zarr_dt: np.timedelta64 | None = None
 
     def process_sample(
@@ -113,12 +135,13 @@ class VerifParser(CfParser):
             if self.zarr_coords is None:
                 self.zarr_coords = get_grid_points(da_fs[0])
                 self.zarr_dt = self.get_zarr_dt(da_fs[0])
-            # check consistency of grid points across forecast steps
-            if not np.array_equal(get_grid_points(da_fs[1]), self.zarr_coords):
-                raise ValueError(
-                    "Grid points between forecast steps are not consistent."
-                    "Check that inference was not performed with masking"
-                )
+            # check consistency of grid points across forecast steps (only if we have multiple steps)
+            if len(da_fs) > 1:
+                if not np.array_equal(get_grid_points(da_fs[1]), self.zarr_coords):
+                    raise ValueError(
+                        "Grid points between forecast steps are not consistent. "
+                        "Check that inference was not performed with masking"
+                    )
             da_fs = self.concatenate(da_fs)
             da_fs = self.assign_frt(da_fs, ref_time)
             da_fs = self.add_attrs(da_fs)
