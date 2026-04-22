@@ -59,8 +59,10 @@ class MetnoParser(CfParser):
         for k, v in kwargs.items():
             setattr(self, k, v)
 
-        if not hasattr(self, "metno_template"):
-            raise ValueError("Template file must be provided for Metno format.")
+        if not hasattr(self, "metno_template") or self.metno_template is None:
+            raise ValueError("Template file must be provided for Metno format, use --metno-template <path_to_template>.")
+        if not Path(self.metno_template).is_file():
+            raise FileNotFoundError(f"Metno template file not found: {self.metno_template}")
 
         # TODO: Why does the base class need this?
         grid_type = 1
