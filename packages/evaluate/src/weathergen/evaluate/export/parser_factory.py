@@ -39,10 +39,10 @@ class CfParserFactory:
         fmt = kwargs.get("output_format")
 
         parser_class = _parser_map.get(fmt)
+        if parser_class is None:
+            raise ValueError(f"Unsupported format: {fmt}")
         parser = parser_class[0]
         # allowed_keys = parser_class[1]
         # filtered_kwargs = {k: v for k, v in kwargs.items() if k in allowed_keys}
 
-        if parser_class is None:
-            raise ValueError(f"Unsupported format: {fmt}")
         return parser(config, **kwargs)
