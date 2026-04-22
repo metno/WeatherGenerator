@@ -95,7 +95,7 @@ def parse_args(args: list) -> argparse.Namespace:
         "--format",
         dest="output_format",
         type=str,
-        choices=["netcdf", "verif", "quaver"],
+        choices=["netcdf", "verif", "quaver", "metno"],
         help="Output file format; netcdf (CF-compliant netcdfs), \
         verif (netcdf compatible with MetNor verif tool), quaver (GRIB files for Quaver tool)",
         required=True,
