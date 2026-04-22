@@ -95,7 +95,7 @@ def parse_args(args: list) -> argparse.Namespace:
         "--format",
         dest="output_format",
         type=str,
-        choices=["netcdf", "verif", "quaver"],
+        choices=["netcdf", "verif", "quaver", "metno"],
         help="Output file format",
         required=True,
     )
