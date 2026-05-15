@@ -499,15 +499,17 @@ def haar_wavelet_mse_local_patch(
         p_field = pred_grid[:,   :, c]
         level_loss = torch.tensor(0.0, device=dev)
 
-        for _lvl in range(num_levels):
+        for lvl in range(num_levels):
             t_LL, t_LH, t_HL, t_HH = haar_2d(t_field)
             p_LL, p_LH, p_HL, p_HH = haar_2d(p_field)
 
+            scale = 1.0 / (4 ** lvl)
+
             level_loss = level_loss + (
                 torch.mean((t_LL - p_LL) ** 2)
-                + detail_weight * torch.mean((t_LH - p_LH) ** 2)
-                + detail_weight * torch.mean((t_HL - p_HL) ** 2)
-                + detail_weight * torch.mean((t_HH - p_HH) ** 2)
+                + detail_weight * scale * torch.mean((t_LH - p_LH) ** 2)
+                + detail_weight * scale * torch.mean((t_HL - p_HL) ** 2)
+                + detail_weight * scale * torch.mean((t_HH - p_HH) ** 2)
             ) / subband_norm
 
             # recurse into LL subband
