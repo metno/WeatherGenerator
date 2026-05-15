@@ -411,7 +411,7 @@ class LossPhysical(LossModuleBase):
 
                     for loss_fct, loss_fct_weight, loss_fct_name, loss_fct_params in self.loss_fcts:
 
-                        print(f"[DEBUG] loss_fct_name='{loss_fct_name}', fn={loss_fct}")
+#                        print(f"[DEBUG] loss_fct_name='{loss_fct_name}', fn={loss_fct}")
                         
                         # skip if loss is not computed for this sample
                         if loss_fct_name not in pred_params.global_params["loss"]:
@@ -462,18 +462,18 @@ class LossPhysical(LossModuleBase):
 #                            )
                             tc_lens_list = target_cur[stream_name]["target_coords_lens"]
                             tc_lens      = tc_lens_list[target_idx]
-                            print(f"[DEBUG wavelet] stream={stream_name} "
-                            f"tc_lens sum={tc_lens.sum().item()} "
-                            f"max={tc_lens.max().item()} "
-                            f"target shape={targets_batch[target_idx].shape} "
-                            f"min_points={loss_fct_params.get('min_points', 50)}")
+#                            print(f"[DEBUG wavelet] stream={stream_name} "
+#                            f"tc_lens sum={tc_lens.sum().item()} "
+#                            f"max={tc_lens.max().item()} "
+#                            f"target shape={targets_batch[target_idx].shape} "
+#                            f"min_points={loss_fct_params.get('min_points', 50)}")
                     
                             if tc_lens is not None and hasattr(self, '_hp_nbours') \
                                     and self._hp_nbours is not None:
-                                print(f"[DEBUG wavelet offset] stream={stream_name} "
-                                      f"target_coords shape={targets_coords_batch[target_idx].shape} "
-                                      f"n_geoinfo={len(stream_info.get('geoinfo_channels', []))} "
-                                      f"geoinfo_offset={1 + 5 + len(stream_info.get('geoinfo_channels', []))}")
+#                                print(f"[DEBUG wavelet offset] stream={stream_name} "
+#                                      f"target_coords_local shape={targets_coords_local_batch[target_idx].shape} "
+#                                      f"n_geoinfo={len(stream_info.get('geoinfo_channels', []))} "
+#                                      f"geoinfo_offset={1 + 5 + len(stream_info.get('geoinfo_channels', []))}")
                                 loss_lfct, loss_lfct_chs = self._loss_wavelet_per_cell(
                                     target,
                                     pred,

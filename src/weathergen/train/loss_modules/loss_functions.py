@@ -370,9 +370,17 @@ def haar_2d(field: torch.Tensor):
     One-level 2D Haar wavelet decomposition.
     field: (H, W), H and W must be even.
     Returns LL, LH, HL, HH each of shape (H//2, W//2).
+
+    What the four subbands mean physically:
+    LL: average of average. The smooth, low-frequency content of the patch. A cell with a warm temperature surrounded by warm neighbours will have a large LL coefficient. This captures the large-scale spatial mean.
+    LH: average of difference (horizontal edges). Large where there is a sharp contrast between left and right columns within the smoothed rows. Captures east-west gradients.
+    HL: difference of average (vertical edges). Large where there is a sharp contrast between top and bottom rows. Captures north-south gradients.
+    HH: difference of difference (diagonal edges). Large at point features and diagonal patterns. Captures checkerboard-like variation.
     """
+#    Take pairs of adjacent rows. L is the row-average (low frequency — smooth variation between rows). H is the row-difference (high frequency — how much two adjacent rows differ). Both have shape (H//2, W). This is a 1D Haar along the vertical direction.
     L = (field[0::2, :] + field[1::2, :]) * 0.5
     H = (field[0::2, :] - field[1::2, :]) * 0.5
+#    Now take pairs of adjacent columns within L and H. This is the 1D Haar along the horizontal direction, applied to both halves. All four outputs have shape (H//2, W//2).
     LL = (L[:, 0::2] + L[:, 1::2]) * 0.5
     LH = (L[:, 0::2] - L[:, 1::2]) * 0.5
     HL = (H[:, 0::2] + H[:, 1::2]) * 0.5
@@ -418,6 +426,10 @@ def haar_wavelet_mse_local_patch(
     Returns:
         loss     : scalar wavelet MSE for this patch
         loss_chs : (num_channels,) per-channel wavelet MSE
+
+    NOTE: Why this matters for your downscaling task. MSE in pixel space treats every point equally. 
+    A prediction that is spatially smooth but offset by a constant scores the same as one that has the right mean but wrong spatial structure. Computing MSE on wavelet coefficients separates these: the LL term penalises mean errors, while LH, HL, HH penalise errors in spatial structure independently. With detail_weight=2.0 you are saying "errors in spatial gradients and edges cost twice as much as errors in the mean" — which is the right prior for downscaling where the coarse input already captures the mean and the model needs to learn fine spatial structure from the terrain and land-use geoinfo fields.
+    With num_levels=2, after the first decomposition the LL subband is decomposed again, giving you a three-scale representation: the second-level LL captures very smooth large-scale variation, the second-level detail bands capture medium-scale structure, and the first-level detail bands capture fine-scale structure at the full grid resolution.
     """
     num_points, num_channels = target.shape
     dev = target.device

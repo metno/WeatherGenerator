@@ -526,7 +526,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 # per-cell point counts — get_target_values does not return these,
                 # and target_coords mode is not active in this path
                 if "target_coords" not in mode:
-                    (_, tc_l) = self.tokenizer.get_target_coords(
+                    (tc, tc_l) = self.tokenizer.get_target_coords(
                         stream_info,
                         rdata,
                         token_data,
@@ -534,6 +534,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                         target_mask,
                     )
                     stream_data.target_coords_lens[timestep_idx] = tc_l
+                    stream_data.target_coords[timestep_idx] = tc 
 
         return stream_data
 
