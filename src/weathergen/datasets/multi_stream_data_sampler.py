@@ -509,6 +509,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 )
                 stream_data.add_target_coords(timestep_idx, tc, tc_l, rdata.is_spoof)
 
+
             if "target_values" in mode:
                 (tt_cells, tt_t, tt_c, idxs_inv) = self.tokenizer.get_target_values(
                     stream_info,
@@ -520,6 +521,19 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 stream_data.add_target_values(
                     timestep_idx, tt_cells, tt_c, tt_t, idxs_inv, rdata.is_spoof
                 )
+
+                # populate target_coords_lens so the wavelet cell loss can identify
+                # per-cell point counts — get_target_values does not return these,
+                # and target_coords mode is not active in this path
+                if "target_coords" not in mode:
+                    (_, tc_l) = self.tokenizer.get_target_coords(
+                        stream_info,
+                        rdata,
+                        token_data,
+                        (time_win_target.start, time_win_target.end),
+                        target_mask,
+                    )
+                    stream_data.target_coords_lens[timestep_idx] = tc_l
 
         return stream_data
 

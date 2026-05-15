@@ -235,6 +235,10 @@ class Trainer(TrainerBase):
         # CrL
         # same as in run() — needed for wavelet cell loss
         self.loss_calculator_val._hp_nbours = self.model_params.hp_nbours.cpu()
+        for _, calc_list in self.loss_calculator_val.loss_calculators.items():
+            for _, calculator in calc_list:
+                if hasattr(calculator, '_hp_nbours'):
+                    calculator._hp_nbours = self.model_params.hp_nbours.cpu()
 
         if is_root():
             config.save(self.cf, mini_epoch=0)
@@ -364,11 +368,14 @@ class Trainer(TrainerBase):
 
         # CrL
 
-        # give loss calculators access to the neighbourhood structure for
-        # the wavelet cell loss — must come after both model_params and
-        # loss calculators are initialised (line 270 and 357 respectively)
-        self.loss_calculator._hp_nbours = self.model_params.hp_nbours.cpu()
-        self.loss_calculator_val._hp_nbours = self.model_params.hp_nbours.cpu()        
+        # set _hp_nbours on the outer LossCalculator and propagate into
+        # all inner LossPhysical instances where compute_loss actually runs
+        for _lc in [self.loss_calculator, self.loss_calculator_val]:
+            _lc._hp_nbours = self.model_params.hp_nbours.cpu()
+            for _, calc_list in _lc.loss_calculators.items():
+                for _, calculator in calc_list:
+                    if hasattr(calculator, '_hp_nbours'):
+                        calculator._hp_nbours = self.model_params.hp_nbours.cpu()
 
         # recover mini_epoch when continuing run
         if self.world_size_original is None:

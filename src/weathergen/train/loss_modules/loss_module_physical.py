@@ -290,6 +290,12 @@ class LossPhysical(LossModuleBase):
     
         if weights_channels is not None:
             loss_total = torch.mean(loss_chs * weights_channels.to(dev))
+
+        if n_active == 0:
+            _logger.debug(
+                f"[haar_wavelet_cell] no active cells found "
+                f"(min_points={min_points}, num_cells={num_cells})"
+            )
     
         return loss_total, loss_chs
 
@@ -368,6 +374,7 @@ class LossPhysical(LossModuleBase):
 
                 targets_batch = target_cur[stream_name]["target"]
                 targets_coords_batch = target_cur[stream_name]["target_coords"]
+                targets_coords_local_batch = target_cur[stream_name]["target_coords_local"]
                 targets_times_batch = target_cur[stream_name]["target_times"]
                 targets_params = target_cur[stream_name]["target_metda_data"]
                 targets_is_spoof = target_cur[stream_name]["is_spoof"]
@@ -436,6 +443,12 @@ class LossPhysical(LossModuleBase):
                         losses_all[stream_name][str(timestep_idx)][loss_fct_name] = defaultdict(dict)
                     
                         if loss_fct_name == "haar_wavelet_cell":
+                            if not hasattr(self, '_hp_nbours') or self._hp_nbours is None:
+                                _logger.warning(
+                                    "[haar_wavelet_cell] _hp_nbours is not set on LossPhysical. "
+                                    "Wavelet loss will be zero. Set loss_calculator._hp_nbours = "
+                                    "model_params.hp_nbours.cpu() after model init in trainer.py"
+                                )
                             # determine geoinfo_offset for this stream:
                             # 1 (stream_id) + n_time (5) + n_geoinfo
                             n_geoinfo      = len(stream_info.get("geoinfo_channels", []))
@@ -449,13 +462,22 @@ class LossPhysical(LossModuleBase):
 #                            )
                             tc_lens_list = target_cur[stream_name]["target_coords_lens"]
                             tc_lens      = tc_lens_list[target_idx]
+                            print(f"[DEBUG wavelet] stream={stream_name} "
+                            f"tc_lens sum={tc_lens.sum().item()} "
+                            f"max={tc_lens.max().item()} "
+                            f"target shape={targets_batch[target_idx].shape} "
+                            f"min_points={loss_fct_params.get('min_points', 50)}")
                     
                             if tc_lens is not None and hasattr(self, '_hp_nbours') \
                                     and self._hp_nbours is not None:
+                                print(f"[DEBUG wavelet offset] stream={stream_name} "
+                                      f"target_coords shape={targets_coords_batch[target_idx].shape} "
+                                      f"n_geoinfo={len(stream_info.get('geoinfo_channels', []))} "
+                                      f"geoinfo_offset={1 + 5 + len(stream_info.get('geoinfo_channels', []))}")
                                 loss_lfct, loss_lfct_chs = self._loss_wavelet_per_cell(
                                     target,
                                     pred,
-                                    targets_coords_batch[target_idx],
+                                    targets_coords_local_batch[target_idx],   # was targets_coords_batch[target_idx]
                                     tc_lens.to(self.device),
                                     self._hp_nbours.to(self.device),
                                     weights_channels,
@@ -469,7 +491,8 @@ class LossPhysical(LossModuleBase):
                             # log and accumulate — then skip to next loss function
                             for ch_n, v in zip(target_channels, loss_lfct_chs, strict=True):
                                 losses_all[stream_name][str(timestep_idx)][loss_fct_name][ch_n] = (
-                                    spoof_weight * v if v != 0.0 and not is_spoof else torch.nan
+                                    spoof_weight * v if v != 0.0 and not is_spoof 
+                                    else torch.tensor(0.0, device=self.device)
                                 )
                             loss_cur_w   = spoof_weight * loss_fct_weight * loss_lfct * output_step_weight
                             loss_st_corr = loss_st_corr + loss_cur_w

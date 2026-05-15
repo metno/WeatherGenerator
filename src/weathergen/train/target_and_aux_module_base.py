@@ -119,15 +119,19 @@ class PhysicalTargetAndAux(TargetAndAuxModuleBase):
                     is_spoof += [sample.streams_data[stream_name].is_spoof(step)]
 
                 targets_step = {
-                    "target": targets_cur,
-                    "target_times": target_times_cur,
-                    "target_coords": target_coords_cur,
-                    "target_metda_data": meta_data,
-                    "is_spoof": is_spoof,
-                    "idxs_inv": idxs_inv,
-                    # add this:
-                    "target_coords_lens": [
+                    "target":              targets_cur,
+                    "target_times":        target_times_cur,
+                    "target_coords":       target_coords_cur,
+                    "target_metda_data":   meta_data,
+                    "is_spoof":            is_spoof,
+                    "idxs_inv":            idxs_inv,
+                    "target_coords_lens":  [
                         sample.streams_data[stream_name].target_coords_lens[step]
+                        for sample in batch.samples
+                    ],
+                    # add this:
+                    "target_coords_local": [
+                        sample.streams_data[stream_name].target_coords[step]
                         for sample in batch.samples
                     ],
                 }
