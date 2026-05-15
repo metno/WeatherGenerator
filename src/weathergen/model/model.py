@@ -9,6 +9,16 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+
+# DEBUG IMPORTS — remove after verification
+import os
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+#import astropy_healpix as hp_lib
+####
+
 import logging
 import math
 import warnings

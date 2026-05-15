@@ -361,3 +361,148 @@ def student_teacher_global_softmax(student_outputs, teacher_output, student_temp
         loss = torch.sum(teacher_output * lsm, dim=-1)
         total_loss -= loss.mean()
     return total_loss
+
+##############################################
+#CrL
+##############################################
+def haar_2d(field: torch.Tensor):
+    """
+    One-level 2D Haar wavelet decomposition.
+    field: (H, W), H and W must be even.
+    Returns LL, LH, HL, HH each of shape (H//2, W//2).
+    """
+    L = (field[0::2, :] + field[1::2, :]) * 0.5
+    H = (field[0::2, :] - field[1::2, :]) * 0.5
+    LL = (L[:, 0::2] + L[:, 1::2]) * 0.5
+    LH = (L[:, 0::2] - L[:, 1::2]) * 0.5
+    HL = (H[:, 0::2] + H[:, 1::2]) * 0.5
+    HH = (H[:, 0::2] - H[:, 1::2]) * 0.5
+    return LL, LH, HL, HH
+
+
+def haar_wavelet_mse_local_patch(
+    target: torch.Tensor,
+    pred: torch.Tensor,
+    local_xy: torch.Tensor,
+    grid_size: int = 32,
+    detail_weight: float = 2.0,
+    num_levels: int = 2,
+    min_points: int = 50,
+):
+    """
+    Per-cell 2D Haar wavelet MSE using local patch coordinates.
+
+    For each channel independently:
+      - collect all points in the central cell + 1-ring
+      - place them on a (grid_size x grid_size) grid using their
+        local (y, z) coordinates in the central cell's rotated frame
+      - apply num_levels of Haar decomposition to both target and pred grids
+      - compute MSE on each subband, weighted by detail_weight for detail bands
+
+    This function operates on the points of ONE cell patch at a time.
+    It is called from _loss_wavelet_per_cell in loss_module_physical.py
+    which handles the iteration over cells and aggregation.
+
+    Args:
+        target      : (num_points, num_channels) — values for this patch
+        pred        : (ens_size, num_points, num_channels) — predictions
+        local_xy    : (num_points, 2) — local (y, z) coords in central cell
+                      frame, in radians. Range is roughly ±patch_radius.
+        grid_size   : side length of the 2D grid (must be even, power of 2
+                      recommended for multi-level decomposition)
+        detail_weight : weight on LH, HL, HH subbands relative to LL
+        num_levels  : number of Haar decomposition levels
+        min_points  : minimum number of points required to compute the loss
+                      (caller should already enforce this, but guard is here too)
+
+    Returns:
+        loss     : scalar wavelet MSE for this patch
+        loss_chs : (num_channels,) per-channel wavelet MSE
+    """
+    num_points, num_channels = target.shape
+    dev = target.device
+
+    if num_points < min_points:
+        return (
+            torch.tensor(0.0, device=dev, requires_grad=True),
+            torch.zeros(num_channels, device=dev),
+        )
+
+    pred_mean = pred.mean(0)    # (num_points, num_channels)
+
+    # --- map local_xy to grid indices ---
+    # local_xy[:,0] = y coord (roughly east-west in rotated frame)
+    # local_xy[:,1] = z coord (roughly north-south in rotated frame)
+    y = local_xy[:, 0]
+    z = local_xy[:, 1]
+
+    # normalise to [0, grid_size) using the observed range of this patch
+    # using a fixed symmetric range avoids scale inconsistency across patches
+    y_range = y.abs().max().clamp(min=1e-6)
+    z_range = z.abs().max().clamp(min=1e-6)
+
+    # map [-range, +range] → [0, grid_size)
+    col_idx = ((y / y_range + 1.0) * 0.5 * (grid_size - 1)).long().clamp(0, grid_size - 1)
+    row_idx = ((z / z_range + 1.0) * 0.5 * (grid_size - 1)).long().clamp(0, grid_size - 1)
+    bin_idx = row_idx * grid_size + col_idx     # (num_points,)
+    n_bins  = grid_size * grid_size
+
+    # --- scatter points onto grid: last-write-wins for collisions ---
+    # (collisions are rare when grid_size is large enough)
+    # use a count grid to compute per-bin mean when collisions occur
+    target_grid = torch.zeros(n_bins, num_channels, device=dev)
+    pred_grid   = torch.zeros(n_bins, num_channels, device=dev)
+    count_grid  = torch.zeros(n_bins, device=dev)
+
+    target_grid.scatter_add_(
+        0, bin_idx.unsqueeze(1).expand_as(target), target.float()
+    )
+    pred_grid.scatter_add_(
+        0, bin_idx.unsqueeze(1).expand_as(pred_mean), pred_mean.float()
+    )
+    count_grid.scatter_add_(0, bin_idx, torch.ones(num_points, device=dev))
+
+    # normalise occupied bins (handles the rare collision case)
+    occupied = count_grid > 0
+    target_grid[occupied] = (target_grid[occupied].T / count_grid[occupied]).T
+    pred_grid[occupied]   = (pred_grid[occupied].T   / count_grid[occupied]).T
+
+    # fill empty bins with the patch mean so Haar coefficients
+    # reflect actual spatial structure rather than zero-padding artefacts
+    patch_mean_t = target_grid[occupied].mean(0, keepdim=True)
+    patch_mean_p = pred_grid[occupied].mean(0, keepdim=True)
+    target_grid[~occupied] = patch_mean_t
+    pred_grid[~occupied]   = patch_mean_p
+
+    # reshape to (grid_size, grid_size, num_channels)
+    target_grid = target_grid.view(grid_size, grid_size, num_channels)
+    pred_grid   = pred_grid.view(  grid_size, grid_size, num_channels)
+
+    # --- multi-level Haar per channel ---
+    loss_chs = torch.zeros(num_channels, device=dev)
+    subband_norm = 1.0 + 3.0 * detail_weight
+
+    for c in range(num_channels):
+        t_field = target_grid[:, :, c]
+        p_field = pred_grid[:,   :, c]
+        level_loss = torch.tensor(0.0, device=dev)
+
+        for _lvl in range(num_levels):
+            t_LL, t_LH, t_HL, t_HH = haar_2d(t_field)
+            p_LL, p_LH, p_HL, p_HH = haar_2d(p_field)
+
+            level_loss = level_loss + (
+                torch.mean((t_LL - p_LL) ** 2)
+                + detail_weight * torch.mean((t_LH - p_LH) ** 2)
+                + detail_weight * torch.mean((t_HL - p_HL) ** 2)
+                + detail_weight * torch.mean((t_HH - p_HH) ** 2)
+            ) / subband_norm
+
+            # recurse into LL subband
+            t_field = t_LL
+            p_field = p_LL
+
+        loss_chs[c] = level_loss / num_levels
+
+    loss = loss_chs.mean()
+    return loss, loss_chs.detach()

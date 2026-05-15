@@ -125,6 +125,11 @@ class PhysicalTargetAndAux(TargetAndAuxModuleBase):
                     "target_metda_data": meta_data,
                     "is_spoof": is_spoof,
                     "idxs_inv": idxs_inv,
+                    # add this:
+                    "target_coords_lens": [
+                        sample.streams_data[stream_name].target_coords_lens[step]
+                        for sample in batch.samples
+                    ],
                 }
 
                 targets.add_physical_target(step, stream_name, targets_step)
