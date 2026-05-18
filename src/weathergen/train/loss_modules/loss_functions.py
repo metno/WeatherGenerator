@@ -490,6 +490,93 @@ def haar_wavelet_mse_local_patch(
     target_grid = target_grid.view(grid_size, grid_size, num_channels)
     pred_grid   = pred_grid.view(  grid_size, grid_size, num_channels)
 
+    # ----------------------------------------------------------------
+    # DEBUG: plot target_grid and pred_grid for one large patch
+    # Remove after verification.
+    # ----------------------------------------------------------------
+    if not hasattr(haar_wavelet_mse_local_patch, '_debug_plot_done') \
+            and num_points > 80:
+        haar_wavelet_mse_local_patch._debug_plot_done = True
+
+        import os
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        out_dir = "/leonardo_scratch/large/userexternal/clussana/debfigures"
+        os.makedirs(out_dir, exist_ok=True)
+
+        t_np = target_grid.detach().cpu().float().numpy()  # (grid_size, grid_size, C)
+        p_np = pred_grid.detach().cpu().float().numpy()
+
+        for c in range(num_channels):
+            t_ch = t_np[:, :, c]
+            p_ch = p_np[:, :, c]
+            diff  = t_ch - p_ch
+
+            # use percentile-based color scale to reveal spatial details
+            # robust to outliers from empty-bin fill
+            vmin = float(np.percentile(t_ch[t_ch != t_ch.mean()], 5)
+                         if (t_ch != t_ch.mean()).any() else t_ch.min())
+            vmax = float(np.percentile(t_ch[t_ch != t_ch.mean()], 95)
+                         if (t_ch != t_ch.mean()).any() else t_ch.max())
+
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+            im0 = axes[0].imshow(
+                t_ch, origin='lower', cmap='RdBu_r',
+                vmin=vmin, vmax=vmax, interpolation='nearest'
+            )
+            axes[0].set_title(f'target  ch={c}  n_pts={num_points}')
+            axes[0].set_xlabel('col (y local)')
+            axes[0].set_ylabel('row (z local)')
+            plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+            im1 = axes[1].imshow(
+                p_ch, origin='lower', cmap='RdBu_r',
+                vmin=vmin, vmax=vmax, interpolation='nearest'
+            )
+            axes[1].set_title(f'pred  ch={c}')
+            axes[1].set_xlabel('col (y local)')
+            plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+            # difference uses its own symmetric color scale
+            diff_abs = np.abs(diff).max()
+            diff_abs = max(diff_abs, 1e-6)
+            im2 = axes[2].imshow(
+                diff, origin='lower', cmap='bwr',
+                vmin=-diff_abs, vmax=diff_abs, interpolation='nearest'
+            )
+            axes[2].set_title(f'target - pred  ch={c}')
+            axes[2].set_xlabel('col (y local)')
+            plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+
+            # overlay point positions as small dots to show coverage
+            y_np = local_xy[:, 0].detach().cpu().float().numpy()
+            z_np = local_xy[:, 1].detach().cpu().float().numpy()
+            y_range_v = float(torch.tensor(y_np).abs().max().clamp(min=1e-6))
+            z_range_v = float(torch.tensor(z_np).abs().max().clamp(min=1e-6))
+            col_pts = (y_np / y_range_v + 1.0) * 0.5 * (grid_size - 1)
+            row_pts = (z_np / z_range_v + 1.0) * 0.5 * (grid_size - 1)
+            for ax in axes:
+                ax.scatter(col_pts, row_pts,
+                           s=0.5, c='black', alpha=0.3, linewidths=0)
+
+            plt.suptitle(
+                f'Wavelet patch  grid={grid_size}x{grid_size}  '
+                f'n_pts={num_points}  ch={c}',
+                fontsize=11
+            )
+            plt.tight_layout()
+            out_path = os.path.join(out_dir, f'wavelet_patch_ch{c}.png')
+            plt.savefig(out_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            print(f"[DEBUG wavelet plot] ch={c} saved to {out_path}")
+    # ----------------------------------------------------------------
+    # END DEBUG
+    # ----------------------------------------------------------------
+
     # --- multi-level Haar per channel ---
     loss_chs = torch.zeros(num_channels, device=dev)
     subband_norm = 1.0 + 3.0 * detail_weight

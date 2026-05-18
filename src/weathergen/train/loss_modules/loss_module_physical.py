@@ -434,7 +434,151 @@ class LossPhysical(LossModuleBase):
                         # expected shape of pred is [ensemble_size, num_samples, num_channels].
                         pred = pred.reshape([pred.shape[0], *target.shape])
                         assert pred.shape[1] > 0
-                    
+                        # ----------------------------------------------------------------
+                        # DEBUG: plot target and pred spatial distribution for NORA3
+                        # Set DEBUG_SPATIAL_PLOT = True to enable.
+                        # Set DEBUG_PLOT_EVERY_N to control plotting frequency.
+                        # Define the bounding box to restrict the area plotted.
+                        # Remove after verification.
+                        # ----------------------------------------------------------------
+                        DEBUG_SPATIAL_PLOT  = True
+                        DEBUG_PLOT_EVERY_N  = 100     # plot every N batches
+                        DEBUG_LAT_MIN       = 57.0
+                        DEBUG_LAT_MAX       = 72.0
+                        DEBUG_LON_MIN       = 3.0
+                        DEBUG_LON_MAX       = 32.0
+                        # set all four to None to plot all points:
+                        # DEBUG_LAT_MIN = DEBUG_LAT_MAX = DEBUG_LON_MIN = DEBUG_LON_MAX = None
+
+                        _debug_counter_key = f'_debug_spatial_counter_{stream_name}'
+                        current_count = getattr(self, _debug_counter_key, 0)
+                        setattr(self, _debug_counter_key, current_count + 1)
+
+                        if DEBUG_SPATIAL_PLOT \
+                                and stream_name == "NORA3" \
+                                and current_count % DEBUG_PLOT_EVERY_N == 0 \
+                                and target.shape[0] > 0:
+
+                            import os
+                            import numpy as np
+                            import matplotlib
+                            matplotlib.use('Agg')
+                            import matplotlib.pyplot as plt
+
+                            out_dir = "/leonardo_scratch/large/userexternal/clussana/debfigures/"
+                            os.makedirs(out_dir, exist_ok=True)
+
+                            # coords are raw (lat, lon) in degrees
+                            coords_np = targets_coords_batch[target_idx].detach().cpu().float().numpy()
+                            lats_all  = coords_np[:, 0]
+                            lons_all  = coords_np[:, 1]
+
+                            target_np = target.detach().cpu().float().numpy()
+                            pred_np   = pred[0].detach().cpu().float().numpy()
+
+                            # apply bounding box mask if defined
+                            if all(v is not None for v in [
+                                    DEBUG_LAT_MIN, DEBUG_LAT_MAX,
+                                    DEBUG_LON_MIN, DEBUG_LON_MAX]):
+                                bbox_mask = (
+                                    (lats_all >= DEBUG_LAT_MIN) &
+                                    (lats_all <= DEBUG_LAT_MAX) &
+                                    (lons_all >= DEBUG_LON_MIN) &
+                                    (lons_all <= DEBUG_LON_MAX)
+                                )
+                            else:
+                                bbox_mask = np.ones(len(lats_all), dtype=bool)
+
+                            lats      = lats_all[bbox_mask]
+                            lons      = lons_all[bbox_mask]
+                            target_bb = target_np[bbox_mask]
+                            pred_bb   = pred_np[bbox_mask]
+
+                            print(f"[DEBUG spatial] NORA3 batch={current_count}: "
+                                  f"total={len(lats_all)} "
+                                  f"in_bbox={bbox_mask.sum()} "
+                                  f"bbox=({DEBUG_LAT_MIN},{DEBUG_LAT_MAX},"
+                                  f"{DEBUG_LON_MIN},{DEBUG_LON_MAX})")
+
+                            if bbox_mask.sum() == 0:
+                                print("[DEBUG spatial] no points in bounding box — "
+                                      "check DEBUG_LAT/LON_MIN/MAX values")
+                            else:
+                                num_ch  = target_bb.shape[1]
+                                n_pts   = len(lats)
+                                pt_size = max(0.1, min(3.0, 80000.0 / n_pts))
+
+                                for c in range(num_ch):
+                                    t_vals = target_bb[:, c]
+                                    p_vals = pred_bb[:, c]
+                                    diff   = t_vals - p_vals
+
+                                    p2,  p98 = np.percentile(t_vals, 2),  np.percentile(t_vals, 98)
+                                    d2,  d98 = np.percentile(diff,   2),  np.percentile(diff,   98)
+                                    dabs     = max(abs(d2), abs(d98), 1e-6)
+
+                                    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+                                    sc0 = axes[0].scatter(
+                                        lons, lats, c=t_vals,
+                                        s=pt_size, cmap='RdBu_r',
+                                        vmin=p2, vmax=p98,
+                                        linewidths=0, rasterized=True,
+                                    )
+                                    axes[0].set_title(
+                                        f'target  ch={c}  n={n_pts}  step={timestep_idx}'
+                                    )
+                                    axes[0].set_xlabel('longitude')
+                                    axes[0].set_ylabel('latitude')
+                                    plt.colorbar(sc0, ax=axes[0], fraction=0.046, pad=0.04)
+
+                                    sc1 = axes[1].scatter(
+                                        lons, lats, c=p_vals,
+                                        s=pt_size, cmap='RdBu_r',
+                                        vmin=p2, vmax=p98,
+                                        linewidths=0, rasterized=True,
+                                    )
+                                    axes[1].set_title(f'pred  ch={c}')
+                                    axes[1].set_xlabel('longitude')
+                                    plt.colorbar(sc1, ax=axes[1], fraction=0.046, pad=0.04)
+
+                                    sc2 = axes[2].scatter(
+                                        lons, lats, c=diff,
+                                        s=pt_size, cmap='bwr',
+                                        vmin=-dabs, vmax=dabs,
+                                        linewidths=0, rasterized=True,
+                                    )
+                                    axes[2].set_title(f'target - pred  ch={c}')
+                                    axes[2].set_xlabel('longitude')
+                                    plt.colorbar(sc2, ax=axes[2], fraction=0.046, pad=0.04)
+
+                                    for ax in axes:
+                                        ax.set_xlim(lons.min() - 0.1, lons.max() + 0.1)
+                                        ax.set_ylim(lats.min() - 0.1, lats.max() + 0.1)
+                                        ax.set_aspect('equal')
+                                        ax.grid(True, lw=0.3, alpha=0.3)
+
+                                    plt.suptitle(
+                                        f'NORA3  ch={c}  n={n_pts}  '
+                                        f'batch={current_count}  step={timestep_idx}  '
+                                        f'lat=[{DEBUG_LAT_MIN},{DEBUG_LAT_MAX}]  '
+                                        f'lon=[{DEBUG_LON_MIN},{DEBUG_LON_MAX}]  '
+                                        f'p2={p2:.3f}  p98={p98:.3f}',
+                                        fontsize=10
+                                    )
+                                    plt.tight_layout()
+                                    out_path = os.path.join(
+                                        out_dir,
+                                        f'nora3_spatial_ch{c}_step{timestep_idx}'
+                                        f'_batch{current_count:06d}.png'
+                                    )
+                                    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+                                    plt.close(fig)
+                                    print(f"[DEBUG spatial] ch={c} "
+                                          f"batch={current_count} saved to {out_path}")
+                        # ----------------------------------------------------------------
+                        # END DEBUG
+                        # ----------------------------------------------------------------                    
                         # get masks for sub-time steps
                         substep_masks = self._get_substep_masks(
                             stream_info, timestep_idx, target_times
