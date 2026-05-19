@@ -1098,3 +1098,202 @@ def global_haar_wavelet_mse(
         loss = torch.mean(loss_chs)
 
     return loss, loss_chs
+
+def healpix_cell_mse(
+    target: torch.Tensor,
+    pred: torch.Tensor,
+    target_coords_lens: torch.Tensor,
+    weights_channels: torch.Tensor | None,
+    weights_points: torch.Tensor | None,
+):
+    """
+    MSE between per-HEALPix-cell averages of target and pred.
+
+    For each cell that has at least one point, averages the target values
+    and pred values independently, then computes MSE between those averages.
+    Cells with zero points are excluded from the loss.
+
+    Args:
+        target              : (num_points, num_channels)
+        pred                : (ens_size, num_points, num_channels)
+        target_coords_lens  : (num_cells,) int32 — points per cell
+        weights_channels    : (num_channels,) or None
+        weights_points      : unused, kept for API consistency
+
+    Returns:
+        loss     : scalar
+        loss_chs : (num_channels,) per-channel loss
+    """
+    num_points, num_channels = target.shape
+    dev = target.device
+    pred_mean = pred.mean(0)   # (num_points, num_channels)
+
+    num_cells = target_coords_lens.shape[0]
+    tc_lens = target_coords_lens.long().to(dev)
+
+    # build cumulative offsets into the flat tensors
+    cumlen = torch.cat([
+        torch.zeros(1, dtype=torch.long, device=dev),
+        tc_lens.cumsum(0)
+    ])
+
+    # accumulate per-cell sums using scatter_add
+    cell_ids = torch.repeat_interleave(
+        torch.arange(num_cells, device=dev), tc_lens
+    )   # (num_points,) — cell id for each point
+
+    target_cell_sum = torch.zeros(num_cells, num_channels, device=dev)
+    pred_cell_sum   = torch.zeros(num_cells, num_channels, device=dev)
+    count           = torch.zeros(num_cells, device=dev)
+
+    target_cell_sum.scatter_add_(
+        0, cell_ids.unsqueeze(1).expand_as(target), target.float()
+    )
+    pred_cell_sum.scatter_add_(
+        0, cell_ids.unsqueeze(1).expand_as(pred_mean), pred_mean.float()
+    )
+    count.scatter_add_(0, cell_ids, torch.ones(num_points, device=dev))
+
+    # only use cells that have at least one point
+    occupied = count > 0
+    n_occupied = occupied.sum().clamp(min=1)
+
+    target_avg = target_cell_sum[occupied] / count[occupied].unsqueeze(1)
+    pred_avg   = pred_cell_sum[occupied]   / count[occupied].unsqueeze(1)
+
+    # ----------------------------------------------------------------
+    # DEBUG: plot per-cell averages of target and pred
+    # Set DEBUG_CELL_MSE_PLOT = True to enable.
+    # Remove after verification.
+    # ----------------------------------------------------------------
+    DEBUG_CELL_MSE_PLOT  = True
+    DEBUG_PLOT_EVERY_N   = 100
+    DEBUG_OUT_DIR        = "/tmp/wg_debug_cell_mse"
+    DEBUG_STREAM_NAME    = "NORA3"   # only plot for this stream
+                                      # pass stream_name as argument to filter
+
+    _counter_key = '_healpix_cell_mse_call_count'
+    _call_count  = getattr(healpix_cell_mse, _counter_key, 0)
+    setattr(healpix_cell_mse, _counter_key, _call_count + 1)
+
+    if DEBUG_CELL_MSE_PLOT and _call_count % DEBUG_PLOT_EVERY_N == 0:
+        import os
+        import numpy as _np3
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as _plt3
+
+        os.makedirs(DEBUG_OUT_DIR, exist_ok=True)
+
+        # we need the cell center coordinates to place the averages on a map
+        # cell_ids tells us which cells are occupied — we need their lat/lon
+        # use the cell index within the occupied mask to recover cell ids
+        occupied_cell_ids = torch.where(occupied)[0].cpu().numpy()
+
+        t_avg_np = target_avg.detach().cpu().float().numpy()  # (n_occupied, C)
+        p_avg_np = pred_avg.detach().cpu().float().numpy()
+        diff_np  = t_avg_np - p_avg_np
+
+        # build approximate lat/lon from cell index using HEALPix
+        # requires astropy_healpix — already a project dependency
+        try:
+            import astropy_healpix as _hp3
+            import math as _math3
+            # infer healpix level from num_cells
+            hl = round(_math3.log(num_cells / 12, 4))
+            ns = 2 ** hl
+            lons_c, lats_c = _hp3.healpix_to_lonlat(
+                occupied_cell_ids, ns, order='nested'
+            )
+            cell_lats = lats_c.deg
+            cell_lons = lons_c.deg
+            cell_lons = ((cell_lons + 180.0) % 360.0) - 180.0
+            has_coords = True
+        except Exception as _e:
+            print(f"[cell_mse plot] could not compute cell coords: {_e}")
+            has_coords = False
+
+        if has_coords:
+            n_ch     = t_avg_np.shape[1]
+            pt_size  = max(1.0, min(20.0, 500000.0 / len(cell_lats)))
+
+            for c in range(n_ch):
+                t_vals   = t_avg_np[:, c]
+                p_vals   = p_avg_np[:, c]
+                diff_vals = diff_np[:, c]
+
+                p2,  p98  = _np3.percentile(t_vals,    2), _np3.percentile(t_vals,   98)
+                d2,  d98  = _np3.percentile(diff_vals, 2), _np3.percentile(diff_vals, 98)
+                dabs      = max(abs(d2), abs(d98), 1e-6)
+
+                fig, axes = _plt3.subplots(1, 3, figsize=(18, 6))
+
+                sc0 = axes[0].scatter(
+                    cell_lons, cell_lats, c=t_vals,
+                    s=pt_size, cmap='RdBu_r',
+                    vmin=p2, vmax=p98,
+                    linewidths=0, rasterized=True,
+                )
+                axes[0].set_title(
+                    f'cell avg target  ch={c}  '
+                    f'n_cells={len(cell_lats)}'
+                )
+                axes[0].set_xlabel('longitude')
+                axes[0].set_ylabel('latitude')
+                _plt3.colorbar(sc0, ax=axes[0], fraction=0.046, pad=0.04)
+
+                sc1 = axes[1].scatter(
+                    cell_lons, cell_lats, c=p_vals,
+                    s=pt_size, cmap='RdBu_r',
+                    vmin=p2, vmax=p98,
+                    linewidths=0, rasterized=True,
+                )
+                axes[1].set_title(f'cell avg pred  ch={c}')
+                axes[1].set_xlabel('longitude')
+                _plt3.colorbar(sc1, ax=axes[1], fraction=0.046, pad=0.04)
+
+                sc2 = axes[2].scatter(
+                    cell_lons, cell_lats, c=diff_vals,
+                    s=pt_size, cmap='bwr',
+                    vmin=-dabs, vmax=dabs,
+                    linewidths=0, rasterized=True,
+                )
+                axes[2].set_title(f'cell avg target-pred  ch={c}')
+                axes[2].set_xlabel('longitude')
+                _plt3.colorbar(sc2, ax=axes[2], fraction=0.046, pad=0.04)
+
+                for ax in axes:
+                    ax.set_aspect('equal')
+                    ax.grid(True, lw=0.3, alpha=0.3)
+
+                _plt3.suptitle(
+                    f'healpix_cell_mse  ch={c}  '
+                    f'call={_call_count}  '
+                    f'n_cells={len(cell_lats)}  '
+                    f'p2={p2:.3f}  p98={p98:.3f}  '
+                    f'max_diff={dabs:.3f}',
+                    fontsize=10
+                )
+                _plt3.tight_layout()
+                out_path = os.path.join(
+                    DEBUG_OUT_DIR,
+                    f'cell_mse_ch{c}_call{_call_count:06d}.png'
+                )
+                _plt3.savefig(out_path, dpi=120, bbox_inches='tight')
+                _plt3.close(fig)
+                print(f"[cell_mse plot] ch={c} "
+                      f"call={_call_count} saved to {out_path}")
+    # ----------------------------------------------------------------
+    # END DEBUG
+    # ----------------------------------------------------------------
+
+    # MSE between cell averages
+    diff_sq  = (target_avg - pred_avg) ** 2   # (n_occupied, num_channels)
+    loss_chs = diff_sq.mean(0)                # (num_channels,)
+
+    if weights_channels is not None:
+        loss = torch.mean(loss_chs * weights_channels.to(dev))
+    else:
+        loss = torch.mean(loss_chs)
+
+    return loss, loss_chs

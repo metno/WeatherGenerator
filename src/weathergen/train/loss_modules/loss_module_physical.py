@@ -69,7 +69,7 @@ class LossPhysical(LossModuleBase):
         # CrL
         self.loss_fcts = []
         for name, params in loss_fcts.items():
-            if name in ("haar_wavelet_cell", "global_haar_wavelet"):
+            if name in ("haar_wavelet_cell", "global_haar_wavelet", "healpix_cell_mse"):
                 fn = None
             else:
                 fn = getattr(loss_fns, name)
@@ -332,6 +332,30 @@ class LossPhysical(LossModuleBase):
             detail_weight=detail_weight,
             num_levels=num_levels,
             stream_name=stream_name,
+        )
+        return loss, loss_chs
+
+    @staticmethod
+    def _loss_healpix_cell_mse(
+        target: torch.Tensor,
+        pred: torch.Tensor,
+        target_coords_lens: torch.Tensor,
+        weights_channels: torch.Tensor | None,
+    ):
+        import weathergen.train.loss_modules.loss_functions as _lf
+
+        if target.shape[0] == 0 or target_coords_lens.sum() == 0:
+            return (
+                torch.tensor(0.0, device=target.device, requires_grad=True),
+                torch.zeros(target.shape[-1], device=target.device),
+            )
+
+        loss, loss_chs = _lf.healpix_cell_mse(
+            target,
+            pred,
+            target_coords_lens.to(target.device),
+            weights_channels,
+            weights_points=None,
         )
         return loss, loss_chs
 
@@ -711,6 +735,29 @@ class LossPhysical(LossModuleBase):
                             loss_st_corr = loss_st_corr + loss_cur_w
                             ctr_loss_fcts += 1 if (loss_cur_w > 0.0 and not is_spoof) else 0
                             continue                        
+
+                        elif loss_fct_name == "healpix_cell_mse":
+
+                            tc_lens_list = target_cur[stream_name]["target_coords_lens"]
+                            tc_lens      = tc_lens_list[target_idx]
+
+                            loss_lfct, loss_lfct_chs = self._loss_healpix_cell_mse(
+                                target,
+                                pred,
+                                tc_lens,
+                                weights_channels,
+                            )
+
+                            for ch_n, v in zip(target_channels, loss_lfct_chs, strict=True):
+                                losses_all[stream_name][str(timestep_idx)][loss_fct_name][ch_n] = (
+                                    spoof_weight * v if v != 0.0 and not is_spoof
+                                    else torch.tensor(0.0, device=self.device)
+                                )
+                            loss_cur_w   = spoof_weight * loss_fct_weight * loss_lfct * output_step_weight
+                            loss_st_corr = loss_st_corr + loss_cur_w
+                            ctr_loss_fcts += 1 if (loss_cur_w > 0.0 and not is_spoof) else 0
+                            continue
+
 
                         # loss_lfct: loss for given loss function aggregated over all channels
                         # loss_lfct_chs: loss for given loss function per channel
