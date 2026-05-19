@@ -69,7 +69,12 @@ class LossPhysical(LossModuleBase):
         # CrL
         self.loss_fcts = []
         for name, params in loss_fcts.items():
-            if name in ("haar_wavelet_cell", "global_haar_wavelet", "healpix_cell_mse"):
+            if name in (
+                "haar_wavelet_cell",
+                "global_haar_wavelet",
+                "global_haar_wavelet_reshape",
+                "healpix_cell_mse",
+            ):
                 fn = None
             else:
                 fn = getattr(loss_fns, name)
@@ -329,6 +334,42 @@ class LossPhysical(LossModuleBase):
             weights_channels=weights_channels,
             weights_points=None,
             grid_resolution_deg=grid_resolution_deg,
+            detail_weight=detail_weight,
+            num_levels=num_levels,
+            stream_name=stream_name,
+        )
+        return loss, loss_chs
+
+    @staticmethod
+    def _loss_global_haar_reshape(
+        target: torch.Tensor,
+        pred: torch.Tensor,
+        target_coords_raw: torch.Tensor,
+        weights_channels: torch.Tensor | None,
+        stream_name: str = "",
+        nx: int = 100,
+        ny: int = 100,
+        detail_weight: float = 2.0,
+        num_levels: int = 3,
+    ):
+        import weathergen.train.loss_modules.loss_functions as _lf
+
+        if target.shape[0] == 0:
+            return (
+                torch.tensor(0.0, device=target.device, requires_grad=True),
+                torch.zeros(target.shape[-1], device=target.device),
+            )
+
+        target_coords_raw = target_coords_raw.to(target.device)
+
+        loss, loss_chs = _lf.global_haar_wavelet_reshape(
+            target,
+            pred,
+            target_coords_raw,
+            weights_channels=weights_channels,
+            weights_points=None,
+            nx=nx,
+            ny=ny,
             detail_weight=detail_weight,
             num_levels=num_levels,
             stream_name=stream_name,
@@ -736,7 +777,33 @@ class LossPhysical(LossModuleBase):
                             loss_cur_w   = spoof_weight * loss_fct_weight * loss_lfct * output_step_weight
                             loss_st_corr = loss_st_corr + loss_cur_w
                             ctr_loss_fcts += 1 if (loss_cur_w > 0.0 and not is_spoof) else 0
-                            continue                        
+                            continue                       
+
+                        elif loss_fct_name == "global_haar_wavelet_reshape":
+                        elif loss_fct_name == "global_haar_wavelet_reshape":
+
+                            loss_lfct, loss_lfct_chs = self._loss_global_haar_reshape(
+                                target,
+                                pred,
+                                targets_coords_batch[target_idx],
+                                weights_channels,
+                                stream_name=stream_name,
+                                template_path=stream_info.get("template_path", ""),
+                                **{
+                                    k: v for k, v in loss_fct_params.items()
+                                    if k not in ("template_path",)
+                                },
+                            )                            
+
+                            for ch_n, v in zip(target_channels, loss_lfct_chs, strict=True):
+                                losses_all[stream_name][str(timestep_idx)][loss_fct_name][ch_n] = (
+                                    spoof_weight * v if v != 0.0 and not is_spoof
+                                    else torch.tensor(0.0, device=self.device)
+                                )
+                            loss_cur_w   = spoof_weight * loss_fct_weight * loss_lfct * output_step_weight
+                            loss_st_corr = loss_st_corr + loss_cur_w
+                            ctr_loss_fcts += 1 if (loss_cur_w > 0.0 and not is_spoof) else 0
+                            continue
 
                         elif loss_fct_name == "healpix_cell_mse":
 

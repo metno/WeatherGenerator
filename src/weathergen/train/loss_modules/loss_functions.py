@@ -1108,6 +1108,438 @@ def global_haar_wavelet_mse(
 
     return loss, loss_chs
 
+def global_haar_wavelet_reshape(
+    target: torch.Tensor,
+    pred: torch.Tensor,
+    target_coords_raw: torch.Tensor,
+    weights_channels: torch.Tensor | None,
+    weights_points: torch.Tensor | None,
+    template_path: str = "",
+    detail_weight: float = 2.0,
+    num_levels: int = 3,
+    stream_name: str = "",
+):
+    """
+    Global 2D Haar wavelet MSE using template-based regridding.
+
+    Uses a NetCDF template file (same format as MetnoParser) to map each
+    flat input point to its correct position on the original 2D grid.
+    The mapping is done via NearestNDInterpolator — no interpolation of
+    values, just a nearest-neighbour index lookup. Values are placed on
+    the 2D grid without averaging or interpolation.
+
+    Grid cells with no input point are filled with the field mean.
+
+    If template_path is empty or the template cannot be loaded, the loss
+    is set to zero for this sample.
+
+    Args:
+        target            : (num_points, num_channels)
+        pred              : (ens_size, num_points, num_channels)
+        target_coords_raw : (num_points, 2) — geographic (lat, lon) degrees
+        weights_channels  : (num_channels,) or None
+        weights_points    : unused, kept for API consistency
+        template_path     : path to a NetCDF template file with 2D latitude
+                            and longitude arrays matching the original grid
+        detail_weight     : weight on LH, HL, HH subbands relative to LL
+        num_levels        : number of Haar decomposition levels
+        stream_name       : used for debug prints and plot filtering
+
+    Returns:
+        loss     : scalar
+        loss_chs : (num_channels,) per-channel loss
+    """
+    import math as _math_rs
+    import numpy as _np_rs
+
+    num_points, num_channels = target.shape
+    dev       = target.device
+    pred_mean = pred.mean(0)   # (num_points, num_channels)
+
+    # --- load template and build index mapping (cached per template_path) ---
+    _cache_key = f'_template_isort_{template_path}'
+    _shape_key  = f'_template_shape_{template_path}'
+
+    Isort    = getattr(global_haar_wavelet_reshape, _cache_key, None)
+    ny_nx    = getattr(global_haar_wavelet_reshape, _shape_key, None)
+
+    if Isort is None:
+        if not template_path:
+            _key = f'_no_template_reported_{stream_name}'
+            if not getattr(global_haar_wavelet_reshape, _key, False):
+                setattr(global_haar_wavelet_reshape, _key, True)
+                print(
+                    f"[global_haar_reshape] stream={stream_name} "
+                    f"template_path is empty. Setting loss to zero."
+                )
+            return (
+                torch.tensor(0.0, device=dev, requires_grad=True),
+                torch.zeros(num_channels, device=dev),
+            )
+
+        try:
+            import xarray as _xr_rs
+            import scipy.interpolate as _sci_rs
+
+            template = _xr_rs.open_dataset(template_path)
+            olat = template.latitude.values.flatten()   # (ny*nx,)
+            olon = template.longitude.values.flatten()
+            ny, nx = template.latitude.shape
+
+            # build mapping: for each output grid point find the nearest input point
+            # input points: (num_points, 2) in lat/lon
+            ilat = target_coords_raw[:, 0].cpu().numpy()
+            ilon = target_coords_raw[:, 1].cpu().numpy()
+            ipoints = _np_rs.stack([ilat, ilon], axis=1)   # (num_points, 2)
+            opoints = _np_rs.stack([olat, olon], axis=1)   # (ny*nx, 2)
+
+            interpolator = _sci_rs.NearestNDInterpolator(
+                ipoints, _np_rs.arange(len(ilat))
+            )
+            Isort = interpolator(opoints).astype(int)   # (ny*nx,)
+
+            setattr(global_haar_wavelet_reshape, _cache_key, Isort)
+            setattr(global_haar_wavelet_reshape, _shape_key, (ny, nx))
+            ny_nx = (ny, nx)
+
+            print(
+                f"[global_haar_reshape] stream={stream_name} "
+                f"template loaded: grid=({ny}x{nx})  "
+                f"n_input_points={num_points}  "
+                f"n_output_points={ny*nx}"
+            )
+
+        except Exception as _e:
+            _key = f'_template_error_reported_{stream_name}'
+            if not getattr(global_haar_wavelet_reshape, _key, False):
+                setattr(global_haar_wavelet_reshape, _key, True)
+                print(
+                    f"[global_haar_reshape] stream={stream_name} "
+                    f"failed to load template '{template_path}': {_e}. "
+                    f"Setting loss to zero."
+                )
+            return (
+                torch.tensor(0.0, device=dev, requires_grad=True),
+                torch.zeros(num_channels, device=dev),
+            )
+
+    ny, nx = ny_nx
+
+    # round to next multiple of 2^num_levels for Haar compatibility
+    factor = 2 ** num_levels
+    ny_p = int(_math_rs.ceil(ny / factor)) * factor
+    nx_p = int(_math_rs.ceil(nx / factor)) * factor
+    n_grid = ny_p * nx_p
+
+    # --- place input points on 2D grid using Isort ---
+    # Isort[i] = index of the input point nearest to output grid position i
+    # this is a pure index lookup — no interpolation of values
+    Isort_t = torch.from_numpy(Isort).long().to(dev)   # (ny*nx,)
+
+    # gather values at grid positions
+    t_flat = target.float()[Isort_t]      # (ny*nx, C)
+    p_flat = pred_mean.float()[Isort_t]
+
+    # pad to (ny_p * nx_p) if needed
+    if n_grid > ny * nx:
+        pad_size = n_grid - ny * nx
+        t_flat = torch.cat([
+            t_flat, torch.zeros(pad_size, num_channels, device=dev)
+        ], dim=0)
+        p_flat = torch.cat([
+            p_flat, torch.zeros(pad_size, num_channels, device=dev)
+        ], dim=0)
+
+    # reshape to (ny_p, nx_p, C)
+    t_grid = t_flat.view(ny_p, nx_p, num_channels)
+    p_grid = p_flat.view(ny_p, nx_p, num_channels)
+
+    # --- debug parameters ---
+    DEBUG_RESHAPE_PLOT = True
+    DEBUG_PLOT_EVERY_N = 100
+    DEBUG_OUT_DIR      = "/tmp/wg_debug_haar_reshape"
+    DEBUG_ZOOM_LAT_MIN = 57.0    # south Norway
+    DEBUG_ZOOM_LAT_MAX = 62.0
+    DEBUG_ZOOM_LON_MIN = 4.0
+    DEBUG_ZOOM_LON_MAX = 12.0
+    # set to None for full field:
+    # DEBUG_ZOOM_LAT_MIN = DEBUG_ZOOM_LAT_MAX = DEBUG_ZOOM_LON_MIN = DEBUG_ZOOM_LON_MAX = None
+
+    _counter_key = '_global_haar_reshape_call_count'
+    _call_count  = getattr(global_haar_wavelet_reshape, _counter_key, 0)
+    setattr(global_haar_wavelet_reshape, _counter_key, _call_count + 1)
+
+    # lat/lon extent from template for plot axes
+    if ny_nx is not None:
+        try:
+            import xarray as _xr_ext
+            _tmpl = _xr_ext.open_dataset(template_path)
+            lat_min_v = float(_tmpl.latitude.values.min())
+            lat_max_v = float(_tmpl.latitude.values.max())
+            lon_min_v = float(_tmpl.longitude.values.min())
+            lon_max_v = float(_tmpl.longitude.values.max())
+        except Exception:
+            coords_np = target_coords_raw.detach().cpu().float().numpy()
+            lat_min_v = float(coords_np[:, 0].min())
+            lat_max_v = float(coords_np[:, 0].max())
+            lon_min_v = float(coords_np[:, 1].min())
+            lon_max_v = float(coords_np[:, 1].max())
+    else:
+        coords_np = target_coords_raw.detach().cpu().float().numpy()
+        lat_min_v = float(coords_np[:, 0].min())
+        lat_max_v = float(coords_np[:, 0].max())
+        lon_min_v = float(coords_np[:, 1].min())
+        lon_max_v = float(coords_np[:, 1].max())
+
+    # --- plot full gridded field ---
+    if DEBUG_RESHAPE_PLOT \
+            and stream_name == "NORA3" \
+            and _call_count % DEBUG_PLOT_EVERY_N == 0:
+
+        import os
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as _plt_rs
+
+        os.makedirs(DEBUG_OUT_DIR, exist_ok=True)
+
+        _do_zoom = all(v is not None for v in [
+            DEBUG_ZOOM_LAT_MIN, DEBUG_ZOOM_LAT_MAX,
+            DEBUG_ZOOM_LON_MIN, DEBUG_ZOOM_LON_MAX,
+        ])
+
+        for c in range(num_channels):
+            t_np    = t_grid[:, :, c].detach().cpu().float().numpy()
+            p_np    = p_grid[:, :, c].detach().cpu().float().numpy()
+            diff_np = t_np - p_np
+
+            if _do_zoom:
+                _lat_ax = _np_rs.linspace(lat_min_v, lat_max_v, ny_p)
+                _lon_ax = _np_rs.linspace(lon_min_v, lon_max_v, nx_p)
+                _r0 = max(0, int(_np_rs.searchsorted(_lat_ax, DEBUG_ZOOM_LAT_MIN)))
+                _r1 = min(ny_p, int(_np_rs.searchsorted(_lat_ax, DEBUG_ZOOM_LAT_MAX)) + 1)
+                _c0 = max(0, int(_np_rs.searchsorted(_lon_ax, DEBUG_ZOOM_LON_MIN)))
+                _c1 = min(nx_p, int(_np_rs.searchsorted(_lon_ax, DEBUG_ZOOM_LON_MAX)) + 1)
+                t_plot    = t_np[_r0:_r1, _c0:_c1]
+                p_plot    = p_np[_r0:_r1, _c0:_c1]
+                diff_plot = diff_np[_r0:_r1, _c0:_c1]
+                _extent   = [DEBUG_ZOOM_LON_MIN, DEBUG_ZOOM_LON_MAX,
+                             DEBUG_ZOOM_LAT_MIN, DEBUG_ZOOM_LAT_MAX]
+                _zoom_str = (f'zoom=[{DEBUG_ZOOM_LAT_MIN},{DEBUG_ZOOM_LAT_MAX}]N '
+                             f'[{DEBUG_ZOOM_LON_MIN},{DEBUG_ZOOM_LON_MAX}]E')
+            else:
+                t_plot    = t_np
+                p_plot    = p_np
+                diff_plot = diff_np
+                _extent   = [lon_min_v, lon_max_v, lat_min_v, lat_max_v]
+                _zoom_str = 'full field'
+
+            if t_plot.size == 0:
+                continue
+
+            p2,  p98 = _np_rs.percentile(t_plot,    2), _np_rs.percentile(t_plot,   98)
+            d2,  d98 = _np_rs.percentile(diff_plot, 2), _np_rs.percentile(diff_plot, 98)
+            dabs     = max(abs(d2), abs(d98), 1e-6)
+
+            _imshow_kw = dict(origin='lower', aspect='auto',
+                              interpolation='nearest', extent=_extent)
+
+            fig, axes = _plt_rs.subplots(1, 3, figsize=(18, 5))
+
+            im0 = axes[0].imshow(t_plot, cmap='RdBu_r',
+                                 vmin=p2, vmax=p98, **_imshow_kw)
+            axes[0].set_title(f'target grid  ch={c}  ({ny_p}x{nx_p})')
+            axes[0].set_xlabel('longitude')
+            axes[0].set_ylabel('latitude')
+            _plt_rs.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+            im1 = axes[1].imshow(p_plot, cmap='RdBu_r',
+                                 vmin=p2, vmax=p98, **_imshow_kw)
+            axes[1].set_title(f'pred grid  ch={c}')
+            axes[1].set_xlabel('longitude')
+            _plt_rs.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+            im2 = axes[2].imshow(diff_plot, cmap='bwr',
+                                 vmin=-dabs, vmax=dabs, **_imshow_kw)
+            axes[2].set_title(f'target-pred  ch={c}')
+            axes[2].set_xlabel('longitude')
+            _plt_rs.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+
+            for ax in axes:
+                ax.grid(True, lw=0.3, alpha=0.3)
+
+            _plt_rs.suptitle(
+                f'global_haar_reshape  stream={stream_name}  ch={c}  '
+                f'call={_call_count}  grid=({ny_p}x{nx_p})  '
+                f'{_zoom_str}  p2={p2:.3f}  p98={p98:.3f}',
+                fontsize=10
+            )
+            _plt_rs.tight_layout()
+            out_path = os.path.join(
+                DEBUG_OUT_DIR,
+                f'haar_reshape_{stream_name}_grid_ch{c}_call{_call_count:06d}.png'
+            )
+            _plt_rs.savefig(out_path, dpi=120, bbox_inches='tight')
+            _plt_rs.close(fig)
+            print(f"[haar_reshape grid] {stream_name} ch={c} "
+                  f"call={_call_count} saved to {out_path}")
+
+    # --- multi-level Haar per channel ---
+    loss_chs = torch.zeros(num_channels, device=dev)
+
+    for c in range(num_channels):
+        t_field    = t_grid[:, :, c]
+        p_field    = p_grid[:, :, c]
+        level_loss = torch.tensor(0.0, device=dev)
+
+        for lvl in range(num_levels):
+            t_LL, t_LH, t_HL, t_HH = haar_2d(t_field)
+            p_LL, p_LH, p_HL, p_HH = haar_2d(p_field)
+
+            # ----------------------------------------------------------------
+            # DEBUG: plot subbands for NORA3
+            # ----------------------------------------------------------------
+            if DEBUG_RESHAPE_PLOT \
+                    and stream_name == "NORA3" \
+                    and _call_count % DEBUG_PLOT_EVERY_N == 0:
+
+                import os
+                import matplotlib
+                matplotlib.use('Agg')
+                import matplotlib.pyplot as _plt_sb
+
+                os.makedirs(DEBUG_OUT_DIR, exist_ok=True)
+
+                subbands = {
+                    'LL': (t_LL, p_LL),
+                    'LH': (t_LH, p_LH),
+                    'HL': (t_HL, p_HL),
+                    'HH': (t_HH, p_HH),
+                }
+
+                _do_zoom_sb = all(v is not None for v in [
+                    DEBUG_ZOOM_LAT_MIN, DEBUG_ZOOM_LAT_MAX,
+                    DEBUG_ZOOM_LON_MIN, DEBUG_ZOOM_LON_MAX,
+                ])
+
+                _full_nr = t_LL.shape[0] * 2
+                _full_nc = t_LL.shape[1] * 2
+
+                if _do_zoom_sb:
+                    _lat_sb = _np_rs.linspace(lat_min_v, lat_max_v, _full_nr)
+                    _lon_sb = _np_rs.linspace(lon_min_v, lon_max_v, _full_nc)
+                    _r0s = max(0,
+                               int(_np_rs.searchsorted(_lat_sb, DEBUG_ZOOM_LAT_MIN)) // 2)
+                    _r1s = min(t_LL.shape[0],
+                               int(_np_rs.searchsorted(_lat_sb, DEBUG_ZOOM_LAT_MAX)) // 2 + 1)
+                    _c0s = max(0,
+                               int(_np_rs.searchsorted(_lon_sb, DEBUG_ZOOM_LON_MIN)) // 2)
+                    _c1s = min(t_LL.shape[1],
+                               int(_np_rs.searchsorted(_lon_sb, DEBUG_ZOOM_LON_MAX)) // 2 + 1)
+                    _extent_sb  = [DEBUG_ZOOM_LON_MIN, DEBUG_ZOOM_LON_MAX,
+                                   DEBUG_ZOOM_LAT_MIN, DEBUG_ZOOM_LAT_MAX]
+                    _zoom_str_sb = (f'zoom=[{DEBUG_ZOOM_LAT_MIN},{DEBUG_ZOOM_LAT_MAX}]N '
+                                    f'[{DEBUG_ZOOM_LON_MIN},{DEBUG_ZOOM_LON_MAX}]E')
+                    _xlabel = 'longitude'
+                    _ylabel = 'latitude'
+                else:
+                    _r0s, _r1s = 0, t_LL.shape[0]
+                    _c0s, _c1s = 0, t_LL.shape[1]
+                    _extent_sb  = None
+                    _zoom_str_sb = 'full field'
+                    _xlabel = 'col'
+                    _ylabel = 'row'
+
+                _imshow_sb = dict(origin='lower', aspect='auto',
+                                  interpolation='nearest')
+                if _extent_sb is not None:
+                    _imshow_sb['extent'] = _extent_sb
+
+                for band_name, (t_b, p_b) in subbands.items():
+                    t_b_np  = t_b[_r0s:_r1s, _c0s:_c1s].detach().cpu().float().numpy()
+                    p_b_np  = p_b[_r0s:_r1s, _c0s:_c1s].detach().cpu().float().numpy()
+                    diff_b  = t_b_np - p_b_np
+
+                    if t_b_np.size == 0:
+                        continue
+
+                    p2b,  p98b = _np_rs.percentile(t_b_np, 2),  _np_rs.percentile(t_b_np, 98)
+                    d2b,  d98b = _np_rs.percentile(diff_b,  2),  _np_rs.percentile(diff_b,  98)
+                    dabsb      = max(abs(d2b), abs(d98b), 1e-6)
+
+                    fig, axes = _plt_sb.subplots(1, 3, figsize=(18, 5))
+
+                    im0 = axes[0].imshow(t_b_np, cmap='RdBu_r',
+                                         vmin=p2b, vmax=p98b, **_imshow_sb)
+                    axes[0].set_title(f'target {band_name}  ch={c}  lvl={lvl}')
+                    axes[0].set_xlabel(_xlabel)
+                    axes[0].set_ylabel(_ylabel)
+                    _plt_sb.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+                    im1 = axes[1].imshow(p_b_np, cmap='RdBu_r',
+                                         vmin=p2b, vmax=p98b, **_imshow_sb)
+                    axes[1].set_title(f'pred {band_name}  ch={c}  lvl={lvl}')
+                    axes[1].set_xlabel(_xlabel)
+                    _plt_sb.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+                    im2 = axes[2].imshow(diff_b, cmap='bwr',
+                                         vmin=-dabsb, vmax=dabsb, **_imshow_sb)
+                    axes[2].set_title(f'target-pred {band_name}  ch={c}  lvl={lvl}')
+                    axes[2].set_xlabel(_xlabel)
+                    _plt_sb.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+
+                    for ax in axes:
+                        ax.grid(True, lw=0.3, alpha=0.3)
+
+                    _plt_sb.suptitle(
+                        f'haar_reshape subbands  stream={stream_name}  '
+                        f'band={band_name}  ch={c}  lvl={lvl}  '
+                        f'call={_call_count}  shape={t_b_np.shape}  '
+                        f'{_zoom_str_sb}  p2={p2b:.3f}  p98={p98b:.3f}',
+                        fontsize=10
+                    )
+                    _plt_sb.tight_layout()
+                    out_path = os.path.join(
+                        DEBUG_OUT_DIR,
+                        f'haar_reshape_{stream_name}_subbands'
+                        f'_ch{c}_lvl{lvl}_{band_name}'
+                        f'_call{_call_count:06d}.png'
+                    )
+                    _plt_sb.savefig(out_path, dpi=120, bbox_inches='tight')
+                    _plt_sb.close(fig)
+                    print(f"[haar_reshape subband] {stream_name} "
+                          f"band={band_name} ch={c} lvl={lvl} "
+                          f"shape={t_b_np.shape} "
+                          f"call={_call_count} saved to {out_path}")
+            # ----------------------------------------------------------------
+            # END DEBUG subbands
+            # ----------------------------------------------------------------
+
+            _active_mask = (
+                (t_LH != p_LH) | (t_HL != p_HL) | (t_HH != p_HH)
+            )
+            _n_active = _active_mask.sum().clamp(min=1)
+
+            if _n_active > 0:
+                scale = 1.0 / (4 ** lvl)
+                level_loss = level_loss + (
+                    scale * ((t_LH - p_LH) ** 2)[_active_mask].mean()
+                    + scale * ((t_HL - p_HL) ** 2)[_active_mask].mean()
+                    + scale * ((t_HH - p_HH) ** 2)[_active_mask].mean()
+                ) / 3.0
+
+            t_field = t_LL
+            p_field = p_LL
+
+        loss_chs[c] = level_loss / num_levels
+
+    if weights_channels is not None:
+        loss = torch.mean(loss_chs * weights_channels.to(dev))
+    else:
+        loss = torch.mean(loss_chs)
+
+    return loss, loss_chs
+
 def healpix_cell_mse(
     target: torch.Tensor,
     pred: torch.Tensor,
