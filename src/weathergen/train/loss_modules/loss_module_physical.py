@@ -341,6 +341,7 @@ class LossPhysical(LossModuleBase):
         pred: torch.Tensor,
         target_coords_lens: torch.Tensor,
         weights_channels: torch.Tensor | None,
+        stream_name: str = "",
     ):
         import weathergen.train.loss_modules.loss_functions as _lf
 
@@ -356,6 +357,7 @@ class LossPhysical(LossModuleBase):
             target_coords_lens.to(target.device),
             weights_channels,
             weights_points=None,
+            stream_name=stream_name,
         )
         return loss, loss_chs
 
@@ -746,6 +748,7 @@ class LossPhysical(LossModuleBase):
                                 pred,
                                 tc_lens,
                                 weights_channels,
+                                stream_name=stream_name,
                             )
 
                             for ch_n, v in zip(target_channels, loss_lfct_chs, strict=True):
