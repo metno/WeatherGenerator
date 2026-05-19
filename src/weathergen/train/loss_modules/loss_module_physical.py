@@ -69,8 +69,8 @@ class LossPhysical(LossModuleBase):
         # CrL
         self.loss_fcts = []
         for name, params in loss_fcts.items():
-            if name == "haar_wavelet_cell":
-                fn = None   # handled separately in compute_loss via _loss_wavelet_per_cell
+            if name in ("haar_wavelet_cell", "global_haar_wavelet"):
+                fn = None
             else:
                 fn = getattr(loss_fns, name)
             self.loss_fcts.append([
@@ -79,6 +79,7 @@ class LossPhysical(LossModuleBase):
                 name,
                 {k: v for k, v in params.items() if k not in ("weight",)},
             ])
+
         # store hp_nbours for wavelet loss — set externally after model init
         self._hp_nbours = None   # set via loss_calculator._hp_nbours = model_params.hp_nbours
 
@@ -299,6 +300,41 @@ class LossPhysical(LossModuleBase):
     
         return loss_total, loss_chs
 
+    @staticmethod
+    def _loss_global_haar(
+        target: torch.Tensor,
+        pred: torch.Tensor,
+        target_coords_raw: torch.Tensor,
+        weights_channels: torch.Tensor | None,
+        stream_name: str = "",
+        grid_resolution_deg: float = 0.03,
+        detail_weight: float = 2.0,
+        num_levels: int = 3,
+    ):
+        import weathergen.train.loss_modules.loss_functions as _lf
+    
+        if target.shape[0] == 0:
+            return (
+                torch.tensor(0.0, device=target.device, requires_grad=True),
+                torch.zeros(target.shape[-1], device=target.device),
+            )
+
+        # target_coords_raw lives on CPU — move it to the same device as target
+        target_coords_raw = target_coords_raw.to(target.device)
+
+        loss, loss_chs = _lf.global_haar_wavelet_mse(
+            target,
+            pred,
+            target_coords_raw,
+            weights_channels=weights_channels,
+            weights_points=None,
+            grid_resolution_deg=grid_resolution_deg,
+            detail_weight=detail_weight,
+            num_levels=num_levels,
+            stream_name=stream_name,
+        )
+        return loss, loss_chs
+
 
     def compute_loss(self, preds: dict, targets: dict, metadata) -> LossValues:
         """
@@ -441,7 +477,8 @@ class LossPhysical(LossModuleBase):
                         # Define the bounding box to restrict the area plotted.
                         # Remove after verification.
                         # ----------------------------------------------------------------
-                        DEBUG_SPATIAL_PLOT  = True
+#                        DEBUG_SPATIAL_PLOT  = True
+                        DEBUG_SPATIAL_PLOT  = False
                         DEBUG_PLOT_EVERY_N  = 100     # plot every N batches
                         DEBUG_LAT_MIN       = 57.0
                         DEBUG_LAT_MAX       = 72.0
@@ -642,6 +679,38 @@ class LossPhysical(LossModuleBase):
                             loss_st_corr = loss_st_corr + loss_cur_w
                             ctr_loss_fcts += 1 if (loss_cur_w > 0.0 and not is_spoof) else 0
                             continue   # <-- this skips _loss_per_loss_function entirely
+
+                        elif loss_fct_name == "global_haar_wavelet":
+
+                            # read resolution from stream config — allows
+                            # per-stream values matching native data resolution
+                            stream_grid_res = stream_info.get(
+                                "grid_resolution_deg",
+                                loss_fct_params.get("grid_resolution_deg", 0.03)
+                            )
+
+                            loss_lfct, loss_lfct_chs = self._loss_global_haar(
+                                target,
+                                pred,
+                                targets_coords_batch[target_idx],
+                                weights_channels,
+                                stream_name=stream_name,
+                                grid_resolution_deg=stream_grid_res,
+                                **{
+                                    k: v for k, v in loss_fct_params.items()
+                                    if k != "grid_resolution_deg"
+                                },
+                            )
+
+                            for ch_n, v in zip(target_channels, loss_lfct_chs, strict=True):
+                                losses_all[stream_name][str(timestep_idx)][loss_fct_name][ch_n] = (
+                                    spoof_weight * v if v != 0.0 and not is_spoof
+                                    else torch.tensor(0.0, device=self.device)
+                                )
+                            loss_cur_w   = spoof_weight * loss_fct_weight * loss_lfct * output_step_weight
+                            loss_st_corr = loss_st_corr + loss_cur_w
+                            ctr_loss_fcts += 1 if (loss_cur_w > 0.0 and not is_spoof) else 0
+                            continue                        
 
                         # loss_lfct: loss for given loss function aggregated over all channels
                         # loss_lfct_chs: loss for given loss function per channel
