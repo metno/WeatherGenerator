@@ -347,8 +347,7 @@ class LossPhysical(LossModuleBase):
         target_coords_raw: torch.Tensor,
         weights_channels: torch.Tensor | None,
         stream_name: str = "",
-        nx: int = 100,
-        ny: int = 100,
+        template_path: str = "",    # add this
         detail_weight: float = 2.0,
         num_levels: int = 3,
     ):
@@ -368,8 +367,7 @@ class LossPhysical(LossModuleBase):
             target_coords_raw,
             weights_channels=weights_channels,
             weights_points=None,
-            nx=nx,
-            ny=ny,
+            template_path=template_path,    # add this
             detail_weight=detail_weight,
             num_levels=num_levels,
             stream_name=stream_name,
@@ -779,7 +777,6 @@ class LossPhysical(LossModuleBase):
                             ctr_loss_fcts += 1 if (loss_cur_w > 0.0 and not is_spoof) else 0
                             continue                       
 
-                        elif loss_fct_name == "global_haar_wavelet_reshape":
                         elif loss_fct_name == "global_haar_wavelet_reshape":
 
                             loss_lfct, loss_lfct_chs = self._loss_global_haar_reshape(

@@ -1124,14 +1124,11 @@ def global_haar_wavelet_reshape(
 
     Uses a NetCDF template file (same format as MetnoParser) to map each
     flat input point to its correct position on the original 2D grid.
-    The mapping is done via NearestNDInterpolator — no interpolation of
-    values, just a nearest-neighbour index lookup. Values are placed on
-    the 2D grid without averaging or interpolation.
-
-    Grid cells with no input point are filled with the field mean.
-
-    If template_path is empty or the template cannot be loaded, the loss
-    is set to zero for this sample.
+    The mapping is done via NearestNDInterpolator exactly as in MetnoParser:
+        Isort[i] = index of the input point nearest to output grid position i
+        values_on_grid = values[Isort]
+    The template output grid coordinates are cached. Isort is recomputed
+    fresh each call because input points change batch to batch due to masking.
 
     Args:
         target            : (num_points, num_channels)
@@ -1139,9 +1136,8 @@ def global_haar_wavelet_reshape(
         target_coords_raw : (num_points, 2) — geographic (lat, lon) degrees
         weights_channels  : (num_channels,) or None
         weights_points    : unused, kept for API consistency
-        template_path     : path to a NetCDF template file with 2D latitude
-                            and longitude arrays matching the original grid
-        detail_weight     : weight on LH, HL, HH subbands relative to LL
+        template_path     : path to NetCDF template with 2D latitude/longitude
+        detail_weight     : weight on LH, HL, HH subbands
         num_levels        : number of Haar decomposition levels
         stream_name       : used for debug prints and plot filtering
 
@@ -1156,14 +1152,17 @@ def global_haar_wavelet_reshape(
     dev       = target.device
     pred_mean = pred.mean(0)   # (num_points, num_channels)
 
-    # --- load template and build index mapping (cached per template_path) ---
-    _cache_key = f'_template_isort_{template_path}'
-    _shape_key  = f'_template_shape_{template_path}'
+    # --- load template output grid (cached) --- 
+    # only the output grid coordinates from the template are cached
+    # Isort is recomputed fresh each call because input points change
+    # batch to batch due to masking
+    _grid_key  = f'_template_grid_{template_path}'
+    _shape_key = f'_template_shape_{template_path}'
 
-    Isort    = getattr(global_haar_wavelet_reshape, _cache_key, None)
-    ny_nx    = getattr(global_haar_wavelet_reshape, _shape_key, None)
+    template_grid = getattr(global_haar_wavelet_reshape, _grid_key,  None)
+    ny_nx         = getattr(global_haar_wavelet_reshape, _shape_key, None)
 
-    if Isort is None:
+    if template_grid is None:
         if not template_path:
             _key = f'_no_template_reported_{stream_name}'
             if not getattr(global_haar_wavelet_reshape, _key, False):
@@ -1179,34 +1178,22 @@ def global_haar_wavelet_reshape(
 
         try:
             import xarray as _xr_rs
-            import scipy.interpolate as _sci_rs
 
             template = _xr_rs.open_dataset(template_path)
-            olat = template.latitude.values.flatten()   # (ny*nx,)
-            olon = template.longitude.values.flatten()
-            ny, nx = template.latitude.shape
+            olat     = template.latitude.values.flatten()    # (ny*nx,)
+            olon     = template.longitude.values.flatten()
+            ny, nx   = template.latitude.shape
 
-            # build mapping: for each output grid point find the nearest input point
-            # input points: (num_points, 2) in lat/lon
-            ilat = target_coords_raw[:, 0].cpu().numpy()
-            ilon = target_coords_raw[:, 1].cpu().numpy()
-            ipoints = _np_rs.stack([ilat, ilon], axis=1)   # (num_points, 2)
-            opoints = _np_rs.stack([olat, olon], axis=1)   # (ny*nx, 2)
-
-            interpolator = _sci_rs.NearestNDInterpolator(
-                ipoints, _np_rs.arange(len(ilat))
-            )
-            Isort = interpolator(opoints).astype(int)   # (ny*nx,)
-
-            setattr(global_haar_wavelet_reshape, _cache_key, Isort)
+            # cache only the output grid coordinates — fixed for all batches
+            template_grid = _np_rs.stack([olat, olon], axis=1)  # (ny*nx, 2)
+            setattr(global_haar_wavelet_reshape, _grid_key,  template_grid)
             setattr(global_haar_wavelet_reshape, _shape_key, (ny, nx))
             ny_nx = (ny, nx)
 
             print(
                 f"[global_haar_reshape] stream={stream_name} "
-                f"template loaded: grid=({ny}x{nx})  "
-                f"n_input_points={num_points}  "
-                f"n_output_points={ny*nx}"
+                f"template loaded from {template_path}: "
+                f"grid=({ny}x{nx})  n_output_points={ny*nx}"
             )
 
         except Exception as _e:
@@ -1225,22 +1212,36 @@ def global_haar_wavelet_reshape(
 
     ny, nx = ny_nx
 
+    # --- build Isort fresh each call (same as MetnoParser.get_sorting) ---
+    # input points change batch to batch due to masking so Isort must not
+    # be cached
+    import scipy.interpolate as _sci_rs
+
+    ilat    = target_coords_raw[:, 0].cpu().numpy()
+    ilon    = target_coords_raw[:, 1].cpu().numpy()
+    ipoints = _np_rs.stack([ilat, ilon], axis=1)   # (num_points, 2)
+
+    interpolator = _sci_rs.NearestNDInterpolator(
+        ipoints, _np_rs.arange(len(ilat))
+    )
+    Isort = interpolator(template_grid).astype(int)  # (ny*nx,)
+    # Isort[i] = index into input array of point nearest to output grid
+    # position i — identical convention to MetnoParser
+
+    # --- place input values on 2D grid ---
+    # values[Isort] gathers input values into output grid order
+    # identical to MetnoParser: all_values[:, Isort, i, :]
+    Isort_t = torch.from_numpy(Isort).long().to(dev)   # (ny*nx,)
+    t_flat  = target.float()[Isort_t]      # (ny*nx, C)
+    p_flat  = pred_mean.float()[Isort_t]
+
     # round to next multiple of 2^num_levels for Haar compatibility
     factor = 2 ** num_levels
-    ny_p = int(_math_rs.ceil(ny / factor)) * factor
-    nx_p = int(_math_rs.ceil(nx / factor)) * factor
+    ny_p   = int(_math_rs.ceil(ny / factor)) * factor
+    nx_p   = int(_math_rs.ceil(nx / factor)) * factor
     n_grid = ny_p * nx_p
 
-    # --- place input points on 2D grid using Isort ---
-    # Isort[i] = index of the input point nearest to output grid position i
-    # this is a pure index lookup — no interpolation of values
-    Isort_t = torch.from_numpy(Isort).long().to(dev)   # (ny*nx,)
-
-    # gather values at grid positions
-    t_flat = target.float()[Isort_t]      # (ny*nx, C)
-    p_flat = pred_mean.float()[Isort_t]
-
-    # pad to (ny_p * nx_p) if needed
+    # pad if rounding added extra cells
     if n_grid > ny * nx:
         pad_size = n_grid - ny * nx
         t_flat = torch.cat([
@@ -1257,39 +1258,23 @@ def global_haar_wavelet_reshape(
     # --- debug parameters ---
     DEBUG_RESHAPE_PLOT = True
     DEBUG_PLOT_EVERY_N = 100
-    DEBUG_OUT_DIR      = "/tmp/wg_debug_haar_reshape"
-    DEBUG_ZOOM_LAT_MIN = 57.0    # south Norway
+    DEBUG_OUT_DIR      = "/leonardo_scratch/large/userexternal/clussana/debfigures/"
+    DEBUG_ZOOM_LAT_MIN = 57.0
     DEBUG_ZOOM_LAT_MAX = 62.0
     DEBUG_ZOOM_LON_MIN = 4.0
     DEBUG_ZOOM_LON_MAX = 12.0
-    # set to None for full field:
+    # set all four to None for full field:
     # DEBUG_ZOOM_LAT_MIN = DEBUG_ZOOM_LAT_MAX = DEBUG_ZOOM_LON_MIN = DEBUG_ZOOM_LON_MAX = None
 
     _counter_key = '_global_haar_reshape_call_count'
     _call_count  = getattr(global_haar_wavelet_reshape, _counter_key, 0)
     setattr(global_haar_wavelet_reshape, _counter_key, _call_count + 1)
 
-    # lat/lon extent from template for plot axes
-    if ny_nx is not None:
-        try:
-            import xarray as _xr_ext
-            _tmpl = _xr_ext.open_dataset(template_path)
-            lat_min_v = float(_tmpl.latitude.values.min())
-            lat_max_v = float(_tmpl.latitude.values.max())
-            lon_min_v = float(_tmpl.longitude.values.min())
-            lon_max_v = float(_tmpl.longitude.values.max())
-        except Exception:
-            coords_np = target_coords_raw.detach().cpu().float().numpy()
-            lat_min_v = float(coords_np[:, 0].min())
-            lat_max_v = float(coords_np[:, 0].max())
-            lon_min_v = float(coords_np[:, 1].min())
-            lon_max_v = float(coords_np[:, 1].max())
-    else:
-        coords_np = target_coords_raw.detach().cpu().float().numpy()
-        lat_min_v = float(coords_np[:, 0].min())
-        lat_max_v = float(coords_np[:, 0].max())
-        lon_min_v = float(coords_np[:, 1].min())
-        lon_max_v = float(coords_np[:, 1].max())
+    # lat/lon extent for plot axes — from template grid
+    lat_min_v = float(template_grid[:, 0].min())
+    lat_max_v = float(template_grid[:, 0].max())
+    lon_min_v = float(template_grid[:, 1].min())
+    lon_max_v = float(template_grid[:, 1].max())
 
     # --- plot full gridded field ---
     if DEBUG_RESHAPE_PLOT \
@@ -1422,6 +1407,7 @@ def global_haar_wavelet_reshape(
                     DEBUG_ZOOM_LON_MIN, DEBUG_ZOOM_LON_MAX,
                 ])
 
+                # subband is 2x smaller than the field entering this level
                 _full_nr = t_LL.shape[0] * 2
                 _full_nc = t_LL.shape[1] * 2
 
@@ -1436,8 +1422,8 @@ def global_haar_wavelet_reshape(
                                int(_np_rs.searchsorted(_lon_sb, DEBUG_ZOOM_LON_MIN)) // 2)
                     _c1s = min(t_LL.shape[1],
                                int(_np_rs.searchsorted(_lon_sb, DEBUG_ZOOM_LON_MAX)) // 2 + 1)
-                    _extent_sb  = [DEBUG_ZOOM_LON_MIN, DEBUG_ZOOM_LON_MAX,
-                                   DEBUG_ZOOM_LAT_MIN, DEBUG_ZOOM_LAT_MAX]
+                    _extent_sb   = [DEBUG_ZOOM_LON_MIN, DEBUG_ZOOM_LON_MAX,
+                                    DEBUG_ZOOM_LAT_MIN, DEBUG_ZOOM_LAT_MAX]
                     _zoom_str_sb = (f'zoom=[{DEBUG_ZOOM_LAT_MIN},{DEBUG_ZOOM_LAT_MAX}]N '
                                     f'[{DEBUG_ZOOM_LON_MIN},{DEBUG_ZOOM_LON_MAX}]E')
                     _xlabel = 'longitude'
@@ -1445,7 +1431,7 @@ def global_haar_wavelet_reshape(
                 else:
                     _r0s, _r1s = 0, t_LL.shape[0]
                     _c0s, _c1s = 0, t_LL.shape[1]
-                    _extent_sb  = None
+                    _extent_sb   = None
                     _zoom_str_sb = 'full field'
                     _xlabel = 'col'
                     _ylabel = 'row'
@@ -1456,9 +1442,9 @@ def global_haar_wavelet_reshape(
                     _imshow_sb['extent'] = _extent_sb
 
                 for band_name, (t_b, p_b) in subbands.items():
-                    t_b_np  = t_b[_r0s:_r1s, _c0s:_c1s].detach().cpu().float().numpy()
-                    p_b_np  = p_b[_r0s:_r1s, _c0s:_c1s].detach().cpu().float().numpy()
-                    diff_b  = t_b_np - p_b_np
+                    t_b_np = t_b[_r0s:_r1s, _c0s:_c1s].detach().cpu().float().numpy()
+                    p_b_np = p_b[_r0s:_r1s, _c0s:_c1s].detach().cpu().float().numpy()
+                    diff_b = t_b_np - p_b_np
 
                     if t_b_np.size == 0:
                         continue
