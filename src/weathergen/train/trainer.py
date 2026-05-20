@@ -11,6 +11,7 @@
 import copy
 import logging
 import time
+from math import sqrt
 
 import numpy as np
 import torch
@@ -25,13 +26,13 @@ from weathergen.common.config import Config
 from weathergen.datasets.multi_stream_data_sampler import MultiStreamDataSampler
 from weathergen.model.ema import EMAModel
 from weathergen.model.model_interface import (
-    get_target_aux_calculator,
     init_model_and_shard,
 )
 from weathergen.model.utils import apply_fct_to_blocks, set_to_eval
 from weathergen.train.collapse_monitor import CollapseMonitor
 from weathergen.train.loss_calculator import LossCalculator
 from weathergen.train.lr_scheduler import LearningRateScheduler
+from weathergen.train.target_and_aux_utils import get_target_aux_calculator
 from weathergen.train.trainer_base import TrainerBase
 from weathergen.train.utils import (
     TRAIN,
@@ -166,8 +167,6 @@ class Trainer(TrainerBase):
         batch_size = get_batch_size_from_config(mode_cfg)
 
         # get target_aux calculators for different loss terms
-        # del self.cf.training_config.losses["student-teacher"]["loss_fcts"]["JEPA"]
-        # del mode_cfg.losses["student-teacher"]["loss_fcts"]["JEPA"]
         target_and_aux_calculators = {}
         for loss_name, loss_cfg in mode_cfg.losses.items():
             target_and_aux_calculators[loss_name] = get_target_aux_calculator(
@@ -201,6 +200,8 @@ class Trainer(TrainerBase):
             "batch_sampler": None,
             "shuffle": False,
             "num_workers": loader_num_workers,
+            "pin_memory": cf.data_loading.get("memory_pinning", False),
+            "persistent_workers": cf.data_loading.get("persistent_workers", False),
         }
         self.data_loader_validation = torch.utils.data.DataLoader(
             self.dataset, **loader_params, sampler=None
@@ -572,6 +573,8 @@ class Trainer(TrainerBase):
 
                     batch.to_device(self.device)
 
+                    inference_only = self.cf.get("inference_only", False)
+
                     # evaluate model
                     with torch.autocast(
                         device_type=f"cuda:{cf.local_rank}",
@@ -590,20 +593,44 @@ class Trainer(TrainerBase):
                             )
 
                         targets_and_auxs = {}
-                        for loss_name, target_aux in self.target_and_aux_calculators_val.items():
-                            target_idxs = get_target_idxs_from_cfg(mode_cfg, loss_name)
-                            targets_and_auxs[loss_name] = target_aux.compute(
-                                self.cf.general.istep,
-                                batch.get_target_samples(target_idxs),
-                                self.model_params,
-                                self.model,
-                            )
+                        if not inference_only:
+                            for loss_name, target_aux in self.target_and_aux_calculators_val.items():
+                                target_idxs = get_target_idxs_from_cfg(mode_cfg, loss_name)
+                                targets_and_auxs[loss_name] = target_aux.compute(
+                                    self.cf.general.istep,
+                                    batch.get_target_samples(target_idxs),
+                                    self.model_params,
+                                    self.model,
+                                )
+                        else:
+                            # In inference_only mode, targets are absent but we still need
+                            # coordinate/time metadata for output writing. Compute targets_and_auxs
+                            # from source samples, which carry target_coords_raw and
+                            # target_times_raw (populated by get_target_coords in the sampler).
+                            for loss_name, target_aux in self.target_and_aux_calculators_val.items():
+                                tao = target_aux.compute(
+                                    self.cf.general.istep,
+                                    batch.get_source_samples(),
+                                    self.model_params,
+                                    self.model,
+                                )
+                                # Source stream data marks output steps as spoof because target
+                                # files are absent by design in inference_only mode. Override
+                                # is_spoof to False so write_output writes actual predictions
+                                # rather than discarding them as corrupted validation data.
+                                for step_dict in tao.physical:
+                                    for _sname, step_data in step_dict.items():
+                                        step_data["is_spoof"] = [False] * len(
+                                            step_data["is_spoof"]
+                                        )
+                                targets_and_auxs[loss_name] = tao
 
-                    _ = self.loss_calculator_val.compute_loss(
-                        preds=preds,
-                        targets_and_aux=targets_and_auxs,
-                        metadata=extract_batch_metadata(batch),
-                    )
+                    if not inference_only:
+                        _ = self.loss_calculator_val.compute_loss(
+                            preds=preds,
+                            targets_and_aux=targets_and_auxs,
+                            metadata=extract_batch_metadata(batch),
+                        )
 
                     # log output
                     if bidx < num_samples_write:
@@ -631,8 +658,13 @@ class Trainer(TrainerBase):
                     if (bidx * batch_size) > mode_cfg.samples_per_mini_epoch:
                         break
 
-                self._log_terminal(0, mini_epoch, VAL)
-                self._log(VAL)
+                if not inference_only:
+                    self._log_terminal(0, mini_epoch, VAL)
+                    self._log(VAL)
+                else:
+                    logger.info(
+                        f"inference_only=True: skipping loss/metric logging for epoch {mini_epoch}."
+                    )
 
         # avoid that there is a systematic bias in the validation subset
         self.dataset_val.advance()
@@ -766,7 +798,9 @@ class Trainer(TrainerBase):
         grad_norms = {"grad_norm.total": self.last_grad_norm}
         for name, param in self.model.named_parameters():
             if param.grad is not None:
-                grad_norms["grad_norm." + name] = self._get_tensor_item(param.grad.norm())
+                grad_norms["grad_norm." + name] = self._get_tensor_item(
+                    param.grad.norm() / sqrt(param.numel())
+                )
 
         if is_root():
             self.train_logger.log_metrics(stage, grad_norms)

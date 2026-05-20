@@ -81,13 +81,12 @@ class TokenizerMasking(Tokenizer):
         self,
         training_mode: str,
         num_cells: int,
-        stage_cfg: dict,
-        stream_cfg: dict,
+        stream_info: dict,
     ) -> tuple[np.typing.NDArray, list[np.typing.NDArray], list[SampleMetaData]]:
         """
         Create masks for samples
         """
-        return self.masker.build_samples_for_stream(training_mode, num_cells, stage_cfg, stream_cfg)
+        return self.masker.build_samples_for_stream(training_mode, num_cells, stream_info)
 
     def cell_to_token_mask(self, idxs_cells, idxs_cells_lens, mask):
         """ """
@@ -166,7 +165,7 @@ class TokenizerMasking(Tokenizer):
         )
 
         # TODO: split up
-        _, _, _, coords_local, coords_per_cell = tokenize_apply_mask_target(
+        _, datetimes, coords_raw, coords_local, coords_per_cell = tokenize_apply_mask_target(
             stream_info["stream_id"],
             self.hl_target,
             idxs_cells,
@@ -181,7 +180,7 @@ class TokenizerMasking(Tokenizer):
             encode_times_target,
         )
 
-        return (coords_local, coords_per_cell)
+        return (coords_local, coords_per_cell, coords_raw, datetimes)
 
     def get_target_values(
         self,

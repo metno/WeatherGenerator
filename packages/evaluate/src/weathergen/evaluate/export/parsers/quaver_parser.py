@@ -37,18 +37,18 @@ class QuaverParser(CfParser):
         """
         Initialize Quaver parser with configuration and additional parameters.
         """
+
         for k, v in kwargs.items():
             setattr(self, k, v)
 
-        if not hasattr(self, "quaver_template_folder"):
+        if not hasattr(self, "quaver_template_folder") or self.quaver_template_folder is None:
             raise ValueError("Template folder must be provided for Quaver format.")
-        if not hasattr(self, "quaver_template_grid_type"):
+        if not hasattr(self, "quaver_template_grid_type") or self.quaver_template_grid_type is None:
             raise ValueError("Template grid type must be provided for Quaver format.")
-        if not hasattr(self, "channels"):
+        if not hasattr(self, "channels") or self.channels is None:
             raise ValueError("Channels must be provided for Quaver format.")
-        if not hasattr(self, "expver"):
+        if not hasattr(self, "expver") or self.expver is None:
             raise ValueError("Expver must be provided for Quaver format.")
-
         super().__init__(config, **kwargs)
 
         self.template_cache = []
@@ -87,7 +87,8 @@ class QuaverParser(CfParser):
             if result is None:
                 continue
 
-            result = result.as_xarray().squeeze()
+            if not isinstance(result, xr.DataArray):
+                result = result.as_xarray().squeeze()
             result = result.sel(channel=self.channels)
             da_fs = self.assign_coords(result)
 
