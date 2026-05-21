@@ -1108,6 +1108,10 @@ def global_haar_wavelet_mse(
 
     return loss, loss_chs
 
+###########################################################################
+###########################################################################
+###########################################################################
+###########################################################################
 def global_haar_wavelet_reshape(
     target: torch.Tensor,
     pred: torch.Tensor,
@@ -1122,40 +1126,23 @@ def global_haar_wavelet_reshape(
     """
     Global 2D Haar wavelet MSE using template-based regridding.
 
-    Uses a NetCDF template file (same format as MetnoParser) to map each
-    flat input point to its correct position on the original 2D grid.
-    The mapping is done via NearestNDInterpolator exactly as in MetnoParser:
-        Isort[i] = index of the input point nearest to output grid position i
-        values_on_grid = values[Isort]
-    The template output grid coordinates are cached. Isort is recomputed
-    fresh each call because input points change batch to batch due to masking.
+    Follows MetnoParser.regrid() exactly:
+      1. Load template latitude/longitude (2D, shape (ny, nx))
+      2. For each output grid point find the nearest input point (NearestNDInterpolator)
+      3. Gather: values_on_grid = values[Isort], reshape to (ny, nx)
+      4. Apply multi-level Haar decomposition and compute MSE on detail subbands
 
-    Args:
-        target            : (num_points, num_channels)
-        pred              : (ens_size, num_points, num_channels)
-        target_coords_raw : (num_points, 2) — geographic (lat, lon) degrees
-        weights_channels  : (num_channels,) or None
-        weights_points    : unused, kept for API consistency
-        template_path     : path to NetCDF template with 2D latitude/longitude
-        detail_weight     : weight on LH, HL, HH subbands
-        num_levels        : number of Haar decomposition levels
-        stream_name       : used for debug prints and plot filtering
-
-    Returns:
-        loss     : scalar
-        loss_chs : (num_channels,) per-channel loss
+    Template output grid is cached. Isort is recomputed each call because
+    input points change batch to batch due to masking.
     """
     import math as _math_rs
     import numpy as _np_rs
 
     num_points, num_channels = target.shape
     dev       = target.device
-    pred_mean = pred.mean(0)   # (num_points, num_channels)
+    pred_mean = pred.mean(0)
 
-    # --- load template output grid (cached) --- 
-    # only the output grid coordinates from the template are cached
-    # Isort is recomputed fresh each call because input points change
-    # batch to batch due to masking
+    # --- load and cache template output grid ---
     _grid_key  = f'_template_grid_{template_path}'
     _shape_key = f'_template_shape_{template_path}'
 
@@ -1180,11 +1167,18 @@ def global_haar_wavelet_reshape(
             import xarray as _xr_rs
 
             template = _xr_rs.open_dataset(template_path)
-            olat     = template.latitude.values.flatten()    # (ny*nx,)
-            olon     = template.longitude.values.flatten()
-            ny, nx   = template.latitude.shape
 
-            # cache only the output grid coordinates — fixed for all batches
+            # latitude/longitude are 2D arrays with dims (y, x)
+            # flatten in C-order (row-major) — same as metno_parser
+            olat = template.latitude.values.flatten()   # (ny*nx,)
+            olon = template.longitude.values.flatten()
+
+            # ny and nx from the coordinate axes — same as metno_parser:
+            # len(y) rows, len(x) columns
+            ny = len(template.y.values)
+            nx = len(template.x.values)
+
+            # cache output grid coordinates (fixed for all batches)
             template_grid = _np_rs.stack([olat, olon], axis=1)  # (ny*nx, 2)
             setattr(global_haar_wavelet_reshape, _grid_key,  template_grid)
             setattr(global_haar_wavelet_reshape, _shape_key, (ny, nx))
@@ -1192,8 +1186,8 @@ def global_haar_wavelet_reshape(
 
             print(
                 f"[global_haar_reshape] stream={stream_name} "
-                f"template loaded from {template_path}: "
-                f"grid=({ny}x{nx})  n_output_points={ny*nx}"
+                f"template loaded: grid=({ny}x{nx})  "
+                f"n_output_points={ny*nx}"
             )
 
         except Exception as _e:
@@ -1212,65 +1206,64 @@ def global_haar_wavelet_reshape(
 
     ny, nx = ny_nx
 
-    # --- build Isort fresh each call (same as MetnoParser.get_sorting) ---
-    # input points change batch to batch due to masking so Isort must not
-    # be cached
+    # --- build Isort fresh each call ---
+    # identical to MetnoParser.get_sorting:
+    #   ipoints = input lat/lon pairs
+    #   opoints = output grid lat/lon pairs (from template)
+    #   Isort[i] = index of nearest input point to output position i
     import scipy.interpolate as _sci_rs
 
     ilat    = target_coords_raw[:, 0].cpu().numpy()
     ilon    = target_coords_raw[:, 1].cpu().numpy()
-    ipoints = _np_rs.stack([ilat, ilon], axis=1)   # (num_points, 2)
+    ipoints = _np_rs.concatenate([ilat[:, None], ilon[:, None]], axis=1)
 
     interpolator = _sci_rs.NearestNDInterpolator(
         ipoints, _np_rs.arange(len(ilat))
     )
     Isort = interpolator(template_grid).astype(int)  # (ny*nx,)
-    # Isort[i] = index into input array of point nearest to output grid
-    # position i — identical convention to MetnoParser
 
-    # --- place input values on 2D grid ---
-    # values[Isort] gathers input values into output grid order
+    # --- gather values onto grid ---
     # identical to MetnoParser: all_values[:, Isort, i, :]
-    Isort_t = torch.from_numpy(Isort).long().to(dev)   # (ny*nx,)
+    # then np.reshape(values, [time, ny, nx])
+    Isort_t = torch.from_numpy(Isort).long().to(dev)
     t_flat  = target.float()[Isort_t]      # (ny*nx, C)
     p_flat  = pred_mean.float()[Isort_t]
 
-    # round to next multiple of 2^num_levels for Haar compatibility
+    # reshape to (ny, nx, C) — C-order matches the flatten order above
+    t_grid_raw = t_flat.view(ny, nx, num_channels)
+    p_grid_raw = p_flat.view(ny, nx, num_channels)
+
+    # pad to next multiple of 2^num_levels for Haar compatibility
+    # pad rows and columns independently to avoid mixing spatial dimensions
     factor = 2 ** num_levels
     ny_p   = int(_math_rs.ceil(ny / factor)) * factor
     nx_p   = int(_math_rs.ceil(nx / factor)) * factor
-    n_grid = ny_p * nx_p
 
-    # pad if rounding added extra cells
-    if n_grid > ny * nx:
-        pad_size = n_grid - ny * nx
-        t_flat = torch.cat([
-            t_flat, torch.zeros(pad_size, num_channels, device=dev)
-        ], dim=0)
-        p_flat = torch.cat([
-            p_flat, torch.zeros(pad_size, num_channels, device=dev)
-        ], dim=0)
-
-    # reshape to (ny_p, nx_p, C)
-    t_grid = t_flat.view(ny_p, nx_p, num_channels)
-    p_grid = p_flat.view(ny_p, nx_p, num_channels)
+    if ny_p > ny or nx_p > nx:
+        t_grid = torch.zeros(ny_p, nx_p, num_channels, device=dev)
+        p_grid = torch.zeros(ny_p, nx_p, num_channels, device=dev)
+        t_grid[:ny, :nx, :] = t_grid_raw
+        p_grid[:ny, :nx, :] = p_grid_raw
+    else:
+        t_grid = t_grid_raw
+        p_grid = p_grid_raw
 
     # --- debug parameters ---
     DEBUG_RESHAPE_PLOT = True
     DEBUG_PLOT_EVERY_N = 100
     DEBUG_OUT_DIR      = "/leonardo_scratch/large/userexternal/clussana/debfigures/"
-    DEBUG_ZOOM_LAT_MIN = 57.0
-    DEBUG_ZOOM_LAT_MAX = 62.0
-    DEBUG_ZOOM_LON_MIN = 4.0
-    DEBUG_ZOOM_LON_MAX = 12.0
+#    DEBUG_ZOOM_LAT_MIN = 57.0
+#    DEBUG_ZOOM_LAT_MAX = 62.0
+#    DEBUG_ZOOM_LON_MIN = 4.0
+#    DEBUG_ZOOM_LON_MAX = 12.0
     # set all four to None for full field:
-    # DEBUG_ZOOM_LAT_MIN = DEBUG_ZOOM_LAT_MAX = DEBUG_ZOOM_LON_MIN = DEBUG_ZOOM_LON_MAX = None
+    DEBUG_ZOOM_LAT_MIN = DEBUG_ZOOM_LAT_MAX = DEBUG_ZOOM_LON_MIN = DEBUG_ZOOM_LON_MAX = None
 
     _counter_key = '_global_haar_reshape_call_count'
     _call_count  = getattr(global_haar_wavelet_reshape, _counter_key, 0)
-    setattr(global_haar_wavelet_reshape, _counter_key, _call_count + 1)
+    if stream_name == "NORA3":
+        setattr(global_haar_wavelet_reshape, _counter_key, _call_count + 1)
 
-    # lat/lon extent for plot axes — from template grid
     lat_min_v = float(template_grid[:, 0].min())
     lat_max_v = float(template_grid[:, 0].max())
     lon_min_v = float(template_grid[:, 1].min())
@@ -1294,17 +1287,17 @@ def global_haar_wavelet_reshape(
         ])
 
         for c in range(num_channels):
-            t_np    = t_grid[:, :, c].detach().cpu().float().numpy()
-            p_np    = p_grid[:, :, c].detach().cpu().float().numpy()
+            t_np    = t_grid[:ny, :nx, c].detach().cpu().float().numpy()
+            p_np    = p_grid[:ny, :nx, c].detach().cpu().float().numpy()
             diff_np = t_np - p_np
 
             if _do_zoom:
-                _lat_ax = _np_rs.linspace(lat_min_v, lat_max_v, ny_p)
-                _lon_ax = _np_rs.linspace(lon_min_v, lon_max_v, nx_p)
+                _lat_ax = _np_rs.linspace(lat_min_v, lat_max_v, ny)
+                _lon_ax = _np_rs.linspace(lon_min_v, lon_max_v, nx)
                 _r0 = max(0, int(_np_rs.searchsorted(_lat_ax, DEBUG_ZOOM_LAT_MIN)))
-                _r1 = min(ny_p, int(_np_rs.searchsorted(_lat_ax, DEBUG_ZOOM_LAT_MAX)) + 1)
+                _r1 = min(ny, int(_np_rs.searchsorted(_lat_ax, DEBUG_ZOOM_LAT_MAX)) + 1)
                 _c0 = max(0, int(_np_rs.searchsorted(_lon_ax, DEBUG_ZOOM_LON_MIN)))
-                _c1 = min(nx_p, int(_np_rs.searchsorted(_lon_ax, DEBUG_ZOOM_LON_MAX)) + 1)
+                _c1 = min(nx, int(_np_rs.searchsorted(_lon_ax, DEBUG_ZOOM_LON_MAX)) + 1)
                 t_plot    = t_np[_r0:_r1, _c0:_c1]
                 p_plot    = p_np[_r0:_r1, _c0:_c1]
                 diff_plot = diff_np[_r0:_r1, _c0:_c1]
@@ -1333,7 +1326,7 @@ def global_haar_wavelet_reshape(
 
             im0 = axes[0].imshow(t_plot, cmap='RdBu_r',
                                  vmin=p2, vmax=p98, **_imshow_kw)
-            axes[0].set_title(f'target grid  ch={c}  ({ny_p}x{nx_p})')
+            axes[0].set_title(f'target grid  ch={c}  ({ny}x{nx})')
             axes[0].set_xlabel('longitude')
             axes[0].set_ylabel('latitude')
             _plt_rs.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
@@ -1355,7 +1348,7 @@ def global_haar_wavelet_reshape(
 
             _plt_rs.suptitle(
                 f'global_haar_reshape  stream={stream_name}  ch={c}  '
-                f'call={_call_count}  grid=({ny_p}x{nx_p})  '
+                f'call={_call_count}  grid=({ny}x{nx})  '
                 f'{_zoom_str}  p2={p2:.3f}  p98={p98:.3f}',
                 fontsize=10
             )
@@ -1407,7 +1400,6 @@ def global_haar_wavelet_reshape(
                     DEBUG_ZOOM_LON_MIN, DEBUG_ZOOM_LON_MAX,
                 ])
 
-                # subband is 2x smaller than the field entering this level
                 _full_nr = t_LL.shape[0] * 2
                 _full_nc = t_LL.shape[1] * 2
 
@@ -1507,7 +1499,8 @@ def global_haar_wavelet_reshape(
             _n_active = _active_mask.sum().clamp(min=1)
 
             if _n_active > 0:
-                scale = 1.0 / (4 ** lvl)
+#                scale = 1.0 / (4 ** lvl)
+                scale = 1.0
                 level_loss = level_loss + (
                     scale * ((t_LH - p_LH) ** 2)[_active_mask].mean()
                     + scale * ((t_HL - p_HL) ** 2)[_active_mask].mean()
@@ -1517,6 +1510,9 @@ def global_haar_wavelet_reshape(
             t_field = t_LL
             p_field = p_LL
 
+            field_var    = t_grid[:, :, c].var().clamp(min=1e-8)
+            loss_chs[c] = level_loss / (num_levels * field_var)
+
         loss_chs[c] = level_loss / num_levels
 
     if weights_channels is not None:
@@ -1525,6 +1521,11 @@ def global_haar_wavelet_reshape(
         loss = torch.mean(loss_chs)
 
     return loss, loss_chs
+###########################################################################
+###########################################################################
+###########################################################################
+###########################################################################
+
 
 def healpix_cell_mse(
     target: torch.Tensor,

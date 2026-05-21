@@ -1,0 +1,5 @@
+train : 
+  plot :
+    df15tizp :
+        slurm_id: 42058836
+        description: "wavelet test"
