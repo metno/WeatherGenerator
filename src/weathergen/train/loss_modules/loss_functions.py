@@ -1726,3 +1726,811 @@ def healpix_cell_mse(
         loss = torch.mean(loss_chs)
 
     return loss, loss_chs
+
+def global_fft_mse(
+    target: torch.Tensor,
+    pred: torch.Tensor,
+    target_coords_raw: torch.Tensor,
+    weights_channels: torch.Tensor | None,
+    weights_points: torch.Tensor | None,
+    template_path: str = "",
+    freq_weight_power: float = 0.0,
+    stream_name: str = "",
+):
+    """
+    Global 2D FFT-based spectral MSE using template-based regridding.
+
+    Follows the same regridding approach as global_haar_wavelet_reshape:
+      1. Load template latitude/longitude (2D, shape ny x nx from y and x axes)
+      2. For each output grid point find the nearest input point (NearestNDInterpolator)
+      3. Gather: values_on_grid = values[Isort], reshape to (ny, nx)
+      4. Apply 2D real FFT to both target and pred grids
+      5. Compute MSE between the complex spectra (real and imaginary parts separately)
+         optionally weighted by frequency magnitude raised to freq_weight_power
+
+    The spectral MSE penalises errors at all spatial frequencies simultaneously.
+    freq_weight_power controls the frequency weighting:
+        0.0  — equal weight to all frequencies (default)
+        1.0  — linearly upweight high frequencies (emphasise fine-scale structure)
+       -1.0  — linearly downweight high frequencies (emphasise large-scale structure)
+        2.0  — quadratic upweight (strongly emphasise fine-scale structure)
+
+    The loss per channel is normalised by the spatial variance of the target field
+    so channels with different magnitudes are comparable.
+
+    Template output grid is cached. Isort is recomputed each call because
+    input points change batch to batch due to masking.
+
+    Args:
+        target            : (num_points, num_channels)
+        pred              : (ens_size, num_points, num_channels)
+        target_coords_raw : (num_points, 2) — geographic (lat, lon) degrees
+        weights_channels  : (num_channels,) or None
+        weights_points    : unused, kept for API consistency
+        template_path     : path to NetCDF template with 2D latitude/longitude
+        freq_weight_power : exponent for frequency-based weighting of spectral MSE
+        stream_name       : used for debug prints and plot filtering
+
+    Returns:
+        loss     : scalar
+        loss_chs : (num_channels,) per-channel loss
+    """
+    import math as _math_fft
+    import numpy as _np_fft
+
+    num_points, num_channels = target.shape
+    dev       = target.device
+    pred_mean = pred.mean(0)
+
+    # --- load and cache template output grid ---
+    _grid_key  = f'_fft_template_grid_{template_path}'
+    _shape_key = f'_fft_template_shape_{template_path}'
+
+    template_grid = getattr(global_fft_mse, _grid_key,  None)
+    ny_nx         = getattr(global_fft_mse, _shape_key, None)
+
+    if template_grid is None:
+        if not template_path:
+            _key = f'_fft_no_template_reported_{stream_name}'
+            if not getattr(global_fft_mse, _key, False):
+                setattr(global_fft_mse, _key, True)
+                print(
+                    f"[global_fft_mse] stream={stream_name} "
+                    f"template_path is empty. Setting loss to zero."
+                )
+            return (
+                torch.tensor(0.0, device=dev, requires_grad=True),
+                torch.zeros(num_channels, device=dev),
+            )
+
+        try:
+            import xarray as _xr_fft
+
+            template  = _xr_fft.open_dataset(template_path)
+            olat      = template.latitude.values.flatten()   # (ny*nx,) C-order
+            olon      = template.longitude.values.flatten()
+            ny        = len(template.y.values)
+            nx        = len(template.x.values)
+
+            template_grid = _np_fft.stack([olat, olon], axis=1)  # (ny*nx, 2)
+            setattr(global_fft_mse, _grid_key,  template_grid)
+            setattr(global_fft_mse, _shape_key, (ny, nx))
+            ny_nx = (ny, nx)
+
+            print(
+                f"[global_fft_mse] stream={stream_name} "
+                f"template loaded: grid=({ny}x{nx})  "
+                f"n_output_points={ny*nx}"
+            )
+
+        except Exception as _e:
+            _key = f'_fft_template_error_reported_{stream_name}'
+            if not getattr(global_fft_mse, _key, False):
+                setattr(global_fft_mse, _key, True)
+                print(
+                    f"[global_fft_mse] stream={stream_name} "
+                    f"failed to load template '{template_path}': {_e}. "
+                    f"Setting loss to zero."
+                )
+            return (
+                torch.tensor(0.0, device=dev, requires_grad=True),
+                torch.zeros(num_channels, device=dev),
+            )
+
+    ny, nx = ny_nx
+
+    # --- build Isort fresh each call ---
+    import scipy.interpolate as _sci_fft
+
+    ilat    = target_coords_raw[:, 0].cpu().numpy()
+    ilon    = target_coords_raw[:, 1].cpu().numpy()
+    ipoints = _np_fft.concatenate([ilat[:, None], ilon[:, None]], axis=1)
+
+    interpolator = _sci_fft.NearestNDInterpolator(
+        ipoints, _np_fft.arange(len(ilat))
+    )
+    Isort = interpolator(template_grid).astype(int)   # (ny*nx,)
+
+    # --- gather values onto 2D grid ---
+    Isort_t    = torch.from_numpy(Isort).long().to(dev)
+    t_flat     = target.float()[Isort_t]      # (ny*nx, C)
+    p_flat     = pred_mean.float()[Isort_t]
+
+    t_grid_raw = t_flat.view(ny, nx, num_channels)   # (ny, nx, C)
+    p_grid_raw = p_flat.view(ny, nx, num_channels)
+
+    # --- build frequency weight matrix ---
+    # freq_ky: (ny, 1),  freq_kx: (1, nx//2+1)
+    # rfft2 output has shape (ny, nx//2+1)
+    ky = torch.fft.fftfreq(ny, device=dev)                    # (ny,)
+    kx = torch.fft.rfftfreq(nx, device=dev)                   # (nx//2+1,)
+    freq_mag = torch.sqrt(
+        ky[:, None] ** 2 + kx[None, :] ** 2
+    )                                                          # (ny, nx//2+1)
+    if freq_weight_power != 0.0:
+        freq_weight = (freq_mag + 1e-8) ** freq_weight_power  # avoid zero
+    else:
+        freq_weight = torch.ones_like(freq_mag)
+
+    # --- debug parameters ---
+    DEBUG_FFT_PLOT  = True
+    DEBUG_PLOT_EVERY_N = 4096
+    DEBUG_OUT_DIR   = "/leonardo_scratch/large/userexternal/clussana/wg_debug_fft"
+#    DEBUG_ZOOM_LAT_MIN = 57.0
+#    DEBUG_ZOOM_LAT_MAX = 62.0
+#    DEBUG_ZOOM_LON_MIN = 4.0
+#    DEBUG_ZOOM_LON_MAX = 12.0
+    # set all four to None for full field:
+    DEBUG_ZOOM_LAT_MIN = DEBUG_ZOOM_LAT_MAX = DEBUG_ZOOM_LON_MIN = DEBUG_ZOOM_LON_MAX = None
+
+    _counter_key = '_global_fft_call_count'
+    _call_count  = getattr(global_fft_mse, _counter_key, 0)
+    if stream_name == "NORA3":
+        setattr(global_fft_mse, _counter_key, _call_count + 1)
+
+    lat_min_v = float(template_grid[:, 0].min())
+    lat_max_v = float(template_grid[:, 0].max())
+    lon_min_v = float(template_grid[:, 1].min())
+    lon_max_v = float(template_grid[:, 1].max())
+
+    # --- plot gridded field ---
+    if DEBUG_FFT_PLOT \
+            and stream_name == "NORA3" \
+            and _call_count % DEBUG_PLOT_EVERY_N == 0:
+
+        import os
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as _plt_fft
+
+        os.makedirs(DEBUG_OUT_DIR, exist_ok=True)
+
+        _do_zoom = all(v is not None for v in [
+            DEBUG_ZOOM_LAT_MIN, DEBUG_ZOOM_LAT_MAX,
+            DEBUG_ZOOM_LON_MIN, DEBUG_ZOOM_LON_MAX,
+        ])
+
+        for c in range(num_channels):
+            t_np    = t_grid_raw[:, :, c].detach().cpu().float().numpy()
+            p_np    = p_grid_raw[:, :, c].detach().cpu().float().numpy()
+            diff_np = t_np - p_np
+
+            if _do_zoom:
+                _lat_ax = _np_fft.linspace(lat_min_v, lat_max_v, ny)
+                _lon_ax = _np_fft.linspace(lon_min_v, lon_max_v, nx)
+                _r0 = max(0, int(_np_fft.searchsorted(_lat_ax, DEBUG_ZOOM_LAT_MIN)))
+                _r1 = min(ny, int(_np_fft.searchsorted(_lat_ax, DEBUG_ZOOM_LAT_MAX)) + 1)
+                _c0 = max(0, int(_np_fft.searchsorted(_lon_ax, DEBUG_ZOOM_LON_MIN)))
+                _c1 = min(nx, int(_np_fft.searchsorted(_lon_ax, DEBUG_ZOOM_LON_MAX)) + 1)
+                t_plot    = t_np[_r0:_r1, _c0:_c1]
+                p_plot    = p_np[_r0:_r1, _c0:_c1]
+                diff_plot = diff_np[_r0:_r1, _c0:_c1]
+                _extent   = [DEBUG_ZOOM_LON_MIN, DEBUG_ZOOM_LON_MAX,
+                             DEBUG_ZOOM_LAT_MIN, DEBUG_ZOOM_LAT_MAX]
+                _zoom_str = (f'zoom=[{DEBUG_ZOOM_LAT_MIN},{DEBUG_ZOOM_LAT_MAX}]N '
+                             f'[{DEBUG_ZOOM_LON_MIN},{DEBUG_ZOOM_LON_MAX}]E')
+            else:
+                t_plot    = t_np
+                p_plot    = p_np
+                diff_plot = diff_np
+                _extent   = [lon_min_v, lon_max_v, lat_min_v, lat_max_v]
+                _zoom_str = 'full field'
+
+            if t_plot.size == 0:
+                continue
+
+            p2,  p98 = _np_fft.percentile(t_plot,    2), _np_fft.percentile(t_plot,   98)
+            d2,  d98 = _np_fft.percentile(diff_plot, 2), _np_fft.percentile(diff_plot, 98)
+            dabs     = max(abs(d2), abs(d98), 1e-6)
+
+            _imshow_kw = dict(origin='lower', aspect='auto',
+                              interpolation='nearest', extent=_extent)
+
+            # --- row 0: spatial field ---
+            fig, axes = _plt_fft.subplots(2, 3, figsize=(18, 10))
+
+            im0 = axes[0, 0].imshow(t_plot, cmap='RdBu_r',
+                                    vmin=p2, vmax=p98, **_imshow_kw)
+            axes[0, 0].set_title(f'target grid  ch={c}  ({ny}x{nx})')
+            axes[0, 0].set_xlabel('longitude')
+            axes[0, 0].set_ylabel('latitude')
+            _plt_fft.colorbar(im0, ax=axes[0, 0], fraction=0.046, pad=0.04)
+
+            im1 = axes[0, 1].imshow(p_plot, cmap='RdBu_r',
+                                    vmin=p2, vmax=p98, **_imshow_kw)
+            axes[0, 1].set_title(f'pred grid  ch={c}')
+            axes[0, 1].set_xlabel('longitude')
+            _plt_fft.colorbar(im1, ax=axes[0, 1], fraction=0.046, pad=0.04)
+
+            im2 = axes[0, 2].imshow(diff_plot, cmap='bwr',
+                                    vmin=-dabs, vmax=dabs, **_imshow_kw)
+            axes[0, 2].set_title(f'target-pred  ch={c}')
+            axes[0, 2].set_xlabel('longitude')
+            _plt_fft.colorbar(im2, ax=axes[0, 2], fraction=0.046, pad=0.04)
+
+            for ax in axes[0]:
+                ax.grid(True, lw=0.3, alpha=0.3)
+
+            # --- row 1: power spectra ---
+            t_fft_np = _np_fft.abs(
+                _np_fft.fft.rfft2(t_np)
+            ) ** 2   # (ny, nx//2+1) power spectrum
+            p_fft_np = _np_fft.abs(
+                _np_fft.fft.rfft2(p_np)
+            ) ** 2
+
+            # 1D power spectrum (average over angles) for comparison
+            freq_mag_np = _np_fft.sqrt(
+                _np_fft.fft.fftfreq(ny)[:, None] ** 2 +
+                _np_fft.fft.rfftfreq(nx)[None, :] ** 2
+            ).flatten()
+            t_pwr_flat = t_fft_np.flatten()
+            p_pwr_flat = p_fft_np.flatten()
+
+            # bin by frequency magnitude
+            n_bins     = 50
+            freq_edges = _np_fft.linspace(0, freq_mag_np.max(), n_bins + 1)
+            t_pwr_bins = _np_fft.zeros(n_bins)
+            p_pwr_bins = _np_fft.zeros(n_bins)
+            for b in range(n_bins):
+                mask = (freq_mag_np >= freq_edges[b]) & (freq_mag_np < freq_edges[b + 1])
+                if mask.sum() > 0:
+                    t_pwr_bins[b] = t_pwr_flat[mask].mean()
+                    p_pwr_bins[b] = p_pwr_flat[mask].mean()
+            freq_centres = 0.5 * (freq_edges[:-1] + freq_edges[1:])
+
+            axes[1, 0].semilogy(freq_centres, t_pwr_bins + 1e-10,
+                                label='target', color='blue')
+            axes[1, 0].semilogy(freq_centres, p_pwr_bins + 1e-10,
+                                label='pred',   color='red',  linestyle='--')
+            axes[1, 0].set_title(f'1D power spectrum  ch={c}')
+            axes[1, 0].set_xlabel('spatial frequency')
+            axes[1, 0].set_ylabel('power (log)')
+            axes[1, 0].legend()
+            axes[1, 0].grid(True, lw=0.3, alpha=0.3)
+
+            # 2D power spectrum target
+            im3 = axes[1, 1].imshow(
+                _np_fft.log10(t_fft_np + 1e-10),
+                origin='lower', aspect='auto', interpolation='nearest',
+                cmap='viridis'
+            )
+            axes[1, 1].set_title(f'log10 power target  ch={c}')
+            axes[1, 1].set_xlabel('kx')
+            axes[1, 1].set_ylabel('ky')
+            _plt_fft.colorbar(im3, ax=axes[1, 1], fraction=0.046, pad=0.04)
+
+            # 2D power spectrum pred
+            im4 = axes[1, 2].imshow(
+                _np_fft.log10(p_fft_np + 1e-10),
+                origin='lower', aspect='auto', interpolation='nearest',
+                cmap='viridis'
+            )
+            axes[1, 2].set_title(f'log10 power pred  ch={c}')
+            axes[1, 2].set_xlabel('kx')
+            _plt_fft.colorbar(im4, ax=axes[1, 2], fraction=0.046, pad=0.04)
+
+            _plt_fft.suptitle(
+                f'global_fft_mse  stream={stream_name}  ch={c}  '
+                f'call={_call_count}  grid=({ny}x{nx})  '
+                f'{_zoom_str}  '
+                f'freq_weight_power={freq_weight_power}',
+                fontsize=10
+            )
+            _plt_fft.tight_layout()
+            out_path = os.path.join(
+                DEBUG_OUT_DIR,
+                f'fft_{stream_name}_ch{c}_call{_call_count:06d}.png'
+            )
+            _plt_fft.savefig(out_path, dpi=120, bbox_inches='tight')
+            _plt_fft.close(fig)
+            print(f"[global_fft_mse plot] {stream_name} ch={c} "
+                  f"call={_call_count} saved to {out_path}")
+
+    # --- compute FFT loss per channel ---
+    loss_chs = torch.zeros(num_channels, device=dev)
+
+    for c in range(num_channels):
+        t_field = t_grid_raw[:, :, c]   # (ny, nx)
+        p_field = p_grid_raw[:, :, c]
+
+        # 2D real FFT — output shape (ny, nx//2+1) complex
+        t_fft = torch.fft.rfft2(t_field)   # (ny, nx//2+1)
+        p_fft = torch.fft.rfft2(p_field)
+
+        # MSE on real and imaginary parts separately
+        diff_real = (t_fft.real - p_fft.real) ** 2
+        diff_imag = (t_fft.imag - p_fft.imag) ** 2
+        diff_sq   = diff_real + diff_imag   # (ny, nx//2+1)
+
+        # apply frequency weight
+        weighted = diff_sq * freq_weight    # (ny, nx//2+1)
+
+        # mean over all frequency bins
+        spectral_mse = weighted.mean()
+
+        # normalise by spatial variance of target channel
+        field_var    = t_field.var().clamp(min=1e-8)
+        loss_chs[c]  = spectral_mse / field_var
+
+    if weights_channels is not None:
+        loss = torch.mean(loss_chs * weights_channels.to(dev))
+    else:
+        loss = torch.mean(loss_chs)
+
+    return loss, loss_chs
+
+def global_haar_wavelet_reshape_varweighted(
+    target: torch.Tensor,
+    pred: torch.Tensor,
+    target_coords_raw: torch.Tensor,
+    weights_channels: torch.Tensor | None,
+    weights_points: torch.Tensor | None,
+    template_path: str = "",
+    detail_weight: float = 2.0,
+    num_levels: int = 3,
+    var_weight_epsilon: float = 1e-3,
+    stream_name: str = "",
+):
+    """
+    Global 2D Haar wavelet MSE with inverse-variance spatial weighting.
+
+    Identical to global_haar_wavelet_reshape except that at each Haar level
+    the detail subband MSE is weighted by the inverse of the local target
+    variance at that spatial scale. Regions where the target is smooth
+    (low local variance, e.g. sea for 2m temperature) receive higher weight,
+    penalising prediction errors there more strongly. Regions where the
+    target is rough (high local variance, e.g. complex terrain) receive
+    lower weight.
+
+    The local variance at level lvl and position (i,j) is estimated directly
+    from the Haar detail coefficients of the target at that level:
+        local_var[i,j] = t_LH[i,j]**2 + t_HL[i,j]**2 + t_HH[i,j]**2
+    This is exact for orthonormal Haar and requires no extra computation.
+    The weight is then:
+        weight[i,j] = 1.0 / (local_var[i,j] + var_weight_epsilon)
+    Weights are normalised by their sum so the total contribution of each
+    level is scale-invariant.
+
+    Args:
+        target              : (num_points, num_channels)
+        pred                : (ens_size, num_points, num_channels)
+        target_coords_raw   : (num_points, 2) — geographic (lat, lon) degrees
+        weights_channels    : (num_channels,) or None
+        weights_points      : unused
+        template_path       : path to NetCDF template with 2D lat/lon
+        detail_weight       : relative weight of LH/HL/HH vs each other
+        num_levels          : number of Haar decomposition levels
+        var_weight_epsilon  : floor for local variance to avoid division by
+                              zero and to control the maximum upweighting of
+                              smooth regions. Larger = less aggressive
+                              weighting. Default 1e-3 (normalised units).
+        stream_name         : used for debug prints and plot filtering
+
+    Returns:
+        loss     : scalar
+        loss_chs : (num_channels,) per-channel loss
+    """
+    import math as _math_vw
+    import numpy as _np_vw
+
+    num_points, num_channels = target.shape
+    dev       = target.device
+    pred_mean = pred.mean(0)
+
+    # --- load and cache template output grid ---
+    _grid_key  = f'_vw_template_grid_{template_path}'
+    _shape_key = f'_vw_template_shape_{template_path}'
+
+    template_grid = getattr(global_haar_wavelet_reshape_varweighted, _grid_key,  None)
+    ny_nx         = getattr(global_haar_wavelet_reshape_varweighted, _shape_key, None)
+
+    if template_grid is None:
+        if not template_path:
+            _key = f'_vw_no_template_reported_{stream_name}'
+            if not getattr(global_haar_wavelet_reshape_varweighted, _key, False):
+                setattr(global_haar_wavelet_reshape_varweighted, _key, True)
+                print(
+                    f"[global_haar_varweighted] stream={stream_name} "
+                    f"template_path is empty. Setting loss to zero."
+                )
+            return (
+                torch.tensor(0.0, device=dev, requires_grad=True),
+                torch.zeros(num_channels, device=dev),
+            )
+
+        try:
+            import xarray as _xr_vw
+
+            template  = _xr_vw.open_dataset(template_path)
+            olat      = template.latitude.values.flatten()
+            olon      = template.longitude.values.flatten()
+            ny        = len(template.y.values)
+            nx        = len(template.x.values)
+
+            template_grid = _np_vw.stack([olat, olon], axis=1)
+            setattr(global_haar_wavelet_reshape_varweighted, _grid_key,  template_grid)
+            setattr(global_haar_wavelet_reshape_varweighted, _shape_key, (ny, nx))
+            ny_nx = (ny, nx)
+
+            print(
+                f"[global_haar_varweighted] stream={stream_name} "
+                f"template loaded: grid=({ny}x{nx})  "
+                f"n_output_points={ny*nx}"
+            )
+
+        except Exception as _e:
+            _key = f'_vw_template_error_reported_{stream_name}'
+            if not getattr(global_haar_wavelet_reshape_varweighted, _key, False):
+                setattr(global_haar_wavelet_reshape_varweighted, _key, True)
+                print(
+                    f"[global_haar_varweighted] stream={stream_name} "
+                    f"failed to load template '{template_path}': {_e}. "
+                    f"Setting loss to zero."
+                )
+            return (
+                torch.tensor(0.0, device=dev, requires_grad=True),
+                torch.zeros(num_channels, device=dev),
+            )
+
+    ny, nx = ny_nx
+
+    # --- build Isort fresh each call ---
+    import scipy.interpolate as _sci_vw
+
+    ilat    = target_coords_raw[:, 0].cpu().numpy()
+    ilon    = target_coords_raw[:, 1].cpu().numpy()
+    ipoints = _np_vw.concatenate([ilat[:, None], ilon[:, None]], axis=1)
+
+    interpolator = _sci_vw.NearestNDInterpolator(
+        ipoints, _np_vw.arange(len(ilat))
+    )
+    Isort   = interpolator(template_grid).astype(int)
+    Isort_t = torch.from_numpy(Isort).long().to(dev)
+
+    # --- gather values onto 2D grid ---
+    t_flat = target.float()[Isort_t]
+    p_flat = pred_mean.float()[Isort_t]
+
+    t_grid_raw = t_flat.view(ny, nx, num_channels)
+    p_grid_raw = p_flat.view(ny, nx, num_channels)
+
+    # --- pad to next multiple of 2^num_levels ---
+    factor = 2 ** num_levels
+    ny_p   = int(_math_vw.ceil(ny / factor)) * factor
+    nx_p   = int(_math_vw.ceil(nx / factor)) * factor
+
+    if ny_p > ny or nx_p > nx:
+        t_grid = torch.zeros(ny_p, nx_p, num_channels, device=dev)
+        p_grid = torch.zeros(ny_p, nx_p, num_channels, device=dev)
+        t_grid[:ny, :nx, :] = t_grid_raw
+        p_grid[:ny, :nx, :] = p_grid_raw
+    else:
+        t_grid = t_grid_raw
+        p_grid = p_grid_raw
+
+    # --- debug parameters ---
+    DEBUG_VW_PLOT      = True
+    DEBUG_PLOT_EVERY_N = 4096
+    DEBUG_OUT_DIR      = "/leonardo_scratch/large/userexternal/clussana/wg_debug_haar_varweighted/"
+#    DEBUG_ZOOM_LAT_MIN = 57.0
+#    DEBUG_ZOOM_LAT_MAX = 62.0
+#    DEBUG_ZOOM_LON_MIN = 4.0
+#    DEBUG_ZOOM_LON_MAX = 12.0
+    # set all four to None for full field:
+    DEBUG_ZOOM_LAT_MIN = DEBUG_ZOOM_LAT_MAX = DEBUG_ZOOM_LON_MIN = DEBUG_ZOOM_LON_MAX = None
+
+    _counter_key = '_global_haar_vw_call_count'
+    _call_count  = getattr(global_haar_wavelet_reshape_varweighted, _counter_key, 0)
+    if stream_name == "NORA3":
+        setattr(global_haar_wavelet_reshape_varweighted, _counter_key, _call_count + 1)
+
+    lat_min_v = float(template_grid[:, 0].min())
+    lat_max_v = float(template_grid[:, 0].max())
+    lon_min_v = float(template_grid[:, 1].min())
+    lon_max_v = float(template_grid[:, 1].max())
+
+    def _apply_zoom_vw(arr_2d):
+        if not all(v is not None for v in [
+            DEBUG_ZOOM_LAT_MIN, DEBUG_ZOOM_LAT_MAX,
+            DEBUG_ZOOM_LON_MIN, DEBUG_ZOOM_LON_MAX,
+        ]):
+            return arr_2d, [lon_min_v, lon_max_v, lat_min_v, lat_max_v], 'full field'
+        _lat_ax = _np_vw.linspace(lat_min_v, lat_max_v, arr_2d.shape[0])
+        _lon_ax = _np_vw.linspace(lon_min_v, lon_max_v, arr_2d.shape[1])
+        _r0 = max(0, int(_np_vw.searchsorted(_lat_ax, DEBUG_ZOOM_LAT_MIN)))
+        _r1 = min(arr_2d.shape[0],
+                  int(_np_vw.searchsorted(_lat_ax, DEBUG_ZOOM_LAT_MAX)) + 1)
+        _c0 = max(0, int(_np_vw.searchsorted(_lon_ax, DEBUG_ZOOM_LON_MIN)))
+        _c1 = min(arr_2d.shape[1],
+                  int(_np_vw.searchsorted(_lon_ax, DEBUG_ZOOM_LON_MAX)) + 1)
+        _zstr = (f'zoom=[{DEBUG_ZOOM_LAT_MIN},{DEBUG_ZOOM_LAT_MAX}]N '
+                 f'[{DEBUG_ZOOM_LON_MIN},{DEBUG_ZOOM_LON_MAX}]E')
+        return arr_2d[_r0:_r1, _c0:_c1], \
+               [DEBUG_ZOOM_LON_MIN, DEBUG_ZOOM_LON_MAX,
+                DEBUG_ZOOM_LAT_MIN, DEBUG_ZOOM_LAT_MAX], _zstr
+
+    # --- plot full gridded field ---
+    if DEBUG_VW_PLOT \
+            and stream_name == "NORA3" \
+            and _call_count % DEBUG_PLOT_EVERY_N == 0:
+
+        import os
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as _plt_vw
+
+        os.makedirs(DEBUG_OUT_DIR, exist_ok=True)
+
+        for c in range(num_channels):
+            t_np    = t_grid[:ny, :nx, c].detach().cpu().float().numpy()
+            p_np    = p_grid[:ny, :nx, c].detach().cpu().float().numpy()
+            diff_np = t_np - p_np
+
+            t_plot,    _ext, _zstr = _apply_zoom_vw(t_np)
+            p_plot,    _,    _     = _apply_zoom_vw(p_np)
+            diff_plot, _,    _     = _apply_zoom_vw(diff_np)
+
+            if t_plot.size == 0:
+                continue
+
+            p2,  p98 = _np_vw.percentile(t_plot,    2), _np_vw.percentile(t_plot,   98)
+            d2,  d98 = _np_vw.percentile(diff_plot, 2), _np_vw.percentile(diff_plot, 98)
+            dabs     = max(abs(d2), abs(d98), 1e-6)
+            _ikw     = dict(origin='lower', aspect='auto',
+                            interpolation='nearest', extent=_ext)
+
+            fig, axes = _plt_vw.subplots(1, 3, figsize=(18, 5))
+            im0 = axes[0].imshow(t_plot,    cmap='RdBu_r', vmin=p2,   vmax=p98,  **_ikw)
+            axes[0].set_title(f'target  ch={c}  ({ny}x{nx})')
+            axes[0].set_xlabel('longitude'); axes[0].set_ylabel('latitude')
+            _plt_vw.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+            im1 = axes[1].imshow(p_plot,    cmap='RdBu_r', vmin=p2,   vmax=p98,  **_ikw)
+            axes[1].set_title(f'pred  ch={c}')
+            axes[1].set_xlabel('longitude')
+            _plt_vw.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+            im2 = axes[2].imshow(diff_plot, cmap='bwr',    vmin=-dabs, vmax=dabs, **_ikw)
+            axes[2].set_title(f'target-pred  ch={c}')
+            axes[2].set_xlabel('longitude')
+            _plt_vw.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+
+            for ax in axes:
+                ax.grid(True, lw=0.3, alpha=0.3)
+
+            _plt_vw.suptitle(
+                f'global_haar_varweighted  stream={stream_name}  ch={c}  '
+                f'call={_call_count}  grid=({ny}x{nx})  {_zstr}  '
+                f'p2={p2:.3f}  p98={p98:.3f}',
+                fontsize=10
+            )
+            _plt_vw.tight_layout()
+            out_path = os.path.join(
+                DEBUG_OUT_DIR,
+                f'haar_vw_{stream_name}_grid_ch{c}_call{_call_count:06d}.png'
+            )
+            _plt_vw.savefig(out_path, dpi=120, bbox_inches='tight')
+            _plt_vw.close(fig)
+            print(f"[haar_varweighted grid] {stream_name} ch={c} "
+                  f"call={_call_count} saved to {out_path}")
+
+    # --- multi-level Haar per channel ---
+    loss_chs = torch.zeros(num_channels, device=dev)
+
+    for c in range(num_channels):
+        t_field    = t_grid[:, :, c]
+        p_field    = p_grid[:, :, c]
+        level_loss = torch.tensor(0.0, device=dev)
+
+        for lvl in range(num_levels):
+            t_LL, t_LH, t_HL, t_HH = haar_2d(t_field)
+            p_LL, p_LH, p_HL, p_HH = haar_2d(p_field)
+
+            # local variance of target at this level estimated from its own
+            # detail coefficients — exact for orthonormal Haar, free to compute
+            # shape: (ny/2^(lvl+1), nx/2^(lvl+1))
+            local_var = (
+                t_LH ** 2 + t_HL ** 2 + t_HH ** 2
+            ).detach()   # detach: weight is a constant, not part of gradient
+
+            # inverse variance weight — smooth regions (low var) get high weight
+            inv_var_weight = 1.0 / (local_var + var_weight_epsilon)
+
+            # active mask: exclude cells where all detail bands are identical
+#            _active_mask = (
+#                (t_LH != p_LH) | (t_HL != p_HL) | (t_HH != p_HH)
+#            )
+            # to remove active_mask
+            _active_mask = torch.ones_like(t_LH, dtype=torch.bool)
+            _n_active = _active_mask.sum().clamp(min=1)
+
+            if _n_active > 0:
+                w     = inv_var_weight[_active_mask]
+                w_sum = w.sum().clamp(min=1e-8)
+
+                lh_loss = (((t_LH - p_LH) ** 2)[_active_mask] * w).sum() / w_sum
+                hl_loss = (((t_HL - p_HL) ** 2)[_active_mask] * w).sum() / w_sum
+                hh_loss = (((t_HH - p_HH) ** 2)[_active_mask] * w).sum() / w_sum
+
+                level_loss = level_loss + (lh_loss + hl_loss + hh_loss) / 3.0
+
+                # ----------------------------------------------------------------
+                # DEBUG: plot subbands and inverse variance weight
+                # ----------------------------------------------------------------
+                if DEBUG_VW_PLOT \
+                        and stream_name == "NORA3" \
+                        and _call_count % DEBUG_PLOT_EVERY_N == 0:
+
+                    import os
+                    import matplotlib
+                    matplotlib.use('Agg')
+                    import matplotlib.pyplot as _plt_sb
+
+                    os.makedirs(DEBUG_OUT_DIR, exist_ok=True)
+
+                    _full_nr = t_LL.shape[0] * 2
+                    _full_nc = t_LL.shape[1] * 2
+
+                    def _zoom_sb(arr):
+                        if not all(v is not None for v in [
+                            DEBUG_ZOOM_LAT_MIN, DEBUG_ZOOM_LAT_MAX,
+                            DEBUG_ZOOM_LON_MIN, DEBUG_ZOOM_LON_MAX,
+                        ]):
+                            return arr, None, 'full field', 'col', 'row'
+                        _la = _np_vw.linspace(lat_min_v, lat_max_v, _full_nr)
+                        _lo = _np_vw.linspace(lon_min_v, lon_max_v, _full_nc)
+                        _r0s = max(0,
+                               int(_np_vw.searchsorted(_la, DEBUG_ZOOM_LAT_MIN)) // 2)
+                        _r1s = min(arr.shape[0],
+                               int(_np_vw.searchsorted(_la, DEBUG_ZOOM_LAT_MAX)) // 2 + 1)
+                        _c0s = max(0,
+                               int(_np_vw.searchsorted(_lo, DEBUG_ZOOM_LON_MIN)) // 2)
+                        _c1s = min(arr.shape[1],
+                               int(_np_vw.searchsorted(_lo, DEBUG_ZOOM_LON_MAX)) // 2 + 1)
+                        _ext = [DEBUG_ZOOM_LON_MIN, DEBUG_ZOOM_LON_MAX,
+                                DEBUG_ZOOM_LAT_MIN, DEBUG_ZOOM_LAT_MAX]
+                        _zs  = (f'zoom=[{DEBUG_ZOOM_LAT_MIN},{DEBUG_ZOOM_LAT_MAX}]N '
+                                f'[{DEBUG_ZOOM_LON_MIN},{DEBUG_ZOOM_LON_MAX}]E')
+                        return arr[_r0s:_r1s, _c0s:_c1s], _ext, _zs, \
+                               'longitude', 'latitude'
+
+                    subbands = {
+                        'LL': (t_LL, p_LL),
+                        'LH': (t_LH, p_LH),
+                        'HL': (t_HL, p_HL),
+                        'HH': (t_HH, p_HH),
+                    }
+
+                    # plot inverse variance weight map
+                    ivw_np = inv_var_weight.detach().cpu().float().numpy()
+                    ivw_plot, _ext_ivw, _zstr_ivw, _xl, _yl = _zoom_sb(ivw_np)
+                    _ikw_ivw = dict(origin='lower', aspect='auto',
+                                    interpolation='nearest')
+                    if _ext_ivw is not None:
+                        _ikw_ivw['extent'] = _ext_ivw
+
+                    fig, ax = _plt_sb.subplots(1, 1, figsize=(8, 6))
+                    im = ax.imshow(_np_vw.log10(ivw_plot + 1e-10),
+                                   cmap='hot_r', **_ikw_ivw)
+                    ax.set_title(
+                        f'log10(inv_var_weight)  ch={c}  lvl={lvl}  '
+                        f'eps={var_weight_epsilon}'
+                    )
+                    ax.set_xlabel(_xl); ax.set_ylabel(_yl)
+                    _plt_sb.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                    ax.grid(True, lw=0.3, alpha=0.3)
+                    _plt_sb.tight_layout()
+                    out_path = os.path.join(
+                        DEBUG_OUT_DIR,
+                        f'haar_vw_{stream_name}_invvar'
+                        f'_ch{c}_lvl{lvl}_call{_call_count:06d}.png'
+                    )
+                    _plt_sb.savefig(out_path, dpi=120, bbox_inches='tight')
+                    _plt_sb.close(fig)
+                    print(f"[haar_varweighted invvar] ch={c} lvl={lvl} "
+                          f"saved to {out_path}")
+
+                    # plot subbands
+                    for band_name, (t_b, p_b) in subbands.items():
+                        t_b_np   = t_b.detach().cpu().float().numpy()
+                        p_b_np   = p_b.detach().cpu().float().numpy()
+                        diff_b   = t_b_np - p_b_np
+
+                        t_b_plot,   _ext_sb, _zstr_sb, _xl, _yl = _zoom_sb(t_b_np)
+                        p_b_plot,   _,       _,        _,   _   = _zoom_sb(p_b_np)
+                        diff_b_plot,_,       _,        _,   _   = _zoom_sb(diff_b)
+
+                        if t_b_plot.size == 0:
+                            continue
+
+                        p2b,  p98b = (_np_vw.percentile(t_b_plot,   2),
+                                      _np_vw.percentile(t_b_plot,  98))
+                        d2b,  d98b = (_np_vw.percentile(diff_b_plot, 2),
+                                      _np_vw.percentile(diff_b_plot, 98))
+                        dabsb      = max(abs(d2b), abs(d98b), 1e-6)
+
+                        _ikw_sb = dict(origin='lower', aspect='auto',
+                                       interpolation='nearest')
+                        if _ext_sb is not None:
+                            _ikw_sb['extent'] = _ext_sb
+
+                        fig, axes = _plt_sb.subplots(1, 3, figsize=(18, 5))
+
+                        im0 = axes[0].imshow(t_b_plot,    cmap='RdBu_r',
+                                             vmin=p2b,    vmax=p98b,   **_ikw_sb)
+                        axes[0].set_title(f'target {band_name}  ch={c}  lvl={lvl}')
+                        axes[0].set_xlabel(_xl); axes[0].set_ylabel(_yl)
+                        _plt_sb.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+                        im1 = axes[1].imshow(p_b_plot,    cmap='RdBu_r',
+                                             vmin=p2b,    vmax=p98b,   **_ikw_sb)
+                        axes[1].set_title(f'pred {band_name}  ch={c}  lvl={lvl}')
+                        axes[1].set_xlabel(_xl)
+                        _plt_sb.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+                        im2 = axes[2].imshow(diff_b_plot, cmap='bwr',
+                                             vmin=-dabsb, vmax=dabsb,  **_ikw_sb)
+                        axes[2].set_title(f'target-pred {band_name}  ch={c}  lvl={lvl}')
+                        axes[2].set_xlabel(_xl)
+                        _plt_sb.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+
+                        for ax in axes:
+                            ax.grid(True, lw=0.3, alpha=0.3)
+
+                        _plt_sb.suptitle(
+                            f'haar_varweighted subbands  stream={stream_name}  '
+                            f'band={band_name}  ch={c}  lvl={lvl}  '
+                            f'call={_call_count}  shape={t_b_plot.shape}  '
+                            f'{_zstr_sb}  p2={p2b:.3f}  p98={p98b:.3f}',
+                            fontsize=10
+                        )
+                        _plt_sb.tight_layout()
+                        out_path = os.path.join(
+                            DEBUG_OUT_DIR,
+                            f'haar_vw_{stream_name}_subbands'
+                            f'_ch{c}_lvl{lvl}_{band_name}'
+                            f'_call{_call_count:06d}.png'
+                        )
+                        _plt_sb.savefig(out_path, dpi=120, bbox_inches='tight')
+                        _plt_sb.close(fig)
+                        print(f"[haar_varweighted subband] {stream_name} "
+                              f"band={band_name} ch={c} lvl={lvl} "
+                              f"shape={t_b_plot.shape} "
+                              f"call={_call_count} saved to {out_path}")
+                # ----------------------------------------------------------------
+                # END DEBUG subbands
+                # ----------------------------------------------------------------
+
+            t_field = t_LL
+            p_field = p_LL
+
+        field_var    = t_grid[:, :, c].var().clamp(min=1e-8)
+        loss_chs[c] = level_loss / (num_levels * field_var)
+
+    if weights_channels is not None:
+        loss = torch.mean(loss_chs * weights_channels.to(dev))
+    else:
+        loss = torch.mean(loss_chs)
+
+    return loss, loss_chs
