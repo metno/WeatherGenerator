@@ -2536,3 +2536,443 @@ def global_haar_wavelet_reshape_varweighted(
         loss = torch.mean(loss_chs)
 
     return loss, loss_chs
+
+
+def global_haar_ll_reshape_varweighted(
+    target: torch.Tensor,
+    pred: torch.Tensor,
+    target_coords_raw: torch.Tensor,
+    weights_channels: torch.Tensor | None,
+    weights_points: torch.Tensor | None,
+    template_path: str = "",
+    num_levels: int = 3,
+    var_weight_epsilon: float = 1e-3,
+    stream_name: str = "",
+):
+    """
+    Global 2D Haar LL-only MSE with inverse-variance spatial weighting,
+    using template-based regridding.
+
+    Identical to global_haar_wavelet_reshape_varweighted in structure, but
+    the loss is computed only on the LL (approximation) coefficients at each
+    Haar level. This penalises errors in the spatially smoothed (low-frequency)
+    component of the field at multiple scales:
+      - level 0 LL: field averaged at 2x coarser resolution
+      - level 1 LL: field averaged at 4x coarser resolution
+      - level 2 LL: field averaged at 8x coarser resolution
+
+    The inverse-variance weighting at each level uses the variance of the LL
+    field entering that level, estimated as the local variance of the LL
+    coefficients across a small neighbourhood. Since LL is a smooth field,
+    the local variance is estimated from the detail coefficients at that level:
+        local_var_ll[i,j] = t_LH[i,j]**2 + t_HL[i,j]**2 + t_HH[i,j]**2
+    This is the same estimator as in global_haar_wavelet_reshape_varweighted
+    and is exact for orthonormal Haar. Where the target LL is smooth (low
+    local variance, e.g. sea), errors in the LL prediction are penalised more.
+
+    Args:
+        target              : (num_points, num_channels)
+        pred                : (ens_size, num_points, num_channels)
+        target_coords_raw   : (num_points, 2) — geographic (lat, lon) degrees
+        weights_channels    : (num_channels,) or None
+        weights_points      : unused
+        template_path       : path to NetCDF template with 2D lat/lon
+        num_levels          : number of Haar decomposition levels
+        var_weight_epsilon  : floor for local variance to avoid division by
+                              zero. Larger = more uniform weighting.
+                              Default 1e-3 (normalised units).
+        stream_name         : used for debug prints and plot filtering
+
+    Returns:
+        loss     : scalar
+        loss_chs : (num_channels,) per-channel loss
+    """
+    import math as _math_ll
+    import numpy as _np_ll
+
+    num_points, num_channels = target.shape
+    dev       = target.device
+    pred_mean = pred.mean(0)
+
+    # --- load and cache template output grid ---
+    _grid_key  = f'_ll_template_grid_{template_path}'
+    _shape_key = f'_ll_template_shape_{template_path}'
+
+    template_grid = getattr(global_haar_ll_reshape, _grid_key,  None)
+    ny_nx         = getattr(global_haar_ll_reshape, _shape_key, None)
+
+    if template_grid is None:
+        if not template_path:
+            _key = f'_ll_no_template_reported_{stream_name}'
+            if not getattr(global_haar_ll_reshape, _key, False):
+                setattr(global_haar_ll_reshape, _key, True)
+                print(
+                    f"[global_haar_ll_reshape] stream={stream_name} "
+                    f"template_path is empty. Setting loss to zero."
+                )
+            return (
+                torch.tensor(0.0, device=dev, requires_grad=True),
+                torch.zeros(num_channels, device=dev),
+            )
+
+        try:
+            import xarray as _xr_ll
+
+            template  = _xr_ll.open_dataset(template_path)
+            olat      = template.latitude.values.flatten()
+            olon      = template.longitude.values.flatten()
+            ny        = len(template.y.values)
+            nx        = len(template.x.values)
+
+            template_grid = _np_ll.stack([olat, olon], axis=1)
+            setattr(global_haar_ll_reshape, _grid_key,  template_grid)
+            setattr(global_haar_ll_reshape, _shape_key, (ny, nx))
+            ny_nx = (ny, nx)
+
+            print(
+                f"[global_haar_ll_reshape] stream={stream_name} "
+                f"template loaded: grid=({ny}x{nx})  "
+                f"n_output_points={ny*nx}"
+            )
+
+        except Exception as _e:
+            _key = f'_ll_template_error_reported_{stream_name}'
+            if not getattr(global_haar_ll_reshape, _key, False):
+                setattr(global_haar_ll_reshape, _key, True)
+                print(
+                    f"[global_haar_ll_reshape] stream={stream_name} "
+                    f"failed to load template '{template_path}': {_e}. "
+                    f"Setting loss to zero."
+                )
+            return (
+                torch.tensor(0.0, device=dev, requires_grad=True),
+                torch.zeros(num_channels, device=dev),
+            )
+
+    ny, nx = ny_nx
+
+    # --- build Isort fresh each call ---
+    import scipy.interpolate as _sci_ll
+
+    ilat    = target_coords_raw[:, 0].cpu().numpy()
+    ilon    = target_coords_raw[:, 1].cpu().numpy()
+    ipoints = _np_ll.concatenate([ilat[:, None], ilon[:, None]], axis=1)
+
+    interpolator = _sci_ll.NearestNDInterpolator(
+        ipoints, _np_ll.arange(len(ilat))
+    )
+    Isort   = interpolator(template_grid).astype(int)
+    Isort_t = torch.from_numpy(Isort).long().to(dev)
+
+    # --- gather values onto 2D grid ---
+    t_flat = target.float()[Isort_t]
+    p_flat = pred_mean.float()[Isort_t]
+
+    t_grid_raw = t_flat.view(ny, nx, num_channels)
+    p_grid_raw = p_flat.view(ny, nx, num_channels)
+
+    # --- pad to next multiple of 2^num_levels ---
+    factor = 2 ** num_levels
+    ny_p   = int(_math_ll.ceil(ny / factor)) * factor
+    nx_p   = int(_math_ll.ceil(nx / factor)) * factor
+
+    if ny_p > ny or nx_p > nx:
+        t_grid = torch.zeros(ny_p, nx_p, num_channels, device=dev)
+        p_grid = torch.zeros(ny_p, nx_p, num_channels, device=dev)
+        t_grid[:ny, :nx, :] = t_grid_raw
+        p_grid[:ny, :nx, :] = p_grid_raw
+    else:
+        t_grid = t_grid_raw
+        p_grid = p_grid_raw
+
+    # --- debug parameters ---
+    DEBUG_LL_PLOT      = True
+    DEBUG_PLOT_EVERY_N = 4096
+    DEBUG_OUT_DIR      = "/leonardo_scratch/large/userexternal/clussana/wg_global_haar_ll_reshape/"
+    DEBUG_ZOOM_LAT_MIN = DEBUG_ZOOM_LAT_MAX = DEBUG_ZOOM_LON_MIN = DEBUG_ZOOM_LON_MAX = None
+    # or zoom:
+    # DEBUG_ZOOM_LAT_MIN = 57.0
+    # DEBUG_ZOOM_LAT_MAX = 62.0
+    # DEBUG_ZOOM_LON_MIN = 4.0
+    # DEBUG_ZOOM_LON_MAX = 12.0
+
+    _counter_key = '_global_haar_ll_call_count'
+    _call_count  = getattr(global_haar_ll_reshape, _counter_key, 0)
+    if stream_name == "NORA3":
+        setattr(global_haar_ll_reshape, _counter_key, _call_count + 1)
+
+    lat_min_v = float(template_grid[:, 0].min())
+    lat_max_v = float(template_grid[:, 0].max())
+    lon_min_v = float(template_grid[:, 1].min())
+    lon_max_v = float(template_grid[:, 1].max())
+
+    def _apply_zoom_ll(arr_2d):
+        if not all(v is not None for v in [
+            DEBUG_ZOOM_LAT_MIN, DEBUG_ZOOM_LAT_MAX,
+            DEBUG_ZOOM_LON_MIN, DEBUG_ZOOM_LON_MAX,
+        ]):
+            return arr_2d, [lon_min_v, lon_max_v, lat_min_v, lat_max_v], 'full field'
+        _lat_ax = _np_ll.linspace(lat_min_v, lat_max_v, arr_2d.shape[0])
+        _lon_ax = _np_ll.linspace(lon_min_v, lon_max_v, arr_2d.shape[1])
+        _r0 = max(0, int(_np_ll.searchsorted(_lat_ax, DEBUG_ZOOM_LAT_MIN)))
+        _r1 = min(arr_2d.shape[0],
+                  int(_np_ll.searchsorted(_lat_ax, DEBUG_ZOOM_LAT_MAX)) + 1)
+        _c0 = max(0, int(_np_ll.searchsorted(_lon_ax, DEBUG_ZOOM_LON_MIN)))
+        _c1 = min(arr_2d.shape[1],
+                  int(_np_ll.searchsorted(_lon_ax, DEBUG_ZOOM_LON_MAX)) + 1)
+        _zstr = (f'zoom=[{DEBUG_ZOOM_LAT_MIN},{DEBUG_ZOOM_LAT_MAX}]N '
+                 f'[{DEBUG_ZOOM_LON_MIN},{DEBUG_ZOOM_LON_MAX}]E')
+        return arr_2d[_r0:_r1, _c0:_c1], \
+               [DEBUG_ZOOM_LON_MIN, DEBUG_ZOOM_LON_MAX,
+                DEBUG_ZOOM_LAT_MIN, DEBUG_ZOOM_LAT_MAX], _zstr
+
+    # --- plot full gridded field ---
+    if DEBUG_LL_PLOT \
+            and stream_name == "NORA3" \
+            and _call_count % DEBUG_PLOT_EVERY_N == 0:
+
+        import os
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as _plt_ll
+
+        os.makedirs(DEBUG_OUT_DIR, exist_ok=True)
+
+        for c in range(num_channels):
+            t_np    = t_grid[:ny, :nx, c].detach().cpu().float().numpy()
+            p_np    = p_grid[:ny, :nx, c].detach().cpu().float().numpy()
+            diff_np = t_np - p_np
+
+            t_plot,    _ext, _zstr = _apply_zoom_ll(t_np)
+            p_plot,    _,    _     = _apply_zoom_ll(p_np)
+            diff_plot, _,    _     = _apply_zoom_ll(diff_np)
+
+            if t_plot.size == 0:
+                continue
+
+            p2,  p98 = _np_ll.percentile(t_plot,    2), _np_ll.percentile(t_plot,   98)
+            d2,  d98 = _np_ll.percentile(diff_plot, 2), _np_ll.percentile(diff_plot, 98)
+            dabs     = max(abs(d2), abs(d98), 1e-6)
+            _ikw     = dict(origin='lower', aspect='auto',
+                            interpolation='nearest', extent=_ext)
+
+            fig, axes = _plt_ll.subplots(1, 3, figsize=(18, 5))
+
+            im0 = axes[0].imshow(t_plot,    cmap='RdBu_r', vmin=p2,   vmax=p98,  **_ikw)
+            axes[0].set_title(f'target  ch={c}  ({ny}x{nx})')
+            axes[0].set_xlabel('longitude'); axes[0].set_ylabel('latitude')
+            _plt_ll.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+            im1 = axes[1].imshow(p_plot,    cmap='RdBu_r', vmin=p2,   vmax=p98,  **_ikw)
+            axes[1].set_title(f'pred  ch={c}')
+            axes[1].set_xlabel('longitude')
+            _plt_ll.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+            im2 = axes[2].imshow(diff_plot, cmap='bwr',    vmin=-dabs, vmax=dabs, **_ikw)
+            axes[2].set_title(f'target-pred  ch={c}')
+            axes[2].set_xlabel('longitude')
+            _plt_ll.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+
+            for ax in axes:
+                ax.grid(True, lw=0.3, alpha=0.3)
+
+            _plt_ll.suptitle(
+                f'global_haar_ll_reshape  stream={stream_name}  ch={c}  '
+                f'call={_call_count}  grid=({ny}x{nx})  {_zstr}  '
+                f'p2={p2:.3f}  p98={p98:.3f}',
+                fontsize=10
+            )
+            _plt_ll.tight_layout()
+            out_path = os.path.join(
+                DEBUG_OUT_DIR,
+                f'haar_ll_{stream_name}_grid_ch{c}_call{_call_count:06d}.png'
+            )
+            _plt_ll.savefig(out_path, dpi=120, bbox_inches='tight')
+            _plt_ll.close(fig)
+            print(f"[haar_ll grid] {stream_name} ch={c} "
+                  f"call={_call_count} saved to {out_path}")
+
+    # --- multi-level Haar LL-only loss per channel ---
+    loss_chs = torch.zeros(num_channels, device=dev)
+
+    for c in range(num_channels):
+        t_field    = t_grid[:, :, c]
+        p_field    = p_grid[:, :, c]
+        level_loss = torch.tensor(0.0, device=dev)
+
+        for lvl in range(num_levels):
+            t_LL, t_LH, t_HL, t_HH = haar_2d(t_field)
+            p_LL, p_LH, p_HL, p_HH = haar_2d(p_field)
+
+            # local variance of target at this level estimated from detail
+            # coefficients — exact for orthonormal Haar, free to compute
+            # shape: (ny/2^(lvl+1), nx/2^(lvl+1))
+            local_var = (
+                t_LH ** 2 + t_HL ** 2 + t_HH ** 2
+            ).detach()
+
+            # inverse variance weight — smooth regions get high weight
+            inv_var_weight = 1.0 / (local_var + var_weight_epsilon)
+
+            # weighted MSE on LL coefficients only
+            w     = inv_var_weight
+            w_sum = w.sum().clamp(min=1e-8)
+            ll_loss = ((t_LL - p_LL) ** 2 * w).sum() / w_sum
+
+            level_loss = level_loss + ll_loss
+
+            # ----------------------------------------------------------------
+            # DEBUG: plot LL subband and inverse variance weight for NORA3
+            # ----------------------------------------------------------------
+            if DEBUG_LL_PLOT \
+                    and stream_name == "NORA3" \
+                    and _call_count % DEBUG_PLOT_EVERY_N == 0:
+
+                import os
+                import matplotlib
+                matplotlib.use('Agg')
+                import matplotlib.pyplot as _plt_sb
+
+                os.makedirs(DEBUG_OUT_DIR, exist_ok=True)
+
+                _full_nr = t_LL.shape[0] * 2
+                _full_nc = t_LL.shape[1] * 2
+
+                def _zoom_sb_ll(arr):
+                    if not all(v is not None for v in [
+                        DEBUG_ZOOM_LAT_MIN, DEBUG_ZOOM_LAT_MAX,
+                        DEBUG_ZOOM_LON_MIN, DEBUG_ZOOM_LON_MAX,
+                    ]):
+                        return arr, None, 'full field', 'col', 'row'
+                    _la = _np_ll.linspace(lat_min_v, lat_max_v, _full_nr)
+                    _lo = _np_ll.linspace(lon_min_v, lon_max_v, _full_nc)
+                    _r0s = max(0,
+                           int(_np_ll.searchsorted(_la, DEBUG_ZOOM_LAT_MIN)) // 2)
+                    _r1s = min(arr.shape[0],
+                           int(_np_ll.searchsorted(_la, DEBUG_ZOOM_LAT_MAX)) // 2 + 1)
+                    _c0s = max(0,
+                           int(_np_ll.searchsorted(_lo, DEBUG_ZOOM_LON_MIN)) // 2)
+                    _c1s = min(arr.shape[1],
+                           int(_np_ll.searchsorted(_lo, DEBUG_ZOOM_LON_MAX)) // 2 + 1)
+                    _ext = [DEBUG_ZOOM_LON_MIN, DEBUG_ZOOM_LON_MAX,
+                            DEBUG_ZOOM_LAT_MIN, DEBUG_ZOOM_LAT_MAX]
+                    _zs  = (f'zoom=[{DEBUG_ZOOM_LAT_MIN},{DEBUG_ZOOM_LAT_MAX}]N '
+                            f'[{DEBUG_ZOOM_LON_MIN},{DEBUG_ZOOM_LON_MAX}]E')
+                    return arr[_r0s:_r1s, _c0s:_c1s], _ext, _zs, \
+                           'longitude', 'latitude'
+
+                # --- plot LL: target, pred, diff ---
+                t_ll_np  = t_LL.detach().cpu().float().numpy()
+                p_ll_np  = p_LL.detach().cpu().float().numpy()
+                diff_ll  = t_ll_np - p_ll_np
+
+                t_ll_plot,   _ext_ll, _zstr_ll, _xl, _yl = _zoom_sb_ll(t_ll_np)
+                p_ll_plot,   _,       _,        _,   _   = _zoom_sb_ll(p_ll_np)
+                diff_ll_plot,_,       _,        _,   _   = _zoom_sb_ll(diff_ll)
+
+                if t_ll_plot.size > 0:
+                    p2b,  p98b = (_np_ll.percentile(t_ll_plot,   2),
+                                  _np_ll.percentile(t_ll_plot,  98))
+                    d2b,  d98b = (_np_ll.percentile(diff_ll_plot, 2),
+                                  _np_ll.percentile(diff_ll_plot, 98))
+                    dabsb      = max(abs(d2b), abs(d98b), 1e-6)
+
+                    _ikw_ll = dict(origin='lower', aspect='auto',
+                                   interpolation='nearest')
+                    if _ext_ll is not None:
+                        _ikw_ll['extent'] = _ext_ll
+
+                    fig, axes = _plt_sb.subplots(1, 3, figsize=(18, 5))
+
+                    im0 = axes[0].imshow(t_ll_plot,    cmap='RdBu_r',
+                                         vmin=p2b,     vmax=p98b,    **_ikw_ll)
+                    axes[0].set_title(f'target LL  ch={c}  lvl={lvl}  '
+                                      f'shape={t_ll_plot.shape}')
+                    axes[0].set_xlabel(_xl); axes[0].set_ylabel(_yl)
+                    _plt_sb.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+                    im1 = axes[1].imshow(p_ll_plot,    cmap='RdBu_r',
+                                         vmin=p2b,     vmax=p98b,    **_ikw_ll)
+                    axes[1].set_title(f'pred LL  ch={c}  lvl={lvl}')
+                    axes[1].set_xlabel(_xl)
+                    _plt_sb.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+                    im2 = axes[2].imshow(diff_ll_plot, cmap='bwr',
+                                         vmin=-dabsb,  vmax=dabsb,   **_ikw_ll)
+                    axes[2].set_title(f'target-pred LL  ch={c}  lvl={lvl}  '
+                                      f'll_loss={ll_loss.item():.6f}')
+                    axes[2].set_xlabel(_xl)
+                    _plt_sb.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+
+                    for ax in axes:
+                        ax.grid(True, lw=0.3, alpha=0.3)
+
+                    _plt_sb.suptitle(
+                        f'global_haar_ll_reshape  stream={stream_name}  '
+                        f'ch={c}  lvl={lvl}  '
+                        f'call={_call_count}  shape={t_ll_plot.shape}  '
+                        f'{_zstr_ll}  p2={p2b:.3f}  p98={p98b:.3f}  '
+                        f'll_loss={ll_loss.item():.6f}',
+                        fontsize=10
+                    )
+                    _plt_sb.tight_layout()
+                    out_path = os.path.join(
+                        DEBUG_OUT_DIR,
+                        f'haar_ll_{stream_name}_LL'
+                        f'_ch{c}_lvl{lvl}_call{_call_count:06d}.png'
+                    )
+                    _plt_sb.savefig(out_path, dpi=120, bbox_inches='tight')
+                    _plt_sb.close(fig)
+                    print(f"[haar_ll LL] {stream_name} ch={c} lvl={lvl} "
+                          f"shape={t_ll_plot.shape} "
+                          f"ll_loss={ll_loss.item():.6f} "
+                          f"call={_call_count} saved to {out_path}")
+
+                # --- plot inverse variance weight map ---
+                ivw_np               = inv_var_weight.detach().cpu().float().numpy()
+                ivw_plot, _ext_ivw, _zstr_ivw, _xl_ivw, _yl_ivw = _zoom_sb_ll(ivw_np)
+
+                if ivw_plot.size > 0:
+                    _ikw_ivw = dict(origin='lower', aspect='auto',
+                                    interpolation='nearest')
+                    if _ext_ivw is not None:
+                        _ikw_ivw['extent'] = _ext_ivw
+
+                    fig, ax = _plt_sb.subplots(1, 1, figsize=(8, 6))
+                    im = ax.imshow(_np_ll.log10(ivw_plot + 1e-10),
+                                   cmap='hot_r', **_ikw_ivw)
+                    ax.set_title(
+                        f'log10(inv_var_weight)  ch={c}  lvl={lvl}  '
+                        f'eps={var_weight_epsilon}'
+                    )
+                    ax.set_xlabel(_xl_ivw); ax.set_ylabel(_yl_ivw)
+                    _plt_sb.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                    ax.grid(True, lw=0.3, alpha=0.3)
+                    _plt_sb.tight_layout()
+                    out_path = os.path.join(
+                        DEBUG_OUT_DIR,
+                        f'haar_ll_{stream_name}_invvar'
+                        f'_ch{c}_lvl{lvl}_call{_call_count:06d}.png'
+                    )
+                    _plt_sb.savefig(out_path, dpi=120, bbox_inches='tight')
+                    _plt_sb.close(fig)
+                    print(f"[haar_ll invvar] {stream_name} ch={c} lvl={lvl} "
+                          f"saved to {out_path}")
+            # ----------------------------------------------------------------
+            # END DEBUG
+            # ----------------------------------------------------------------
+
+            # recurse into LL for next level
+            t_field = t_LL
+            p_field = p_LL
+
+        # normalise by number of levels and spatial variance of target
+        field_var    = t_grid[:, :, c].var().clamp(min=1e-8)
+        loss_chs[c] = level_loss / (num_levels * field_var)
+
+    if weights_channels is not None:
+        loss = torch.mean(loss_chs * weights_channels.to(dev))
+    else:
+        loss = torch.mean(loss_chs)
+
+    return loss, loss_chs
