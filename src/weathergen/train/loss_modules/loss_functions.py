@@ -2598,16 +2598,16 @@ def global_haar_ll_reshape_varweighted(
     _grid_key  = f'_ll_template_grid_{template_path}'
     _shape_key = f'_ll_template_shape_{template_path}'
 
-    template_grid = getattr(global_haar_ll_reshape, _grid_key,  None)
-    ny_nx         = getattr(global_haar_ll_reshape, _shape_key, None)
+    template_grid = getattr(global_haar_ll_reshape_varweighted, _grid_key,  None)
+    ny_nx         = getattr(global_haar_ll_reshape_varweighted, _shape_key, None)
 
     if template_grid is None:
         if not template_path:
             _key = f'_ll_no_template_reported_{stream_name}'
-            if not getattr(global_haar_ll_reshape, _key, False):
-                setattr(global_haar_ll_reshape, _key, True)
+            if not getattr(global_haar_ll_reshape_varweighted, _key, False):
+                setattr(global_haar_ll_reshape_varweighted, _key, True)
                 print(
-                    f"[global_haar_ll_reshape] stream={stream_name} "
+                    f"[global_haar_ll_reshape_varweighted] stream={stream_name} "
                     f"template_path is empty. Setting loss to zero."
                 )
             return (
@@ -2625,22 +2625,22 @@ def global_haar_ll_reshape_varweighted(
             nx        = len(template.x.values)
 
             template_grid = _np_ll.stack([olat, olon], axis=1)
-            setattr(global_haar_ll_reshape, _grid_key,  template_grid)
-            setattr(global_haar_ll_reshape, _shape_key, (ny, nx))
+            setattr(global_haar_ll_reshape_varweighted, _grid_key,  template_grid)
+            setattr(global_haar_ll_reshape_varweighted, _shape_key, (ny, nx))
             ny_nx = (ny, nx)
 
             print(
-                f"[global_haar_ll_reshape] stream={stream_name} "
+                f"[global_haar_ll_reshape_varweighted] stream={stream_name} "
                 f"template loaded: grid=({ny}x{nx})  "
                 f"n_output_points={ny*nx}"
             )
 
         except Exception as _e:
             _key = f'_ll_template_error_reported_{stream_name}'
-            if not getattr(global_haar_ll_reshape, _key, False):
-                setattr(global_haar_ll_reshape, _key, True)
+            if not getattr(global_haar_ll_reshape_varweighted, _key, False):
+                setattr(global_haar_ll_reshape_varweighted, _key, True)
                 print(
-                    f"[global_haar_ll_reshape] stream={stream_name} "
+                    f"[global_haar_ll_reshape_varweighted] stream={stream_name} "
                     f"failed to load template '{template_path}': {_e}. "
                     f"Setting loss to zero."
                 )
@@ -2688,7 +2688,7 @@ def global_haar_ll_reshape_varweighted(
     # --- debug parameters ---
     DEBUG_LL_PLOT      = True
     DEBUG_PLOT_EVERY_N = 4096
-    DEBUG_OUT_DIR      = "/leonardo_scratch/large/userexternal/clussana/wg_global_haar_ll_reshape/"
+    DEBUG_OUT_DIR      = "/leonardo_scratch/large/userexternal/clussana/wg_global_haar_ll_reshape_varweighted/"
     DEBUG_ZOOM_LAT_MIN = DEBUG_ZOOM_LAT_MAX = DEBUG_ZOOM_LON_MIN = DEBUG_ZOOM_LON_MAX = None
     # or zoom:
     # DEBUG_ZOOM_LAT_MIN = 57.0
@@ -2697,9 +2697,9 @@ def global_haar_ll_reshape_varweighted(
     # DEBUG_ZOOM_LON_MAX = 12.0
 
     _counter_key = '_global_haar_ll_call_count'
-    _call_count  = getattr(global_haar_ll_reshape, _counter_key, 0)
+    _call_count  = getattr(global_haar_ll_reshape_varweighted, _counter_key, 0)
     if stream_name == "NORA3":
-        setattr(global_haar_ll_reshape, _counter_key, _call_count + 1)
+        setattr(global_haar_ll_reshape_varweighted, _counter_key, _call_count + 1)
 
     lat_min_v = float(template_grid[:, 0].min())
     lat_max_v = float(template_grid[:, 0].max())
@@ -2777,7 +2777,7 @@ def global_haar_ll_reshape_varweighted(
                 ax.grid(True, lw=0.3, alpha=0.3)
 
             _plt_ll.suptitle(
-                f'global_haar_ll_reshape  stream={stream_name}  ch={c}  '
+                f'global_haar_ll_reshape_varweighted  stream={stream_name}  ch={c}  '
                 f'call={_call_count}  grid=({ny}x{nx})  {_zstr}  '
                 f'p2={p2:.3f}  p98={p98:.3f}',
                 fontsize=10
@@ -2908,7 +2908,7 @@ def global_haar_ll_reshape_varweighted(
                         ax.grid(True, lw=0.3, alpha=0.3)
 
                     _plt_sb.suptitle(
-                        f'global_haar_ll_reshape  stream={stream_name}  '
+                        f'global_haar_ll_reshape_varweighted  stream={stream_name}  '
                         f'ch={c}  lvl={lvl}  '
                         f'call={_call_count}  shape={t_ll_plot.shape}  '
                         f'{_zstr_ll}  p2={p2b:.3f}  p98={p98b:.3f}  '
