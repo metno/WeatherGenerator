@@ -1,5 +1,26 @@
 train : 
   plot :
-    df15tizp :
-        slurm_id: 42058836
-        description: "wavelet test"
+    byskzo46 :
+        slurm_id: 42319956
+        description: "exp12_ep09"
+    qj65sif4 :
+        slurm_id: 42399135
+        description: "exp12_ep18"
+    ofrg0i7f :
+        slurm_id: 42587406
+        description: "exp12_ep27"
+    zzh8wfnh :
+        slurm_id: 42821510
+        description: "exp12_ep31"
+    m5c6lmbg :
+        slurm_id: 42319957 
+        description: "exp13_ep09"
+    v9pjh6c8 :
+        slurm_id: 42398893 
+        description: "exp13_ep17"
+    ohb8oiin :
+        slurm_id: 42587461 
+        description: "exp13_ep27"
+    goyxp3y4 :
+        slurm_id: 42821516 
+        description: "exp13_ep31"

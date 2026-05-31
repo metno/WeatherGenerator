@@ -1493,9 +1493,11 @@ def global_haar_wavelet_reshape(
             # END DEBUG subbands
             # ----------------------------------------------------------------
 
-            _active_mask = (
-                (t_LH != p_LH) | (t_HL != p_HL) | (t_HH != p_HH)
-            )
+            #_active_mask = (
+            #    (t_LH != p_LH) | (t_HL != p_HL) | (t_HH != p_HH)
+            #)
+            # to remove active_mask
+            _active_mask = torch.ones_like(t_LH, dtype=torch.bool)
             _n_active = _active_mask.sum().clamp(min=1)
 
             if _n_active > 0:
@@ -2231,8 +2233,8 @@ def global_haar_wavelet_reshape_varweighted(
 
     # --- debug parameters ---
     DEBUG_VW_PLOT      = True
-    DEBUG_PLOT_EVERY_N = 4096
-    DEBUG_OUT_DIR      = "/leonardo_scratch/large/userexternal/clussana/wg_debug_haar_varweighted/"
+    DEBUG_PLOT_EVERY_N = 100
+    DEBUG_OUT_DIR      = "/leonardo_scratch/large/userexternal/clussana/wg_debug_haar_varweighted_test_20260527/"
 #    DEBUG_ZOOM_LAT_MIN = 57.0
 #    DEBUG_ZOOM_LAT_MAX = 62.0
 #    DEBUG_ZOOM_LON_MIN = 4.0
