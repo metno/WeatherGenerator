@@ -934,7 +934,7 @@ class LossPhysical(LossModuleBase):
 
                         elif loss_fct_name == "global_haar_ll_reshape_varweighted":
 
-                            loss_lfct, loss_lfct_chs = self._loss_global_haar_ll(
+                            loss_lfct, loss_lfct_chs = self._loss_global_haar_ll_varweighted(
                                 target,
                                 pred,
                                 targets_coords_batch[target_idx],
