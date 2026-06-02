@@ -2686,7 +2686,7 @@ def global_haar_ll_reshape_varweighted(
         p_grid = p_grid_raw
 
     # --- debug parameters ---
-    DEBUG_LL_PLOT      = True
+    DEBUG_LL_PLOT      = False
     DEBUG_PLOT_EVERY_N = 4096
     DEBUG_OUT_DIR      = "/leonardo_scratch/large/userexternal/clussana/wg_global_haar_ll_reshape_varweighted/"
     DEBUG_ZOOM_LAT_MIN = DEBUG_ZOOM_LAT_MAX = DEBUG_ZOOM_LON_MIN = DEBUG_ZOOM_LON_MAX = None

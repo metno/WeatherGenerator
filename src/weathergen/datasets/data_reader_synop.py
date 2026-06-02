@@ -89,7 +89,13 @@ class DataReaderSynop(DataReaderTimestep):
             self.len = len(ds)
 
         self.offset_data_channels = 4
-        self.fillvalue = ds["air_temperature"][0, 0].values.item()
+#        self.fillvalue = ds["air_temperature"][0, 0].values.item()
+#        self.fillvalue = ds["2t"][0, 0].values.item()
+        var_name = next(
+            name for name, da in ds.data_vars.items()
+            if da.ndim >= 2
+        )
+        self.fillvalue = ds[var_name][0, 0].values.item()
         self.channels_file = [k for k in self.ds.keys()]
 
         # caches lats and lons
@@ -228,33 +234,60 @@ class DataReaderSynop(DataReaderTimestep):
 
         return rd
 
+#    def select_channels(self, ds, ch_type: str) -> NDArray[np.int64]:
+#        """
+#        Select source or target channels
+#
+#        Parameters
+#        ----------
+#        ds0 :
+#            raw anemoi dataset with available channels
+#        ch_type :
+#            "source" or "target", i.e channel type to select
+#
+#        Returns
+#        -------
+#        ReaderData providing coords, geoinfos, data, datetimes
+#
+#        """
+#
+#        channels = self.stream_info.get(ch_type)
+#        assert channels is not None, f"{ch_type} channels need to be specified"
+#        # sanity check
+#        is_empty = len(channels) == 0 if channels is not None else False
+#        if is_empty:
+#            stream_name = self.stream_info["name"]
+#            _logger.warning(f"No channel for {stream_name} for {ch_type}.")
+#
+#        chs_idx = np.sort([self.channels_file.index(ch) for ch in channels])
+#
+#        return np.array(chs_idx)
+
     def select_channels(self, ds, ch_type: str) -> NDArray[np.int64]:
-        """
-        Select source or target channels
-
-        Parameters
-        ----------
-        ds0 :
-            raw anemoi dataset with available channels
-        ch_type :
-            "source" or "target", i.e channel type to select
-
-        Returns
-        -------
-        ReaderData providing coords, geoinfos, data, datetimes
-
-        """
-
         channels = self.stream_info.get(ch_type)
         assert channels is not None, f"{ch_type} channels need to be specified"
-        # sanity check
         is_empty = len(channels) == 0 if channels is not None else False
         if is_empty:
             stream_name = self.stream_info["name"]
             _logger.warning(f"No channel for {stream_name} for {ch_type}.")
 
-        chs_idx = np.sort([self.channels_file.index(ch) for ch in channels])
+        # warn about channels that lack a time dimension
+        for ch in channels:
+            if ch in self.channels_file and 'time' not in ds[ch].dims:
+                _logger.warning(
+                    f"Channel '{ch}' has no time dimension and will be "
+                    f"excluded from {ch_type} channels for stream "
+                    f"{self.stream_info['name']}."
+                )
 
+
+        # only include channels that have a time dimension — location-only
+        # variables (geoinfos) must not be included in source/target channels
+        chs_idx = np.sort([
+            self.channels_file.index(ch) for ch in channels
+            if ch in self.channels_file
+            and 'time' in ds[ch].dims
+        ])
         return np.array(chs_idx)
 
 
