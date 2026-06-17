@@ -9,8 +9,10 @@
 
 import logging
 
+import astropy_healpix as hp
 import numpy as np
 import torch
+from numpy.typing import NDArray
 
 import weathergen.common.config as config
 import weathergen.common.io as io
@@ -102,7 +104,18 @@ def write_output(
             targets_coords_all[-1] += [np.concatenate(t_coords_s)]
             targets_times_all[-1] += [np.concatenate(t_times_s)]
 
-    if len(preds_all) == 0 or np.array([p.shape[1] for pp in preds_all for p in pp]).sum() == 0:
+    # output stream names to be written, use specified ones or all if nothing specified
+    stream_names = list(cf.streams.keys())
+    stream_infos = list(cf.streams.values())
+    if val_cfg.get("output").get("streams") is not None:
+        output_stream_names = val_cfg.output.streams
+    else:
+        output_stream_names = stream_names
+    latent_requested = io.LATENT_STREAM in output_stream_names
+
+    if (
+        len(preds_all) == 0 or np.array([p.shape[1] for pp in preds_all for p in pp]).sum() == 0
+    ) and not latent_requested:
         _logger.warning("Writing no data since predictions are empty.")
         return
 
@@ -121,15 +134,9 @@ def write_output(
 
     # more prep work
 
-    # output stream names to be written, use specified ones or all if nothing specified
-    stream_names = list(cf.streams.keys())
-    stream_infos = list(cf.streams.values())
-    if val_cfg.get("output").get("streams") is not None:
-        output_stream_names = val_cfg.output.streams
-    else:
-        output_stream_names = stream_names
-
-    output_streams = {name: stream_names.index(name) for name in output_stream_names}
+    output_streams = {
+        name: stream_names.index(name) for name in output_stream_names if name != io.LATENT_STREAM
+    }
     _logger.debug(f"Using output streams: {output_streams} from streams: {stream_names}")
 
     target_channels: list[list[str]] = [list(stream.val_target_channels) for stream in stream_infos]
@@ -153,6 +160,7 @@ def write_output(
     )
     source_windows = (twh.window(idx) for idx in sample_idxs)
     source_intervals = [TimeRange(window.start, window.end) for window in source_windows]
+    latent_outputs = get_latent_output(batch, model_output) if latent_requested else []
 
     data = io.OutputBatchData(
         sources,
@@ -172,3 +180,169 @@ def write_output(
     with zarrio_writer(config.get_path_results(cf, mini_epoch)) as zio:
         for subset in data.items():
             zio.write_zarr(subset)
+        if latent_outputs:
+            _write_latent_outputs(
+                zio,
+                cf,
+                batch,
+                latent_outputs,
+                sample_start,
+                timestep_idxs,
+            )
+
+
+def get_latent_output(batch, model_output):
+    """Collect latent outputs per forecast step and sample as CPU numpy arrays."""
+
+    timestep_idxs = [0] if len(batch.get_output_idxs()) == 0 else batch.get_output_idxs()
+    n_samples = len(batch.get_source_samples().get_samples())
+    latents_all: list[list[dict[str, NDArray]]] = []
+
+    for t_idx in timestep_idxs:
+        latent_pred = model_output.get_latent_prediction(t_idx)
+        latents_step: list[dict[str, NDArray]] = []
+        for sample_idx in range(n_samples):
+            latents_sample: dict[str, NDArray] = {}
+            for latent_name, latent_value in latent_pred.items():
+                for output_name, tensor in _iter_latent_tensors(latent_name, latent_value):
+                    if tensor is None:
+                        continue
+                    latents_sample[output_name] = _as_sample_array(tensor, sample_idx)
+            latents_step.append(latents_sample)
+        latents_all.append(latents_step)
+
+    return latents_all
+
+
+def _iter_latent_tensors(latent_name: str, latent_value):
+    if latent_value is None:
+        return
+
+    if hasattr(latent_value, "z_pre_norm"):
+        yield latent_name, latent_value.z_pre_norm
+        yield f"{latent_name}_register_tokens", getattr(latent_value, "register_tokens", None)
+        yield f"{latent_name}_class_token", getattr(latent_value, "class_token", None)
+        return
+
+    if isinstance(latent_value, torch.Tensor):
+        yield latent_name, latent_value
+
+
+def _as_sample_array(tensor: torch.Tensor, sample_idx: int) -> NDArray:
+    sample_tensor = tensor[sample_idx] if tensor.ndim > 0 else tensor
+    return sample_tensor.detach().to(torch.float32).cpu().numpy()
+
+
+def _write_latent_outputs(
+    zio,
+    cf,
+    batch,
+    latent_outputs: list[list[dict[str, NDArray]]],
+    sample_start: int,
+    timestep_idxs: list[int],
+) -> None:
+    for rel_step, latents_for_step in enumerate(latent_outputs):
+        forecast_step = timestep_idxs[rel_step]
+        for sample_idx, latents_for_sample in enumerate(latents_for_step):
+            if not latents_for_sample:
+                continue
+
+            group_path = f"{sample_start + sample_idx}/{io.LATENT_STREAM}/{forecast_step}"
+            npoints = _infer_latent_points(latents_for_sample)
+            metadata = _build_latent_metadata(cf, batch, sample_idx, npoints)
+            attrs = {
+                "num_register_tokens": metadata["num_register_tokens"],
+                "num_class_tokens": metadata["num_class_tokens"],
+                "num_extra_tokens": metadata["num_extra_tokens"],
+                "spatial_points": metadata["coords_len"],
+                "coords_order": "lat_lon",
+            }
+
+            group = zio.data_root.get(group_path)
+            if group is None:
+                group = zio.data_root.create_group(group_path, attributes=attrs)
+
+            for latent_name, latent_array in latents_for_sample.items():
+                array = _strip_extra_tokens(latent_array, metadata["coords_len"], attrs)
+                _write_array(group, latent_name, array)
+
+            _write_array(group, "coords", metadata["coords"])
+            _write_array(group, "geoinfo", metadata["geoinfo"])
+            _write_array(group, "times", metadata["times"])
+
+
+def _infer_latent_points(latents_for_sample: dict[str, NDArray]) -> int | None:
+    for key in ("latent_state", "z_pre_norm", "patch_tokens"):
+        if key in latents_for_sample and latents_for_sample[key].ndim >= 1:
+            return latents_for_sample[key].shape[0]
+    for latent_array in latents_for_sample.values():
+        if latent_array.ndim >= 1:
+            return latent_array.shape[0]
+    return None
+
+
+def _build_latent_metadata(cf, batch, sample_idx: int, npoints: int | None):
+    num_register_tokens = int(cf.get("num_register_tokens", 0))
+    num_class_tokens = int(cf.get("num_class_tokens", 0))
+    num_extra_tokens = num_register_tokens + num_class_tokens
+
+    coords = _healpix_coords(int(cf.healpix_level))
+    coords = _apply_sample_mask(coords, batch, sample_idx)
+    coords_len = coords.shape[0]
+
+    if npoints is not None and npoints == coords_len + num_extra_tokens:
+        npoints = coords_len
+    if npoints is not None and npoints != coords_len:
+        coords = np.zeros((npoints, 2), dtype=np.float32)
+        coords_len = npoints
+
+    return {
+        "coords": coords.astype(np.float32),
+        "geoinfo": np.zeros((coords_len, 0), dtype=np.float32),
+        "times": np.full((coords_len,), np.datetime64("NaT"), dtype="datetime64[ns]"),
+        "coords_len": coords_len,
+        "num_register_tokens": num_register_tokens,
+        "num_class_tokens": num_class_tokens,
+        "num_extra_tokens": num_extra_tokens,
+    }
+
+
+def _healpix_coords(healpix_level: int) -> NDArray:
+    nside = 2**healpix_level
+    ipix = np.arange(12 * 4**healpix_level)
+    lon, lat = hp.healpix_to_lonlat(ipix, nside, order="nested")
+    return np.stack([lat.to_value("deg"), lon.to_value("deg")], axis=1)
+
+
+def _apply_sample_mask(coords: NDArray, batch, sample_idx: int) -> NDArray:
+    samples = batch.get_source_samples().get_samples()
+    if sample_idx >= len(samples):
+        return coords
+    for meta in getattr(samples[sample_idx], "meta_info", {}).values():
+        mask = getattr(meta, "mask", None)
+        if mask is None:
+            continue
+        mask = mask.detach().cpu().numpy().astype(bool) if isinstance(mask, torch.Tensor) else mask
+        if mask.shape[0] == coords.shape[0]:
+            return coords[mask]
+    return coords
+
+
+def _strip_extra_tokens(
+    latent_array: NDArray,
+    coords_len: int,
+    attrs: dict[str, int | str],
+) -> NDArray:
+    num_extra_tokens = int(attrs["num_extra_tokens"])
+    if (
+        num_extra_tokens > 0
+        and latent_array.ndim >= 1
+        and latent_array.shape[0] == coords_len + num_extra_tokens
+    ):
+        return latent_array[num_extra_tokens:]
+    return latent_array
+
+
+def _write_array(group, name: str, data: NDArray) -> None:
+    if name not in group:
+        group.create_array(name, data=data)
