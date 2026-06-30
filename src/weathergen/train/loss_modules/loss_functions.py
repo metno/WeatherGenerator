@@ -2232,7 +2232,7 @@ def global_haar_wavelet_reshape_varweighted(
         p_grid = p_grid_raw
 
     # --- debug parameters ---
-    DEBUG_VW_PLOT      = True
+    DEBUG_VW_PLOT      = False
     DEBUG_PLOT_EVERY_N = 100
     DEBUG_OUT_DIR      = "/leonardo_scratch/large/userexternal/clussana/wg_debug_haar_varweighted_test_20260527/"
 #    DEBUG_ZOOM_LAT_MIN = 57.0

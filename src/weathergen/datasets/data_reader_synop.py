@@ -191,6 +191,12 @@ class DataReaderSynop(DataReaderTimestep):
                 num_data_fields=len(channels_idx), num_geo_fields=len(self.geoinfo_idx)
             )
 
+        # nothing to read if no channels requested (e.g. source: [])
+        if len(channels_idx) == 0:
+            return ReaderData.empty(
+                num_data_fields=0, num_geo_fields=len(self.geoinfo_idx)
+            )
+
         assert t_idxs[0] >= 0, "index must be non-negative"
         didx_start = t_idxs[0]
         # End is inclusive
@@ -288,7 +294,7 @@ class DataReaderSynop(DataReaderTimestep):
             if ch in self.channels_file
             and 'time' in ds[ch].dims
         ])
-        return np.array(chs_idx)
+        return np.array(chs_idx, dtype=np.int64)
 
 
 # TODO: move to base class
