@@ -213,7 +213,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
     def _calc_baseperms(self, fsm: int) -> np.typing.NDArray:
         """This calculates the base permutation array and
-        depends on fsm so must be repeated for __init__ and reset"""metno_develop_202606_svg
+        depends on fsm so must be repeated for __init__ and reset"""
         perms_len = int(self.index_range.end - self.index_range.start)
         perms_len -= (fsm + self.output_offset) * (self.time_step // self.step_timedelta)
 

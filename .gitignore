@@ -229,6 +229,7 @@ models
 results
 reports
 config/streams/metno_highres_e*/
+config/streams/metno_*/
 
 # ignore backup for config files
 *.yml.bak
