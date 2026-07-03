@@ -30,6 +30,7 @@ from weathergen.datasets.data_reader_synop import DataReaderSynop
 from weathergen.datasets.masking import Masker
 from weathergen.datasets.stream_data import StreamData, spoof
 from weathergen.datasets.tokenizer_masking import TokenizerMasking
+from weathergen.datasets.tokenizer_utils import NUM_GLOBAL_COORD_CHANNELS
 from weathergen.datasets.utils import (
     get_tokens_lens,
 )
@@ -372,8 +373,16 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
     def get_targets_coords_size(self):
         # TODO: avoid hard coding magic values
         # +6 at the end for stream_id and time encoding
+        # NUM_GLOBAL_COORD_CHANNELS: smooth unit-sphere position appended in
+        # tokenizer_utils.get_target_coords_local (must stay in sync)
         return [
-            (ds.readers[0].get_geoinfo_size() + (5 * (3 * 5)) + 3 * 8) + 6
+            (
+                ds.readers[0].get_geoinfo_size()
+                + (5 * (3 * 5))
+                + 3 * 8
+                + NUM_GLOBAL_COORD_CHANNELS
+            )
+            + 6
             for ds in self.streams_datasets.values()
         ]
 

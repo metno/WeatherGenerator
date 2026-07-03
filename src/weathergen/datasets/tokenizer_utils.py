@@ -1,8 +1,24 @@
+import logging
+import os
+
 import numpy as np
 import pandas as pd
 import torch
 from astropy_healpix.healpy import ang2pix
 from torch import Tensor
+
+_logger = logging.getLogger(__name__)
+
+# Number of smooth global coordinate channels appended at the tail of the target
+# coordinate features (unit-sphere R3 position). These are the only positional
+# channels that are continuous across healpix cell boundaries; all other geometry
+# blocks are cell-relative and jump when the containing cell changes.
+# MUST be kept in sync with MultiStreamDataSampler.get_targets_coords_size().
+NUM_GLOBAL_COORD_CHANNELS = 3
+
+# Set WEATHERGEN_DEBUG_TARGET_COORDS=1 to enable per-call sanity checks on the
+# target coordinate features (non-finite values, dead channels, block magnitudes).
+_DEBUG_TARGET_COORDS = os.environ.get("WEATHERGEN_DEBUG_TARGET_COORDS", "0") == "1"
 
 from weathergen.common.io import IOReaderData
 from weathergen.datasets.utils import (
@@ -448,10 +464,18 @@ def get_target_coords_local(
     a = torch.zeros(
         [
             *target_coords.shape[:-1],
-            1 + target_geoinfos.shape[1] + target_times.shape[1] + 5 * (3 * 5) + 3 * 8,
+            1
+            + target_geoinfos.shape[1]
+            + target_times.shape[1]
+            + 5 * (3 * 5)
+            + 3 * 8
+            + NUM_GLOBAL_COORD_CHANNELS,
         ]
     )
-    a[0] = stream_id
+    # channel 0 carries the stream id for every point
+    # (was `a[0] = stream_id`, which overwrote the full feature vector of the
+    #  first point and left channel 0 at zero for all others)
+    a[..., 0] = stream_id
     geoinfo_offset = 1
     a[..., geoinfo_offset : geoinfo_offset + target_times.shape[1]] = target_times
     geoinfo_offset += target_times.shape[1]
@@ -517,8 +541,63 @@ def get_target_coords_local(
     zi = 75
     a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + (3 * 8))] = tcs_ctrs
 
-    # remaining geoinfos (zenith angle etc)
+    # smooth global position on the unit sphere (R3, no lon-wrap seam).
+    # This replaces a dead assignment (`a[..., geoinfo_offset+99:] = target_coords[...,
+    # geoinfo_offset+2:]`) where both sides were empty slices: `a` ended exactly at
+    # channel geoinfo_offset+99 and target_coords has only 3 channels.
     zi = 99
-    a[..., (geoinfo_offset + zi) :] = target_coords[..., (geoinfo_offset + 2) :]
+    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + NUM_GLOBAL_COORD_CHANNELS)] = (
+        target_coords
+    )
+
+    if _DEBUG_TARGET_COORDS:
+        _debug_check_target_coords(a, stream_id, geoinfo_offset)
 
     return a
+
+
+def _debug_check_target_coords(a: Tensor, stream_id, geoinfo_offset: int) -> None:
+    """
+    Sanity checks for the target coordinate features. Enabled via
+    WEATHERGEN_DEBUG_TARGET_COORDS=1. Logs:
+      - non-finite values (NaN/Inf) and the channels they occur in
+      - channels that are identically zero (catches dead/dropped writes such as
+        the former no-op tail assignment)
+      - abs-max per geometry block (a healthy encoding stays O(1); blow-ups point
+        to broken rotation matrices)
+    """
+    bad = ~torch.isfinite(a)
+    if bad.any():
+        bad_channels = torch.nonzero(bad.any(dim=0)).flatten().tolist()
+        _logger.warning(
+            "target coords stream_id=%s: %d non-finite values in channels %s",
+            stream_id,
+            int(bad.sum()),
+            bad_channels,
+        )
+
+    dead = (a == 0.0).all(dim=0)
+    # channel 0 (stream_id) can legitimately be 0 for stream 0; geoinfo/time channels
+    # can legitimately be 0; geometry channels [geoinfo_offset:] should never all be 0
+    dead_geometry = torch.nonzero(dead[geoinfo_offset:]).flatten() + geoinfo_offset
+    if len(dead_geometry) > 0:
+        _logger.warning(
+            "target coords stream_id=%s: geometry channels identically zero: %s",
+            stream_id,
+            dead_geometry.tolist(),
+        )
+
+    blocks = {
+        "verts00": (0, 15),
+        "verts10": (15, 30),
+        "verts11": (30, 45),
+        "verts01": (45, 60),
+        "vertsmm": (60, 75),
+        "nbor_ctrs": (75, 99),
+        "global_r3": (99, 99 + NUM_GLOBAL_COORD_CHANNELS),
+    }
+    stats = {
+        name: round(float(a[..., geoinfo_offset + lo : geoinfo_offset + hi].abs().max()), 4)
+        for name, (lo, hi) in blocks.items()
+    }
+    _logger.debug("target coords stream_id=%s: abs-max per block: %s", stream_id, stats)
