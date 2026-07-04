@@ -76,6 +76,8 @@ class MetnoParser(CfParser):
         self,
         fstep_iterator_results: iter,
         ref_time: np.datetime64,
+        source_interval_start: np.datetime64 | None = None,
+        source_interval_end: np.datetime64 | None = None,
     ):
         """
         Process results from get_data_worker: reshape, concatenate, add metadata, and save.
@@ -83,6 +85,8 @@ class MetnoParser(CfParser):
         ----------
             fstep_iterator_results : Iterator over results from get_data_worker.
             ref_time : Forecast reference time for the sample.
+            source_interval_start : Start of the source (analysis) interval, optional.
+            source_interval_end : End of the source (analysis) interval, optional.
         Returns
         -------
             None
@@ -109,7 +113,11 @@ class MetnoParser(CfParser):
         if da_fs:
             da_fs = self.concatenate(da_fs, dim="forecast_step", sortby_dim="forecast_step")
             da_fs = self.regrid(da_fs)
-            da_fs = self.add_global_attributes(da_fs)
+            da_fs = self.add_global_attributes(
+                da_fs,
+                source_interval_start=source_interval_start,
+                source_interval_end=source_interval_end,
+            )
             self.save(da_fs, ref_time)
 
     def get_output_filename(self, forecast_ref_time: np.datetime64) -> Path:
@@ -326,13 +334,20 @@ class MetnoParser(CfParser):
         Isort = interpolator(opoints).astype(int)
         return Isort
 
-    def add_global_attributes(self, ds: xr.Dataset) -> xr.Dataset:
+    def add_global_attributes(
+        self,
+        ds: xr.Dataset,
+        source_interval_start: np.datetime64 | None = None,
+        source_interval_end: np.datetime64 | None = None,
+    ) -> xr.Dataset:
         """
         Add CF conventions to the dataset attributes.
 
         Parameters
         ----------
             ds : Input xarray Dataset to add conventions to.
+            source_interval_start : Start of the source (analysis) interval, optional.
+            source_interval_end : End of the source (analysis) interval, optional.
         Returns
         -------
             xarray Dataset with CF conventions added to attributes.
@@ -345,6 +360,14 @@ class MetnoParser(CfParser):
             + np.datetime_as_string(np.datetime64("now"), unit="s")
         )
         ds.attrs["Conventions"] = "CF-1.12"
+        if source_interval_start is not None:
+            ds.attrs["source_interval_start"] = np.datetime_as_string(
+                source_interval_start, unit="s"
+            )
+        if source_interval_end is not None:
+            ds.attrs["source_interval_end"] = np.datetime_as_string(
+                source_interval_end, unit="s"
+            )
         return ds
 
 
