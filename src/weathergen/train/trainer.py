@@ -238,6 +238,13 @@ class Trainer(TrainerBase):
 
         self.loss_calculator_val = LossCalculator(cf, self.test_cfg, VAL, device=self.devices[0])
 
+        # same as in run() — needed for the haar_wavelet_cell loss
+        self.loss_calculator_val._hp_nbours = self.model_params.hp_nbours.cpu()
+        for _, calc_list in self.loss_calculator_val.loss_calculators.items():
+            for _, calculator in calc_list:
+                if hasattr(calculator, "_hp_nbours"):
+                    calculator._hp_nbours = self.model_params.hp_nbours.cpu()
+
         if is_root():
             config.save(self.cf, mini_epoch=0)
 
@@ -362,6 +369,15 @@ class Trainer(TrainerBase):
         self.loss_calculator = LossCalculator(cf, self.training_cfg, TRAIN, device=self.device)
         val_cfg = self.validation_cfg
         self.loss_calculator_val = LossCalculator(cf, val_cfg, VAL, device=self.device)
+
+        # give the inner LossPhysical instances access to the healpix
+        # neighbourhood structure, needed by the haar_wavelet_cell loss
+        for _lc in [self.loss_calculator, self.loss_calculator_val]:
+            _lc._hp_nbours = self.model_params.hp_nbours.cpu()
+            for _, calc_list in _lc.loss_calculators.items():
+                for _, calculator in calc_list:
+                    if hasattr(calculator, "_hp_nbours"):
+                        calculator._hp_nbours = self.model_params.hp_nbours.cpu()
 
         # recover mini_epoch when continuing run
         if self.world_size_original is None:

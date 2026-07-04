@@ -502,6 +502,21 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                     self._stage, timestep_idx, tt_cells, tt_c, tt_t, idxs_inv, rdata.is_spoof
                 )
 
+                # populate per-cell point counts and the full local coordinate
+                # descriptor so the wavelet/cell losses can use them —
+                # get_target_values does not provide these and target_coords
+                # mode is not active in this path
+                if "target_coords" not in mode:
+                    (tc, tc_l) = self.tokenizer.get_target_coords(
+                        stream_info,
+                        rdata,
+                        token_data,
+                        (time_win_target.start, time_win_target.end),
+                        target_mask,
+                    )
+                    stream_data.target_coords_lens[timestep_idx] = tc_l
+                    stream_data.target_coords[timestep_idx] = tc
+
         return stream_data
 
     def _build_stream_data(

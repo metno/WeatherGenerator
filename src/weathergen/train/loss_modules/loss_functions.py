@@ -398,6 +398,7 @@ def haar_wavelet_mse_local_patch(
     detail_weight: float = 2.0,
     num_levels: int = 2,
     min_points: int = 50,
+    stream_name: str = "",
 ):
     """
     Per-cell 2D Haar wavelet MSE using local patch coordinates.

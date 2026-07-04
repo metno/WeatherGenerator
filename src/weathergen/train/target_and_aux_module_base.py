@@ -110,6 +110,7 @@ class PhysicalTargetAndAux(TargetAndAuxModuleBase):
             for step in output_idxs:
                 targets_cur, target_times_cur, target_coords_cur, meta_data = [], [], [], []
                 is_spoof, idxs_inv = [], []
+                target_coords_lens_cur, target_coords_local_cur = [], []   # add
                 for sample in batch.samples:
                     targets_cur += [sample.streams_data[stream_name].target_tokens[step]]
                     target_times_cur += [sample.streams_data[stream_name].target_times_raw[step]]
@@ -117,6 +118,13 @@ class PhysicalTargetAndAux(TargetAndAuxModuleBase):
                     idxs_inv += [sample.streams_data[stream_name].idxs_inv[step]]
                     meta_data += [sample.meta_info]
                     is_spoof += [sample.streams_data[stream_name].is_spoof(step)]
+                    # add these two lines:
+                    target_coords_lens_cur += [
+                        sample.streams_data[stream_name].target_coords_lens[step]
+                    ]
+                    target_coords_local_cur += [
+                        sample.streams_data[stream_name].target_coords[step]
+                    ]
 
                 targets_step = {
                     "target": targets_cur,
@@ -125,8 +133,10 @@ class PhysicalTargetAndAux(TargetAndAuxModuleBase):
                     "target_metda_data": meta_data,
                     "is_spoof": is_spoof,
                     "idxs_inv": idxs_inv,
+                    # add these two keys:
+                    "target_coords_lens": target_coords_lens_cur,
+                    "target_coords_local": target_coords_local_cur,
                 }
-
                 targets.add_physical_target(step, stream_name, targets_step)
 
         return targets
