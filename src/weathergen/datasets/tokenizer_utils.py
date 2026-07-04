@@ -20,6 +20,21 @@ NUM_GLOBAL_COORD_CHANNELS = 3
 # target coordinate features (non-finite values, dead channels, block magnitudes).
 _DEBUG_TARGET_COORDS = os.environ.get("WEATHERGEN_DEBUG_TARGET_COORDS", "0") == "1"
 
+# Set WEATHERGEN_ABLATE_CELL_COORDS=1 to zero out the 99 cell-relative geometry
+# channels (vertex-local coords, cell vertex geometry, neighbor-center offsets) in
+# the target coordinate features, keeping only stream_id, time encoding, geoinfos
+# and the smooth global R3 position. DIAGNOSTIC USE ONLY: this is shape-preserving
+# (identical tensor width and model architecture), so an ablated and a control run
+# are directly comparable. It removes the covariates that are discontinuous across
+# healpix cell boundaries; if grid artifacts vanish in a run trained with this flag,
+# the discontinuous encoding is their cause.
+_ABLATE_CELL_COORDS = os.environ.get("WEATHERGEN_ABLATE_CELL_COORDS", "0") == "1"
+if _ABLATE_CELL_COORDS:
+    _logger.warning(
+        "WEATHERGEN_ABLATE_CELL_COORDS=1: the 99 cell-relative target coordinate "
+        "channels are ZEROED. This is a diagnostic configuration, not a production one."
+    )
+
 from weathergen.common.io import IOReaderData
 from weathergen.datasets.utils import (
     locs_to_cell_coords_ctrs,
@@ -550,6 +565,13 @@ def get_target_coords_local(
         target_coords
     )
 
+    if _ABLATE_CELL_COORDS:
+        # Diagnostic ablation: zero exactly the channels that jump at healpix cell
+        # boundaries (zi = 0..98). stream_id/time/geoinfos (before geoinfo_offset)
+        # and the smooth global R3 tail (zi = 99..) are kept. Tensor shape is
+        # unchanged, so checkpoints and layer dimensions match the control run.
+        a[..., geoinfo_offset : geoinfo_offset + 99] = 0.0
+
     if _DEBUG_TARGET_COORDS:
         _debug_check_target_coords(a, stream_id, geoinfo_offset)
 
@@ -579,8 +601,9 @@ def _debug_check_target_coords(a: Tensor, stream_id, geoinfo_offset: int) -> Non
     dead = (a == 0.0).all(dim=0)
     # channel 0 (stream_id) can legitimately be 0 for stream 0; geoinfo/time channels
     # can legitimately be 0; geometry channels [geoinfo_offset:] should never all be 0
+    # (unless the cell-relative channels are deliberately zeroed by the ablation flag)
     dead_geometry = torch.nonzero(dead[geoinfo_offset:]).flatten() + geoinfo_offset
-    if len(dead_geometry) > 0:
+    if len(dead_geometry) > 0 and not _ABLATE_CELL_COORDS:
         _logger.warning(
             "target coords stream_id=%s: geometry channels identically zero: %s",
             stream_id,
