@@ -836,14 +836,20 @@ class Model(torch.nn.Module):
 
         lam = torch.zeros(len(hp_cell), K, dtype=torch.float32)
         lam.scatter_add_(1, col, torch.where(found, w4, torch.zeros_like(w4)))
-        n_missed = int((~found & (w4 > 1e-9)).sum())
+        missed_mask = ~found & (w4 > 1e-9)          # (N_pts, 4)
+        n_missed = int(missed_mask.sum())
         if n_missed > 0:
             # sampling gap in the candidate table: renormalize the matched mass
             # (continuity is broken only for these points; expected count: 0)
+            n_pts_missed = int(missed_mask.any(dim=-1).sum())
+            n_pts_total = len(hp_cell)
             logger.warning(
-                f"pou_blend: {n_missed} bilinear pixel(s) missing from candidate "
-                "table; weights renormalized for the affected points."
+                f"pou_blend [{stream_name}]: {n_missed} bilinear pixel(s) missing "
+                f"from candidate table; weights renormalized for "
+                f"{n_pts_missed}/{n_pts_total} points "
+                f"({100.0 * n_pts_missed / n_pts_total:.2f}%)."
             )
+
         lam = lam / lam.sum(dim=-1, keepdim=True).clamp(min=1e-12)
         lam = lam.to(dev)
 
@@ -860,18 +866,33 @@ class Model(torch.nn.Module):
             if not (lam_k > 0).any():
                 continue
             # KV pool gather for column k, mirroring the original tokens_nbors
-            # construction (incl. its per-batch index handling)
+            # construction (incl. its per-batch index handling).
             idxs_k = pools[k].to(dev).unsqueeze(0).repeat((batch_size, 1, 1)).flatten(0, 1)
-            toks_k = tokens_flat[idxs_k.flatten()].flatten(0, 1)
 
-            out_k = self.target_token_engines[stream_name](
-                latent=toks_k,
-                output=tc_tokens,
-                latent_lens=lens,
-                output_lens=tcs_lens,
-                coordinates=t_coords,
-            )
-            pred_k = self.pred_heads[stream_name](out_k)       # (ens, N_pts, C)
+            def _slot_forward(tokens_flat_, tc_tokens_, t_coords_, idxs_flat_):
+                # The gather is INSIDE the checkpoint so the large KV tensor
+                # (same size as tokens_nbors) is freed after this slot's forward
+                # and recomputed at backward. Without this, all K gathers plus
+                # per-slot activations stay resident simultaneously (~K x the
+                # readout memory), which OOMs on GPUs running near capacity.
+                toks_k_ = tokens_flat_[idxs_flat_].flatten(0, 1)
+                out_k_ = self.target_token_engines[stream_name](
+                    latent=toks_k_,
+                    output=tc_tokens_,
+                    latent_lens=lens,
+                    output_lens=tcs_lens,
+                    coordinates=t_coords_,
+                )
+                return self.pred_heads[stream_name](out_k_)
+
+            pred_k = checkpoint(
+                _slot_forward,
+                tokens_flat,
+                tc_tokens,
+                t_coords,
+                idxs_k.flatten(),
+                use_reentrant=False,
+            )                                                   # (ens, N_pts, C)
 
             w_k = lam_k.view(1, -1, 1).to(pred_k.dtype)
             pred_blend = pred_k * w_k if pred_blend is None else pred_blend + pred_k * w_k
