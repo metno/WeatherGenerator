@@ -120,6 +120,7 @@ class LossPhysical(LossModuleBase):
             "global_haar_wavelet_reshape",
             "global_haar_wavelet_reshape_geoweighted",
             "global_haar_wavelet_reshape_varweighted",
+            "global_haar_wavelet_reshape_varweighted_crps",
             "global_haar_ll_reshape_varweighted",
             "healpix_cell_mse",
             "global_fft_mse",
@@ -224,6 +225,7 @@ class LossPhysical(LossModuleBase):
         substep_masks: list[torch.Tensor],
         weights_channels: torch.Tensor,
         weights_locations: list[torch.Tensor],
+        loss_fct_params: dict | None = None,
     ):
         """
         Compute loss for given loss function
@@ -241,7 +243,9 @@ class LossPhysical(LossModuleBase):
             )
 
             loss, loss_chs = loss_fct(
-                target[mask_t], pred[:, mask_t], weights_channels, weights_locations[i_t]
+                target[mask_t], pred[:, mask_t], 
+                weights_channels, weights_locations[i_t],
+                **(loss_fct_params or {}),
             )
 
             # accumulate loss
@@ -430,6 +434,29 @@ class LossPhysical(LossModuleBase):
             stream_name=stream_name,
         )
 
+        @staticmethod
+        def _loss_global_haar_varweighted_crps(
+            target, pred, target_coords_raw, weights_channels,
+            stream_name="", template_path="",
+            num_levels=3, var_weight_epsilon=1e-3,
+            fair=True, normalization="std",
+        ):
+            if target.shape[0] == 0:
+                return (
+                    torch.tensor(0.0, device=target.device, requires_grad=True),
+                    torch.zeros(target.shape[-1], device=target.device),
+                )
+            target_coords_raw = target_coords_raw.to(target.device)
+            return loss_fns.global_haar_wavelet_reshape_varweighted_crps(
+                target, pred, target_coords_raw,
+                weights_channels=weights_channels, weights_points=None,
+                template_path=template_path,
+                num_levels=num_levels,
+                var_weight_epsilon=var_weight_epsilon,
+                fair=fair, normalization=normalization,
+                stream_name=stream_name,
+            )
+
     @staticmethod
     def _loss_global_haar_ll_varweighted(
         target, pred, target_coords_raw, weights_channels,
@@ -523,6 +550,8 @@ class LossPhysical(LossModuleBase):
         # initialize dictionaries for detailed loss tracking and standard deviation statistics
         # create tensor for each stream
         losses_all = defaultdict(dict)
+        stddev_all = defaultdict(dict)
+        _spread_acc: dict[str, list] = defaultdict(list)
 
         source2target_idxs, output_info, target2source_idxs, target_info = metadata
 
@@ -591,6 +620,11 @@ class LossPhysical(LossModuleBase):
                     # source -> target correspondence has to be unique
                     assert len(target_idx) == 1
                     target_idx = target_idx[0]
+
+                    if pred.shape[0] > 1 and not targets_is_spoof[target_idx] and pred.shape[1] > 0:
+                        _spread_acc[stream_name].append(
+                            pred.detach().to(torch.float32).std(dim=0).mean()
+                        )
 
                     # current target data
                     target = targets_batch[target_idx]
@@ -717,6 +751,15 @@ class LossPhysical(LossModuleBase):
                                    if k != "template_path"},
                             )
 
+                        elif loss_fct_name == "global_haar_wavelet_reshape_varweighted_crps":
+                            loss_lfct, loss_lfct_chs = self._loss_global_haar_varweighted_crps(
+                                target, pred, targets_coords_batch[target_idx],
+                                weights_channels, stream_name=stream_name,
+                                template_path=stream_info.get("template_path", ""),
+                                **{k: v for k, v in loss_fct_params.items()
+                                    if k != "template_path"},
+                            )
+
                         elif loss_fct_name == "global_haar_ll_reshape_varweighted":
                             loss_lfct, loss_lfct_chs = self._loss_global_haar_ll_varweighted(
                                 target, pred, targets_coords_batch[target_idx],
@@ -762,6 +805,7 @@ class LossPhysical(LossModuleBase):
                                 substep_masks,
                                 weights_channels,
                                 weights_locations,
+                                loss_fct_params,
                             )
                         # ---- end dispatch ----
 
@@ -829,6 +873,9 @@ class LossPhysical(LossModuleBase):
                             reordered_losses[stream_name][loss_fct_name]["avg"] += v
                             count += 1
                 reordered_losses[stream_name][loss_fct_name]["avg"] /= count
+
+        for sname, vals in _spread_acc.items():
+            stddev_all[sname]["stddev_avg"] = torch.stack(vals).mean()
 
         # Return all computed loss components encapsulated in a ModelLoss dataclass
         return LossValues(loss=loss, losses_all=reordered_losses, stddev_all=None)
