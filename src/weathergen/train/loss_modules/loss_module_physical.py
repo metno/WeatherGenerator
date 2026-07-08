@@ -434,28 +434,28 @@ class LossPhysical(LossModuleBase):
             stream_name=stream_name,
         )
 
-        @staticmethod
-        def _loss_global_haar_varweighted_crps(
-            target, pred, target_coords_raw, weights_channels,
-            stream_name="", template_path="",
-            num_levels=3, var_weight_epsilon=1e-3,
-            fair=True, normalization="std",
-        ):
-            if target.shape[0] == 0:
-                return (
-                    torch.tensor(0.0, device=target.device, requires_grad=True),
-                    torch.zeros(target.shape[-1], device=target.device),
-                )
-            target_coords_raw = target_coords_raw.to(target.device)
-            return loss_fns.global_haar_wavelet_reshape_varweighted_crps(
-                target, pred, target_coords_raw,
-                weights_channels=weights_channels, weights_points=None,
-                template_path=template_path,
-                num_levels=num_levels,
-                var_weight_epsilon=var_weight_epsilon,
-                fair=fair, normalization=normalization,
-                stream_name=stream_name,
+    @staticmethod
+    def _loss_global_haar_varweighted_crps(
+        target, pred, target_coords_raw, weights_channels,
+        stream_name="", template_path="",
+        num_levels=3, var_weight_epsilon=1e-3,
+        fair=True, normalization="std",
+    ):
+        if target.shape[0] == 0:
+            return (
+                torch.tensor(0.0, device=target.device, requires_grad=True),
+                torch.zeros(target.shape[-1], device=target.device),
             )
+        target_coords_raw = target_coords_raw.to(target.device)
+        return loss_fns.global_haar_wavelet_reshape_varweighted_crps(
+            target, pred, target_coords_raw,
+            weights_channels=weights_channels, weights_points=None,
+            template_path=template_path,
+            num_levels=num_levels,
+            var_weight_epsilon=var_weight_epsilon,
+            fair=fair, normalization=normalization,
+            stream_name=stream_name,
+        )
 
     @staticmethod
     def _loss_global_haar_ll_varweighted(

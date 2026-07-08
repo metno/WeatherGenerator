@@ -273,12 +273,15 @@ class MetnoParser(CfParser):
             _logger.info(f"Processing {channel}")
             values = all_values[:, Isort, i, :]
             if has_ens:
+                values = values.transpose(0, 2, 1)      # (T, P, M) -> (T, M, P)
+            else:
+                values = values[..., 0]
+            if has_ens:
                 new_shape = [len(times), Nmembers, len(y), len(x)]
                 dims =  ["time", "ensemble_member", "y", "x"]
             else:
                 new_shape = [len(times), len(y), len(x)]
                 dims =  ["time", "y", "x"]
-                values = values[..., 0]
 
             values = np.reshape(values, new_shape)
             attrs = {"coordinates": "longitude latitude"}

@@ -60,23 +60,39 @@ def get_data_worker(args: tuple) -> tuple[int, int, xr.DataArray]:
     #   dims = [ipoint, channel]
     #   coords: forecast_step, channel, valid_time, lat, lon
     npoints = data_arr.shape[0]
+    common_coords = {
+        "ipoint": np.arange(npoints),
+        "channel": channels,
+        "forecast_step": fstep,
+        "valid_time": ("ipoint", times_arr),
+        "lat": ("ipoint", coords_arr[:, 0]),
+        "lon": ("ipoint", coords_arr[:, 1]),
+    }
+    if data_arr.ndim == 3:   # (npoints, nchannels, nens)
+        da_result = xr.DataArray(
+            data_arr,
+            dims=["ipoint", "channel", "ensemble_member"],
+            coords={**common_coords, "ensemble_member": np.arange(data_arr.shape[2])},
+        )
+    else:                    # (npoints, nchannels)
+        da_result = xr.DataArray(data_arr, dims=["ipoint", "channel"], coords=common_coords)
 
     # Handle optional ensemble dimension: squeeze it out if present.
-    if data_arr.ndim == 3 and data_arr.shape[2] == 1:
-        data_arr = data_arr[:, :, 0]
-
-    da_result = xr.DataArray(
-        data_arr,
-        dims=["ipoint", "channel"],
-        coords={
-            "ipoint": np.arange(npoints),
-            "channel": channels,
-            "forecast_step": fstep,
-            "valid_time": ("ipoint", times_arr),
-            "lat": ("ipoint", coords_arr[:, 0]),
-            "lon": ("ipoint", coords_arr[:, 1]),
-        },
-    )
+#    if data_arr.ndim == 3 and data_arr.shape[2] == 1:
+#        data_arr = data_arr[:, :, 0]
+#
+#    da_result = xr.DataArray(
+#        data_arr,
+#        dims=["ipoint", "channel"],
+#        coords={
+#            "ipoint": np.arange(npoints),
+#            "channel": channels,
+#            "forecast_step": fstep,
+#            "valid_time": ("ipoint", times_arr),
+#            "lat": ("ipoint", coords_arr[:, 0]),
+#            "lon": ("ipoint", coords_arr[:, 1]),
+#        },
+#    )
 
     return (sample, fstep, da_result)
 
