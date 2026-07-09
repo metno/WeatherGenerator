@@ -76,11 +76,11 @@ dev = [
 [project.optional-dependencies]
 
 cpu = [
-  'torch==2.9.1',
+  'torch==2.12.1+cu126',
 ]
 
 gpu = [
-  "torch==2.9.1; sys_platform == 'linux'",
+  "torch==2.12.1+cu126; sys_platform == 'linux'",
   # flash-attn also has a torch dependency.
   "flash-attn",
 ]
