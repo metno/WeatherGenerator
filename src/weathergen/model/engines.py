@@ -723,6 +723,28 @@ class TargetPredictionEngineClassic(nn.Module):
         self.softcap = softcap
         self.tte = torch.nn.ModuleList()
 
+        # ---- sharpness-related AdaLN options (all default to original behavior) ----
+        # Fix 1: DiT-style zero-init + gated residual for the coordinate AdaLN.
+        self.adaln_zero_init = bool(self.cf.get("adaln_zero_init", False))
+        self.adaln_with_gate = bool(self.cf.get("adaln_with_gate", False))
+        # Fix 2: disable AdaLN entirely (plain LayerNorm on the query). The query
+        #        still carries position via the coordinate embedding, but blocks
+        #        are no longer coordinate-modulated. Tests whether AdaLN causes blur.
+        self.disable_adaln = bool(self.cf.get("disable_target_adaln", False))
+        # Fix 3: condition AdaLN on the *embedded* query q(p) (dim dims_embed[0])
+        #        instead of the raw ~110-dim coordinate vector, which is dominated
+        #        by discontinuous, tiny-magnitude cell-relative channels.
+        self.adaln_on_embedded_query = bool(self.cf.get("adaln_on_embedded_query", False))
+
+        if self.disable_adaln:
+            head_dim_aux = None
+            mlp_dim_aux = None
+        else:
+            head_dim_aux = (
+                self.dims_embed[0] if self.adaln_on_embedded_query else self.dim_coord_in
+            )
+            mlp_dim_aux = head_dim_aux if self.cf.pred_mlp_adaln else None
+
         for i in range(len(self.dims_embed) - 1):
             # Multi-Cross Attention Head
             self.tte.append(
@@ -738,9 +760,11 @@ class TargetPredictionEngineClassic(nn.Module):
                     norm_type=self.cf.norm_type,
                     qk_norm_type=self.cf.get("qk_norm_type", self.cf.norm_type),
                     softcap=self.softcap,
-                    dim_aux=self.dim_coord_in,
+                    dim_aux=head_dim_aux,
                     norm_eps=self.cf.norm_eps,
                     attention_dtype=get_dtype(self.cf.attention_dtype),
+                    adaln_zero_init=self.adaln_zero_init,
+                    adaln_with_gate=self.adaln_with_gate,
                 )
             )
 
@@ -755,9 +779,11 @@ class TargetPredictionEngineClassic(nn.Module):
                         with_flash=self.cf.with_flash_attention,
                         norm_type=self.cf.norm_type,
                         qk_norm_type=self.cf.get("qk_norm_type", self.cf.norm_type),
-                        dim_aux=self.dim_coord_in,
+                        dim_aux=head_dim_aux,
                         norm_eps=self.cf.norm_eps,
                         attention_dtype=get_dtype(self.cf.attention_dtype),
+                        adaln_zero_init=self.adaln_zero_init,
+                        adaln_with_gate=self.adaln_with_gate,
                     )
                 )
 
@@ -770,7 +796,7 @@ class TargetPredictionEngineClassic(nn.Module):
                     hidden_factor=self.tr_mlp_hidden_factor,
                     dropout_rate=0.1,  # Assuming dropout_rate is 0.1
                     norm_type=self.cf.norm_type,
-                    dim_aux=(self.dim_coord_in if self.cf.pred_mlp_adaln else None),
+                    dim_aux=mlp_dim_aux,
                     norm_eps=self.cf.mlp_norm_eps,
                 )
             )
@@ -780,7 +806,16 @@ class TargetPredictionEngineClassic(nn.Module):
         tcs_lens = output_lens
         tokens_stream = latent
         tokens_lens = latent_lens
-        tcs_aux = coordinates
+        # Fix 2/3: choose the AdaLN conditioning signal.
+        #   disable_adaln          -> None (plain LayerNorm inside the heads)
+        #   adaln_on_embedded_query-> the query tokens q(p) themselves
+        #   default                -> raw coordinate vector
+        if self.disable_adaln:
+            tcs_aux = None
+        elif self.adaln_on_embedded_query:
+            tcs_aux = tc_tokens
+        else:
+            tcs_aux = coordinates
 
         for ib, block in enumerate(self.tte):
             if self.cf.pred_self_attention and ib % 3 == 1:

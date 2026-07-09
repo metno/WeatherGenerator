@@ -41,6 +41,8 @@ class MultiSelfAttentionHeadVarlen(torch.nn.Module):
         norm_eps=1e-5,
         attention_dtype=torch.bfloat16,
         with_2d_rope=False,
+        adaln_zero_init: bool = False,
+        adaln_with_gate: bool = False,
     ):
         super(MultiSelfAttentionHeadVarlen, self).__init__()
 
@@ -60,7 +62,10 @@ class MultiSelfAttentionHeadVarlen(torch.nn.Module):
             norm = RMSNorm
 
         if dim_aux is not None:
-            self.lnorm = AdaLayerNorm(dim_embed, dim_aux, norm_eps=norm_eps)
+            self.lnorm = AdaLayerNorm(
+                dim_embed, dim_aux, norm_eps=norm_eps,
+                zero_init=adaln_zero_init, with_gate=adaln_with_gate,
+            )
         else:
             self.lnorm = norm(dim_embed, eps=norm_eps)
         self.proj_heads_q = torch.nn.Linear(dim_embed, num_heads * self.dim_head_proj, bias=False)
@@ -87,7 +92,12 @@ class MultiSelfAttentionHeadVarlen(torch.nn.Module):
     def forward(self, x, x_lens, ada_ln_aux=None, coords=None):
         if self.with_residual:
             x_in = x
-        x = self.lnorm(x) if ada_ln_aux is None else self.lnorm(x, ada_ln_aux)
+        gate = None
+        if ada_ln_aux is None:
+            x = self.lnorm(x)
+        else:
+            out = self.lnorm(x, ada_ln_aux)
+            x, gate = out if isinstance(out, tuple) else (out, None)
 
         # project onto heads and q,k,v and
         # ensure these are 4D tensors as required for flash attention
@@ -120,6 +130,8 @@ class MultiSelfAttentionHeadVarlen(torch.nn.Module):
 
         out = self.proj_out(outs.flatten(-2, -1))
 
+        if gate is not None:
+            out = gate * out
         if self.with_residual:
             out = out + x_in
 
@@ -319,6 +331,8 @@ class MultiCrossAttentionHeadVarlen(torch.nn.Module):
         dim_aux=None,
         norm_eps=1e-5,
         attention_dtype=torch.bfloat16,
+        adaln_zero_init: bool = False,
+        adaln_with_gate: bool = False,
     ):
         super(MultiCrossAttentionHeadVarlen, self).__init__()
 
@@ -336,7 +350,13 @@ class MultiCrossAttentionHeadVarlen(torch.nn.Module):
         self.dim_head_proj = dim_embed_q // num_heads if dim_head_proj is None else dim_head_proj
 
         if dim_aux is not None:
-            self.lnorm_in_q = AdaLayerNorm(dim_embed_q, dim_aux, norm_eps=norm_eps)
+            self.lnorm_in_q = AdaLayerNorm(
+                dim_embed_q,
+                dim_aux,
+                norm_eps=norm_eps,
+                zero_init=adaln_zero_init,
+                with_gate=adaln_with_gate,
+            )
         else:
             self.lnorm_in_q = norm(dim_embed_q, eps=norm_eps)
         self.lnorm_in_kv = norm(dim_embed_kv, eps=norm_eps)
@@ -369,7 +389,13 @@ class MultiCrossAttentionHeadVarlen(torch.nn.Module):
     def forward(self, x_q, x_kv, x_q_lens=None, x_kv_lens=None, ada_ln_aux=None):
         if self.with_residual:
             x_q_in = x_q
-        x_q = self.lnorm_in_q(x_q) if ada_ln_aux is None else self.lnorm_in_q(x_q, ada_ln_aux)
+        gate = None
+        if ada_ln_aux is None:
+            x_q = self.lnorm_in_q(x_q)
+        else:
+            out = self.lnorm_in_q(x_q, ada_ln_aux)
+            # AdaLayerNorm returns (x, gate) when with_gate is enabled, else x
+            x_q, gate = out if isinstance(out, tuple) else (out, None)
         x_kv = self.lnorm_in_kv(x_kv)
 
         # project onto heads and q,k,v and
@@ -401,6 +427,9 @@ class MultiCrossAttentionHeadVarlen(torch.nn.Module):
             assert False
 
         outs = self.proj_out(outs.flatten(-2, -1))
+        if gate is not None:
+            # gated residual (DiT-style): x <- x + g * sublayer(x)
+            outs = gate * outs
         if self.with_residual:
             outs = x_q_in + outs
 

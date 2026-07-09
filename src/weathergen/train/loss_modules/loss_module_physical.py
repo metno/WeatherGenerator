@@ -440,6 +440,7 @@ class LossPhysical(LossModuleBase):
         stream_name="", template_path="",
         num_levels=3, var_weight_epsilon=1e-3,
         fair=True, normalization="std",
+        ll_weight=0.0,
     ):
         if target.shape[0] == 0:
             return (

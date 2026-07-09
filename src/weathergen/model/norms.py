@@ -63,29 +63,67 @@ class RMSNorm(torch.nn.Module):
 
 class AdaLayerNorm(torch.nn.Module):
     """
-    AdaLayerNorm for embedding auxiliary information
+    AdaLayerNorm for embedding auxiliary information.
+
+    The coordinate vector `aux` is passed through a 2-layer MLP to predict a
+    per-channel scale and shift that modulate the LayerNorm'd input x:
+
+        x <- LN(x) * (1 + scale) + shift
+
+    Sharpness-related options (all default to the original behavior):
+
+    * zero_init (config: adaln_zero_init, default False)
+        Zero-initialize the *last* linear of the aux MLP so that at the start of
+        training scale = shift = 0 and the module reduces to a plain LayerNorm.
+        Coordinate modulation is then learned upward from a clean identity rather
+        than starting as large random perturbations that the rest of the network
+        must first suppress (this is the DiT initialization, Peebles & Xie 2022).
+
+    * with_gate (config: adaln_with_gate, default False)
+        Additionally predict a per-channel gate g (zero-initialized) and expose it
+        via the last returned value so the *caller* can apply a gated residual
+        x <- x + g * sublayer(...). Only meaningful together with a residual path;
+        AdaLayerNorm itself only returns g, it does not apply the residual.
     """
 
     def __init__(
-        self, dim_embed_x, dim_aux, norm_elementwise_affine: bool = False, norm_eps: float = 1e-5
+        self,
+        dim_embed_x,
+        dim_aux,
+        norm_elementwise_affine: bool = False,
+        norm_eps: float = 1e-5,
+        zero_init: bool = False,
+        with_gate: bool = False,
     ):
         super().__init__()
+
+        self.with_gate = with_gate
+        n_out = 3 if with_gate else 2  # scale, shift (, gate)
 
         # simple 2-layer MLP for embedding auxiliary information
         self.embed_aux = torch.nn.ModuleList()
         self.embed_aux.append(torch.nn.Linear(dim_aux, 4 * dim_aux))
         self.embed_aux.append(torch.nn.SiLU())
-        self.embed_aux.append(torch.nn.Linear(4 * dim_aux, 2 * dim_embed_x))
+        self.embed_aux.append(torch.nn.Linear(4 * dim_aux, n_out * dim_embed_x))
 
         self.norm = torch.nn.LayerNorm(dim_embed_x, norm_eps, norm_elementwise_affine)
 
-    def forward(self, x: torch.Tensor, aux: torch.Tensor | None = None) -> torch.Tensor:
+        if zero_init:
+            # scale=shift(=gate)=0 at init -> module starts as a plain LayerNorm
+            torch.nn.init.zeros_(self.embed_aux[-1].weight)
+            torch.nn.init.zeros_(self.embed_aux[-1].bias)
+
+    def forward(self, x: torch.Tensor, aux: torch.Tensor | None = None):
         for block in self.embed_aux:
             aux = block(aux)
+
+        if self.with_gate:
+            scale, shift, gate = aux.chunk(3, dim=-1)
+            x = self.norm(x) * (1 + scale) + shift
+            return x, gate
+
         scale, shift = aux.split(aux.shape[-1] // 2, dim=-1)
-
         x = self.norm(x) * (1 + scale) + shift
-
         return x
 
 
