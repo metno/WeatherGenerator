@@ -7,7 +7,7 @@ authors = [
     { name = "WeatherGenerator collaboration" }
 ]
 
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.12,<3.13"
 # TODO: split the plotting dependencies into their own dep groups, they are not required.
 dependencies = [
  'numpy~=2.2',
@@ -76,11 +76,11 @@ dev = [
 [project.optional-dependencies]
 
 cpu = [
-  'torch==2.6.0',
+  'torch==2.12.1',
 ]
 
 gpu = [
-  "torch==2.6.0; sys_platform == 'linux'",
+  "torch==2.12.1; sys_platform == 'linux'",
   # flash-attn also has a torch dependency.
   "flash-attn",
 ]
