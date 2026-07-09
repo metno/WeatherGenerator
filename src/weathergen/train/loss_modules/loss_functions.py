@@ -3095,6 +3095,7 @@ def global_haar_wavelet_reshape_varweighted_crps(
     var_weight_epsilon: float = 1e-3,
     fair: bool = True,
     normalization: str = "std",  # "std" | "var" | "none"
+    ll_weight: float = 0.0,
     stream_name: str = "",
 ):
     """
@@ -3251,6 +3252,12 @@ def global_haar_wavelet_reshape_varweighted_crps(
             # recurse on the approximation band (per member for pred)
             t_field = t_LL
             p_field = p_LL
+
+        # CRPS on the coarsest approximation band (unweighted — it is the
+        # large-scale content; inverse-variance weighting is not meaningful here)
+        if ll_weight > 0.0:
+            ll_loss = crps_kernel_pointwise(t_field, p_field, fair).mean()
+            level_loss = level_loss + ll_weight * ll_loss
 
         # per-channel normalization: CRPS is first-order, so scale by the
         # target field's std by default; "var" reproduces the MSE variant's

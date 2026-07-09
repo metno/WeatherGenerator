@@ -454,6 +454,7 @@ class LossPhysical(LossModuleBase):
             num_levels=num_levels,
             var_weight_epsilon=var_weight_epsilon,
             fair=fair, normalization=normalization,
+            ll_weight=ll_weight,
             stream_name=stream_name,
         )
 
