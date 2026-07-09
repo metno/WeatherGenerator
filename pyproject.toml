@@ -76,11 +76,11 @@ dev = [
 [project.optional-dependencies]
 
 cpu = [
-  'torch==2.12.1',
+  'torch==2.9.1',
 ]
 
 gpu = [
-  "torch==2.12.1; sys_platform == 'linux'",
+  "torch==2.9.1; sys_platform == 'linux'",
   # flash-attn also has a torch dependency.
   "flash-attn",
 ]
@@ -242,18 +242,18 @@ flash-attn = [
 ]
 
 
-torch = [
-# Explicit pin for GPU
-  { url = "https://download.pytorch.org/whl/cu126/torch-2.6.0%2Bcu126-cp312-cp312-linux_aarch64.whl", marker = 'sys_platform == "linux" and platform_machine == "aarch64"', extra="gpu" },
-  { url = "https://download.pytorch.org/whl/cu126/torch-2.6.0%2Bcu126-cp312-cp312-manylinux_2_28_x86_64.whl", marker = 'sys_platform == "linux"  and platform_machine == "x86_64"', extra="gpu" },
-# Explicit pin for CPU.
-  { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp312-cp312-linux_x86_64.whl",marker = "sys_platform == 'linux' and platform_machine == 'x86_64'",extra = "cpu" },
-  { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp312-cp312-manylinux_2_28_aarch64.whl",marker = "sys_platform == 'linux' and platform_machine == 'aarch64'",extra = "cpu" },
-  { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0-cp312-none-macosx_11_0_arm64.whl",marker = "sys_platform == 'darwin'", extra="cpu" },
-  # No acceleration for now.
-  # TODO: explore pytorch + metal backend
-  { index = "pytorch-cpu", marker = "sys_platform == 'darwin'", extra="gpu"},
-]
+#torch = [
+## Explicit pin for GPU
+#  { url = "https://download.pytorch.org/whl/cu126/torch-2.6.0%2Bcu126-cp312-cp312-linux_aarch64.whl", marker = 'sys_platform == "linux" and platform_machine == "aarch64"', extra="gpu" },
+#  { url = "https://download.pytorch.org/whl/cu126/torch-2.6.0%2Bcu126-cp312-cp312-manylinux_2_28_x86_64.whl", marker = 'sys_platform == "linux"  and platform_machine == "x86_64"', extra="gpu" },
+## Explicit pin for CPU.
+#  { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp312-cp312-linux_x86_64.whl",marker = "sys_platform == 'linux' and platform_machine == 'x86_64'",extra = "cpu" },
+#  { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0%2Bcpu-cp312-cp312-manylinux_2_28_aarch64.whl",marker = "sys_platform == 'linux' and platform_machine == 'aarch64'",extra = "cpu" },
+#  { url = "https://download.pytorch.org/whl/cpu/torch-2.6.0-cp312-none-macosx_11_0_arm64.whl",marker = "sys_platform == 'darwin'", extra="cpu" },
+#  # No acceleration for now.
+#  # TODO: explore pytorch + metal backend
+#  { index = "pytorch-cpu", marker = "sys_platform == 'darwin'", extra="gpu"},
+#]
 # branch = "feature/any-zarr-version-in-pyproject/"
 anemoi-datasets = { git = "https://github.com/tjhunter/anemoi-datasets", tag = "0.0.1"}
 
