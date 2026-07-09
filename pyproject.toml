@@ -191,10 +191,10 @@ conflicts = [
 ]
 
 
-[[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
-explicit = true
+#[[tool.uv.index]]
+#name = "pytorch-cu126"
+#url = "https://download.pytorch.org/whl/cu126"
+#explicit = true
 
 
 [tool.pyrefly]
@@ -218,10 +218,10 @@ not-callable = false
 
 
 
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
+#[[tool.uv.index]]
+#name = "pytorch-cpu"
+#url = "https://download.pytorch.org/whl/cpu"
+#explicit = true
 
 [tool.uv.sources]
 weathergen-common = { workspace = true }
