@@ -37,7 +37,7 @@ class SelfAttentionBlock(nn.Module):
             **kwargs["attention_kwargs"],
         )
         if self.with_adanorm:
-            self.mhsa_block = AdaLayerNormLayer(dim, dim_aux, self.mhsa, dropout_rate)
+            self.mhsa_block = AdaLayerNormLayer(dim, dim_aux, self.mhsa, dropout_rate=dropout_rate)
         else:
             self.ln_sa = nn.LayerNorm(dim, eps=kwargs["attention_kwargs"]["norm_eps"])
             self.mhsa_block = lambda x, _, **kwargs: self.mhsa(self.ln_sa(x), **kwargs) + x
@@ -53,9 +53,9 @@ class SelfAttentionBlock(nn.Module):
         )
         if self.with_adanorm:
             self.mlp_fn = lambda x, **kwargs: self.mlp(x)
-            self.mlp_block = AdaLayerNormLayer(dim, dim_aux, self.mlp_fn, dropout_rate)
+            self.mlp_block = AdaLayerNormLayer(dim, dim_aux, self.mlp_fn, dropout_rate=dropout_rate)
         else:
-            self.ln_mlp = nn.LayerNorm(norm_eps=kwargs["attention_kwargs"]["norm_eps"])
+            self.ln_mlp = nn.LayerNorm(dim, eps=kwargs["attention_kwargs"]["norm_eps"])
             self.mlp_block = lambda x, _, **kwargs: self.mlp(self.ln_mlp(x), None, **kwargs) + x
 
         self.initialise_weights()
@@ -78,7 +78,7 @@ class SelfAttentionBlock(nn.Module):
         # we have aux_lens as arg to be consistent with the CrossAttentionBlock
         assert self.with_adanorm ^ (aux is None), "Conditioning is not being used"
         x = self.mhsa_block(x, aux, x_lens=x_lens)
-        x = self.mlp_block(x, aux)
+        x = self.mlp_block(x, aux, x_lens=x_lens)
         return x
 
 
@@ -104,7 +104,7 @@ class CrossAttentionBlock(nn.Module):
 
         self.with_adanorm = with_adanorm
         self.with_self_attn = with_self_attn
-        self.with_mlp = with_self_attn
+        self.with_mlp = with_mlp  # was: with_self_attn (typo)
 
         if with_self_attn:
             self.mhsa = MultiSelfAttentionHeadVarlen(
@@ -114,7 +114,7 @@ class CrossAttentionBlock(nn.Module):
                 **kwargs["attention_kwargs"],
             )
             if self.with_adanorm:
-                self.mhsa_block = AdaLayerNormLayer(dim_q, dim_aux, self.mhsa, dropout_rate)
+                self.mhsa_block = AdaLayerNormLayer(dim_q, dim_aux, self.mhsa, dropout_rate=dropout_rate)
             else:
                 self.ln_sa = nn.LayerNorm(dim_q, eps=kwargs["attention_kwargs"]["norm_eps"])
                 self.mhsa_block = lambda x, _, **kwargs: self.mhsa(self.ln_sa(x), **kwargs) + x
@@ -126,12 +126,20 @@ class CrossAttentionBlock(nn.Module):
             with_residual=False,
             **kwargs["attention_kwargs"],
         )
+
+        # adapter: the AdaLayerNormLayer wrapper (and this block's forward) pass
+        # x_lens, but MultiCrossAttentionHeadVarlen.forward expects x_q_lens
+        def _cross_attn_fn(x, x_kv=None, x_lens=None, x_kv_lens=None):
+            return self.cross_attn(x, x_kv, x_q_lens=x_lens, x_kv_lens=x_kv_lens)
+
         if self.with_adanorm:
-            self.cross_attn_block = AdaLayerNormLayer(dim_q, dim_aux, self.cross_attn, dropout_rate)
+            self.cross_attn_block = AdaLayerNormLayer(
+                dim_q, dim_aux, _cross_attn_fn, dropout_rate=dropout_rate
+            )
         else:
             self.ln_ca = nn.LayerNorm(dim_q, eps=kwargs["attention_kwargs"]["norm_eps"])
             self.cross_attn_block = (
-                lambda x, _, **kwargs: self.cross_attn(self.ln_ca(x), **kwargs) + x
+                lambda x, _, **kwargs: _cross_attn_fn(self.ln_ca(x), **kwargs) + x
             )
 
         if self.with_mlp:
@@ -145,7 +153,7 @@ class CrossAttentionBlock(nn.Module):
             )
             if self.with_adanorm:
                 self.mlp_fn = lambda x, **kwargs: self.mlp(x)
-                self.mlp_block = AdaLayerNormLayer(dim_q, dim_aux, self.mlp_fn, dropout_rate)
+                self.mlp_block = AdaLayerNormLayer(dim_q, dim_aux, self.mlp_fn, dropout_rate=dropout_rate)
             else:
                 self.ln_mlp = nn.LayerNorm(dim_q, eps=kwargs["attention_kwargs"]["norm_eps"])
                 self.mlp_block = lambda x, _, **kwargs: self.mlp(self.ln_mlp(x)) + x
@@ -189,7 +197,7 @@ class OriginalPredictionBlock(nn.Module):
         attention_kwargs,
         tr_dim_head_proj,
         tr_mlp_hidden_factor,
-        tro_type,
+        tro_type=None,
         mlp_norm_eps=1e-6,
     ):
         super().__init__()
@@ -201,7 +209,10 @@ class OriginalPredictionBlock(nn.Module):
 
         self.block = nn.ModuleList()
 
-        target_readout_num_heads = next(self.cf.streams.values())["target_readout"]["num_heads"]
+        # use the per-stream value passed by the caller
+        # (was: next(self.cf.streams.values())[...] -- TypeError on dict_values and
+        #  semantically wrong: it would take the first stream's num_heads)
+        target_readout_num_heads = num_heads
 
         # Multi-Cross Attention Head
         self.block.append(
@@ -233,7 +244,7 @@ class OriginalPredictionBlock(nn.Module):
                     with_qk_lnorm=True,
                     with_flash=self.cf.with_flash_attention,
                     norm_type=self.cf.norm_type,
-                    qk_norm_type=self.cf.qk_norm_type,
+                    qk_norm_type=self.cf.get("qk_norm_type", self.cf.norm_type),
                     dim_aux=dim_aux,
                     norm_eps=self.cf.norm_eps,
                     attention_dtype=get_dtype(self.cf.attention_dtype),

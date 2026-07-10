@@ -457,11 +457,24 @@ class Model(torch.nn.Module):
                         )
                     else:
                         # target prediction engines
+                        # By default, decoder_type == "PerceiverIOCoordConditioning"
+                        # routes to TargetPredictionEngineClassic; any other
+                        # decoder_type routes to TargetPredictionEngine (which
+                        # dispatches internally on decoder_type).
+                        # Setting use_target_prediction_engine: true in the config
+                        # forces TargetPredictionEngine also for
+                        # PerceiverIOCoordConditioning (OriginalPredictionBlock path).
+                        use_tpe = cf.get("use_target_prediction_engine", False)
                         tte_version = (
                             TargetPredictionEngine
-                            if cf.decoder_type != "PerceiverIOCoordConditioning"
+                            if (cf.decoder_type != "PerceiverIOCoordConditioning" or use_tpe)
                             else TargetPredictionEngineClassic
                         )
+                        if is_root():
+                            logger.info(
+                                f"{stream_name}: target readout engine = "
+                                f"{tte_version.__name__} (decoder_type={cf.decoder_type})"
+                            )
                         tte = tte_version(
                             cf,
                             dims_embed,
@@ -836,20 +849,14 @@ class Model(torch.nn.Module):
 
         lam = torch.zeros(len(hp_cell), K, dtype=torch.float32)
         lam.scatter_add_(1, col, torch.where(found, w4, torch.zeros_like(w4)))
-        missed_mask = ~found & (w4 > 1e-9)          # (N_pts, 4)
-        n_missed = int(missed_mask.sum())
+        n_missed = int((~found & (w4 > 1e-9)).sum())
         if n_missed > 0:
             # sampling gap in the candidate table: renormalize the matched mass
             # (continuity is broken only for these points; expected count: 0)
-            n_pts_missed = int(missed_mask.any(dim=-1).sum())
-            n_pts_total = len(hp_cell)
             logger.warning(
-                f"pou_blend [{stream_name}]: {n_missed} bilinear pixel(s) missing "
-                f"from candidate table; weights renormalized for "
-                f"{n_pts_missed}/{n_pts_total} points "
-                f"({100.0 * n_pts_missed / n_pts_total:.2f}%)."
+                f"pou_blend: {n_missed} bilinear pixel(s) missing from candidate "
+                "table; weights renormalized for the affected points."
             )
-
         lam = lam / lam.sum(dim=-1, keepdim=True).clamp(min=1e-12)
         lam = lam.to(dev)
 
@@ -885,14 +892,25 @@ class Model(torch.nn.Module):
                 )
                 return self.pred_heads[stream_name](out_k_)
 
-            pred_k = checkpoint(
-                _slot_forward,
-                tokens_flat,
-                tc_tokens,
-                t_coords,
-                idxs_k.flatten(),
-                use_reentrant=False,
-            )                                                   # (ens, N_pts, C)
+            # Memory/compat trade-off: wrapping the slot in torch.utils.checkpoint
+            # frees the large gathered KV between slots (recomputed at backward),
+            # but under FSDP2 the backward-time recomputation runs outside the
+            # FSDP hooks that unshard the DTensor parameters, producing
+            # "got mixed torch.Tensor and DTensor" (nested non-reentrant
+            # checkpointing + FSDP2 is not supported). So: checkpoint only when
+            # the model is not FSDP-sharded; under FSDP2 call directly and rely
+            # on the engine's internal per-layer checkpoints.
+            if self.cf.get("with_fsdp", False) and self.cf.get("with_ddp", False):
+                pred_k = _slot_forward(tokens_flat, tc_tokens, t_coords, idxs_k.flatten())
+            else:
+                pred_k = checkpoint(
+                    _slot_forward,
+                    tokens_flat,
+                    tc_tokens,
+                    t_coords,
+                    idxs_k.flatten(),
+                    use_reentrant=False,
+                )                                               # (ens, N_pts, C)
 
             w_k = lam_k.view(1, -1, 1).to(pred_k.dtype)
             pred_blend = pred_k * w_k if pred_blend is None else pred_blend + pred_k * w_k

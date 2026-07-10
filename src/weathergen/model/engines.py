@@ -842,7 +842,7 @@ class TargetPredictionEngine(nn.Module):
         tr_dim_head_proj,
         tr_mlp_hidden_factor,
         softcap,
-        stream_name: str,
+        stream_config: dict,
     ):
         """
         Initialize the TargetPredictionEngine with the configuration.
@@ -853,6 +853,9 @@ class TargetPredictionEngine(nn.Module):
         :param tr_dim_head_proj: Dimension for head projection.
         :param tr_mlp_hidden_factor: Hidden factor for the MLP layers.
         :param softcap: Softcap value for the attention layers.
+        :param stream_config: Per-stream config dict (provides name and
+            target_readout.num_heads); same interface as
+            TargetPredictionEngineClassic.
 
         the decoder_type decides the how the conditioning is done
 
@@ -865,7 +868,7 @@ class TargetPredictionEngine(nn.Module):
             LayerNorm that does not scale after the layer is applied
         """
         super(TargetPredictionEngine, self).__init__()
-        self.name = f"TargetPredictionEngine_{stream_name}"
+        self.name = f"TargetPredictionEngine_{stream_config['name']}"
 
         self.cf = cf
         self.dims_embed = dims_embed
@@ -880,14 +883,26 @@ class TargetPredictionEngine(nn.Module):
             OmegaConf.create({"decoder_type": "PerceiverIOCoordConditioning"}), self.cf
         )
 
+        # dim_aux inside the attention heads:
+        # - PerceiverIOCoordConditioning: the heads themselves carry the coordinate
+        #   AdaLayerNorm, so dim_aux = dim_coord_in and the coords are passed at call.
+        # - block-based types (PerceiverIO, *Conditioning): conditioning is applied by
+        #   the wrapper (AdaLayerNormLayer) around the heads; the inner heads must use
+        #   a plain LayerNorm, i.e. dim_aux=None (otherwise they build an AdaLayerNorm
+        #   that never receives an aux and crash at forward).
+        head_dim_aux = (
+            self.dim_coord_in
+            if self.cf.decoder_type == "PerceiverIOCoordConditioning"
+            else None
+        )
         attention_kwargs = {
             "with_qk_lnorm": True,
             "dropout_rate": 0.1,  # Assuming dropout_rate is 0.1
             "with_flash": self.cf.with_flash_attention,
             "norm_type": self.cf.norm_type,
-            "qk_norm_type": self.cf.qk_norm_type,
+            "qk_norm_type": self.cf.get("qk_norm_type", self.cf.norm_type),
             "softcap": self.softcap,
-            "dim_aux": self.dim_coord_in,
+            "dim_aux": head_dim_aux,
             "norm_eps": self.cf.norm_eps,
             "attention_dtype": get_dtype(self.cf.attention_dtype),
         }
@@ -899,7 +914,10 @@ class TargetPredictionEngine(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, 9, self.cf.ae_global_dim_embed))
         dim_aux = self.cf.ae_global_dim_embed
 
-        target_readout_num_heads = next(self.cf.streams.values())["target_readout"]["num_heads"]
+        # per-stream number of readout heads
+        # (was: next(self.cf.streams.values())[...] -- TypeError on dict values and
+        #  semantically wrong: it took the FIRST stream's num_heads for every stream)
+        target_readout_num_heads = stream_config["target_readout"]["num_heads"]
         for ith, dim in enumerate(self.dims_embed[:-1]):
             if self.cf.decoder_type == "PerceiverIO":
                 # a single cross attention layer as per https://arxiv.org/pdf/2107.14795
@@ -912,6 +930,7 @@ class TargetPredictionEngine(nn.Module):
                         with_self_attn=False,
                         with_adanorm=False,
                         with_mlp=False,
+                        dropout_rate=0.1,
                         attention_kwargs=attention_kwargs,
                     )
                 )
@@ -975,16 +994,36 @@ class TargetPredictionEngine(nn.Module):
                 )
 
     def forward(self, latent, output, latent_lens, output_lens, coordinates):
-        latent = (
-            self.dropout(self.latent_in_norm(latent + self.pos_embed))
-            if self.cf.decoder_type != "PerceiverIOCoordConditioning"
-            else latent
-        )
+        # Today's Model.predict_decoders passes the latent as a flat 2-D tensor of
+        # shape (num_cells_total * 9 * nq, D) with per-cell varlen segments of
+        # length 9 (see tokens_nbors construction / tokens_nbors_lens).  This class
+        # was written for a 3-D (num_cells, 9, D) layout (pos_embed addition,
+        # latent[:, 0] aux slicing, flatten(0, 1)).  Recover that layout here so
+        # both conventions work:
+        nq = int(self.cf.get("ae_local_num_queries", 1))
+        d = latent.shape[-1]
+        if latent.dim() == 2:
+            # (cells*9*nq, D) -> (cells, 9, nq, D)
+            latent = latent.reshape(-1, 9, nq, d)
+        elif latent.dim() == 3:
+            # legacy (cells, 9, D) -> (cells, 9, 1, D)
+            latent = latent.unsqueeze(2)
+
+        if self.cf.decoder_type != "PerceiverIOCoordConditioning":
+            # per-neighbor-slot positional embedding, broadcast over the nq queries
+            latent = self.dropout(self.latent_in_norm(latent + self.pos_embed.unsqueeze(2)))
+
+        # per-cell conditioning vector for the block-based decoder types:
+        # first neighbor slot (the cell itself), first query token
+        latent_aux = latent[:, 0, 0]
+        # flat 2-D rows for the varlen attention inside the blocks
+        latent_flat = latent.flatten(0, 2)
+
         for layer in self.tte:
             if isinstance(layer, OriginalPredictionBlock):
                 output = checkpoint(
                     layer,
-                    latent=latent.flatten(0, 1),
+                    latent=latent_flat,
                     output=output,
                     coords=coordinates,
                     latent_lens=latent_lens,
@@ -995,9 +1034,9 @@ class TargetPredictionEngine(nn.Module):
                 output = checkpoint(
                     layer,
                     x=output,
-                    x_kv=latent.flatten(0, 1),
+                    x_kv=latent_flat,
                     x_lens=output_lens,
-                    aux=latent[:, 0],
+                    aux=latent_aux,
                     x_kv_lens=latent_lens,
                     use_reentrant=False,
                 )
@@ -1006,7 +1045,7 @@ class TargetPredictionEngine(nn.Module):
                     layer,
                     x=output,
                     x_lens=output_lens,
-                    aux=latent[:, 0],
+                    aux=latent_aux,
                     use_reentrant=False,
                 )
         output = (
