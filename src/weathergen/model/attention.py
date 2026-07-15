@@ -113,22 +113,52 @@ class MultiSelfAttentionHeadVarlen(torch.nn.Module):
 
         # set dropout rate according to training/eval mode as required by flash_attn
         dropout_rate = self.dropout_rate if self.training else 0.0
-
         cum_x_lens = torch.cumsum(x_lens, 0, dtype=torch.int32)
-        # ordering of tensors (seq, heads, embed) (which differs from torch's flash attention implt)
-        outs = flash_attn_varlen_func(
-            qs,
-            ks,
-            vs,
-            cum_x_lens,
-            cum_x_lens,
-            x_lens.max(),
-            x_lens.max(),
-            softcap=self.softcap,
-            dropout_p=dropout_rate,
-        )
+
+        # Guard against zero-length sequences (flash_attn fails on them)
+        valid_mask = x_lens > 0
+        if valid_mask.any():
+            valid_lens = x_lens[valid_mask]
+            cum_valid_lens = torch.cumsum(valid_lens, 0, dtype=torch.int32)
+            keep = torch.cat([
+                torch.arange(
+                    cum_x_lens[i - 1] if i > 0 else 0, cum_x_lens[i], device=qs.device
+                )
+                for i, v in enumerate(valid_mask) if v
+            ])
+            # ordering of tensors (seq, heads, embed) (differs from torch's flash attention impl)
+            valid_outs = flash_attn_varlen_func(
+                qs[keep],
+                ks[keep],
+                vs[keep],
+                cum_valid_lens,
+                cum_valid_lens,
+                valid_lens.max(),
+                valid_lens.max(),
+                softcap=self.softcap,
+                dropout_p=dropout_rate,
+            )
+            outs = torch.zeros_like(qs)
+            outs[keep] = valid_outs
+        else:
+            outs = torch.zeros_like(qs)
 
         out = self.proj_out(outs.flatten(-2, -1))
+
+        # ordering of tensors (seq, heads, embed) (which differs from torch's flash attention implt)
+#        outs = flash_attn_varlen_func(
+#            qs,
+#            ks,
+#            vs,
+#            cum_x_lens,
+#            cum_x_lens,
+#            x_lens.max(),
+#            x_lens.max(),
+#            softcap=self.softcap,
+#            dropout_p=dropout_rate,
+#        )
+#
+#        out = self.proj_out(outs.flatten(-2, -1))
 
         if gate is not None:
             out = gate * out
@@ -409,22 +439,70 @@ class MultiCrossAttentionHeadVarlen(torch.nn.Module):
         # set dropout rate according to training/eval mode as required by flash_attn
         dropout_rate = self.dropout_rate if self.training else 0.0
 
+#        if x_kv_lens is not None:
+#            cum_x_q_lens = torch.cumsum(x_q_lens, 0, dtype=torch.int32)
+#            cum_x_kv_lens = torch.cumsum(x_kv_lens, 0, dtype=torch.int32)
+#
+#            print(f"qs shape: {qs.shape}, dtype: {qs.dtype}")  # [total_tokens, n_heads, d_head]
+#            print(f"max_seqlen_q: {x_q_lens.max()}, max_seqlen_k: {x_kv_lens.max()}")
+#            seqlens = x_q_lens
+#            print(f"min seqlen: {seqlens.min()}, max: {seqlens.max()}")
+#            print(f"dim_head_proj: {self.dim_head_proj}")
+#
+#            outs = flash_attn_varlen_func(
+#                qs,
+#                ks,
+#                vs,
+#                cum_x_q_lens,
+#                cum_x_kv_lens,
+#                x_q_lens.max(),
+#                x_kv_lens.max(),
+#                softcap=self.softcap,
+#                dropout_p=dropout_rate,
+#            )
+#        else:
+#            assert False
         if x_kv_lens is not None:
             cum_x_q_lens = torch.cumsum(x_q_lens, 0, dtype=torch.int32)
             cum_x_kv_lens = torch.cumsum(x_kv_lens, 0, dtype=torch.int32)
-            outs = flash_attn_varlen_func(
-                qs,
-                ks,
-                vs,
-                cum_x_q_lens,
-                cum_x_kv_lens,
-                x_q_lens.max(),
-                x_kv_lens.max(),
-                softcap=self.softcap,
-                dropout_p=dropout_rate,
-            )
-        else:
-            assert False
+
+            # A sequence is valid only if BOTH q and kv are non-zero
+            valid_mask = (x_q_lens > 0) & (x_kv_lens > 0)
+
+            if valid_mask.any():
+                valid_q_lens = x_q_lens[valid_mask]
+                valid_kv_lens = x_kv_lens[valid_mask]
+                cum_valid_q_lens = torch.cumsum(valid_q_lens, 0, dtype=torch.int32)
+                cum_valid_kv_lens = torch.cumsum(valid_kv_lens, 0, dtype=torch.int32)
+
+                # Select only tokens from valid sequences
+                # Build index of which tokens to keep
+                q_keep = torch.cat([
+                    torch.arange(cum_x_q_lens[i-1] if i > 0 else 0, cum_x_q_lens[i], device=qs.device)
+                    for i, v in enumerate(valid_mask) if v
+                ])
+                kv_keep = torch.cat([
+                    torch.arange(cum_x_kv_lens[i-1] if i > 0 else 0, cum_x_kv_lens[i], device=ks.device)
+                    for i, v in enumerate(valid_mask) if v
+                ])
+
+                valid_outs = flash_attn_varlen_func(
+                    qs[q_keep],
+                    ks[kv_keep],
+                    vs[kv_keep],
+                    cum_valid_q_lens,
+                    cum_valid_kv_lens,
+                    valid_q_lens.max(),
+                    valid_kv_lens.max(),
+                    softcap=self.softcap,
+                    dropout_p=dropout_rate,
+                )
+
+                # Scatter results back into full output tensor
+                outs = torch.zeros_like(qs)
+                outs[q_keep] = valid_outs
+            else:
+                outs = torch.zeros_like(qs)
 
         outs = self.proj_out(outs.flatten(-2, -1))
         if gate is not None:

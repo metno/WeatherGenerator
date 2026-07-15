@@ -1,0 +1,31 @@
+train : 
+  plot :
+    q7ur75dg : 
+      slurm_id: 987050
+      description: "e0"
+      eval: vgbndhco
+    cs5r6jj2 : 
+      slurm_id: 987052
+      description: "e1"
+      eval: vgbndhco
+    h324ro85 : 
+      slurm_id: 987056
+      description: "e2"
+      eval: vgbndhco
+    rqtcbquc : 
+      slurm_id: 987058
+      description: "e3"
+      eval: vgbndhco
+    huu9gdad : 
+      slurm_id: 987060
+      description: "e4"
+      eval: vgbndhco
+    bnep6c2t : 
+      slurm_id: 989272
+      description: "e5"
+      eval: vgbndhco
+    v0wxilno : 
+      slurm_id: 990248
+      description: "e6"
+      eval: vgbndhco
+
