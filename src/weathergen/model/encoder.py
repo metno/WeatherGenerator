@@ -42,6 +42,7 @@ class EncoderModule(torch.nn.Module):
         self.cf = cf
 
         self.healpix_level = cf.healpix_level
+        self.domain = Domain.from_config(cf)
         self.num_healpix_cells = len(Domain.from_config(cf))
 
         self.cf = cf
