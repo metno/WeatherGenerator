@@ -38,6 +38,8 @@ from weathergen.readers_extra.registry import get_extra_reader
 from weathergen.train.utils import Stage, get_batch_size_from_config
 from weathergen.utils.distributed import is_root
 
+from weathergen.datasets.domain import Domain
+
 type AnyDataReader = DataReaderBase | DataReaderAnemoi | DataReaderObs
 type StreamName = str
 
@@ -106,11 +108,19 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self.world_size = cf.world_size
         self.repeat_data = cf.data_loading.get("repeat_data_in_mini_epoch", False)
 
-        # initialise healpic
+        # initialise healpix
         self.healpix_level = cf.healpix_level
-        self.num_healpix_cells = 12 * 4**self.healpix_level
-        self.masker = Masker(cf.healpix_level, stage, cf.streams, self.mode_cfg)
-        self.tokenizer = TokenizerMasking(cf.healpix_level, self.masker)
+        # The domain is the single source of truth for which cells exist. For a
+        # global run (no `domain:` block in the config) len(domain) == 12 * 4**hl
+        # and every mapping below is the identity.
+        self.domain = Domain.from_config(cf)                            # <-- ADD
+        self.num_healpix_cells = len(self.domain)                       # <-- CHANGE
+        self.masker = Masker(
+            cf.healpix_level, stage, cf.streams, self.mode_cfg, domain=self.domain   # <-- ADD
+        )
+        self.tokenizer = TokenizerMasking(
+            cf.healpix_level, self.masker, domain=self.domain           # <-- ADD
+        )
 
         forecast_cfg = FORECAST_DEFAULTS | OmegaConf.to_object(mode_cfg.get("forecast", {}))
         self.output_offset = forecast_cfg["offset"]
@@ -231,6 +241,13 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 "stream_info": stream_info,
                 "stage": self._stage,
             }
+            # ADD -- only pass `domain` when it actually restricts anything, so that
+            # (a) global runs are byte-for-byte unchanged and (b) any custom reader
+            # from get_extra_reader() that does not accept a `domain` kwarg keeps
+            # working. Readers below all default domain=None.
+            if not self.domain.is_global:
+                kwargs["domain"] = self.domain
+
             dataset: type[AnyDataReader] | None = None
             match stream_info["type"]:
                 case "obs":
@@ -608,6 +625,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                     time_win.start,
                     stream_ds[0].get_geoinfo_size(),
                     len(stream_ds[0].mean[stream_ds[0].source_idx]),
+                    domain=self.domain
                 )
                 rdata.is_spoof = True
 
@@ -630,6 +648,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                     time_win.start,
                     stream_ds[0].get_geoinfo_size(),
                     len(stream_ds[0].mean[stream_ds[0].target_idx]),
+                    domain=self.domain,
                 )
                 rdata.is_spoof = True
 
@@ -823,7 +842,12 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
                 # skip completely empty batch item or when all targets are empty -> no grad
                 if not_valid:
-                    logger.warning(f"Skipping empty batch with idx={idx}.")
+                    logger.warning(
+                        f"Skipping empty batch with idx={idx}. "
+                        f"sources_empty={batch.sources_empty()} "
+                        f"is_nan={batch.is_nan()} "
+                        f"targets_empty={batch.targets_empty()}"
+                    )
                 else:
                     break
 

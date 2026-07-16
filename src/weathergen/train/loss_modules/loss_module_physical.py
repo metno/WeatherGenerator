@@ -632,6 +632,25 @@ class LossPhysical(LossModuleBase):
                     target = targets_batch[target_idx]
                     target_times = targets_times_batch[target_idx]
 
+                    # TEMP domain check -- remove after verifying
+                    if not targets_is_spoof[target_idx]:
+                        from weathergen.train.loss_modules.plot_domain_check import (
+                            plot_target_pred_map,
+                        )
+                        _epoch = self.cf.general.istep // self.mode_cfg.samples_per_mini_epoch
+                        for _ci in range(target.shape[-1]):
+                            plot_target_pred_map(
+                                stream_name,
+                                target,
+                                pred,
+                                targets_coords_batch[target_idx],
+                                channel_names=list(target_channels),
+                                channel_idx=_ci,
+#                                tag=f"{self.stage}",
+                                tag=f"{self.stage}_ep{_epoch:03d}",
+                                out_dir="/home/cristianl/weathergenerator/plots/domain_check",
+                            )
+
                     # get masks for sub-time steps
                     substep_masks = self._get_substep_masks(stream_info, timestep_idx, target_times)
 

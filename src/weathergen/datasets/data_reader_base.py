@@ -315,6 +315,7 @@ class DataReaderBase(metaclass=ABCMeta):
         self,
         tw_handler: TimeWindowHandler,
         stream_info: dict,
+        domain=None,
     ) -> None:
         """
         Parameters
@@ -332,6 +333,8 @@ class DataReaderBase(metaclass=ABCMeta):
         self.time_window_handler = tw_handler
         self.stream_info = stream_info
         self.target_channel_weights = None
+        self.domain = domain
+        self.domain_mask = None
 
     def init_empty(self) -> None:
         """
@@ -349,7 +352,9 @@ class DataReaderBase(metaclass=ABCMeta):
         self.mean = np.zeros(0)
         self.stdev = np.ones(0)
         self.mean_geoinfo = np.zeros(0)
-        self.stdev_geoinfo = np.ones(0)
+        self.stdev_geoinfo = npi.ones(0)
+
+        self.domain_mask = None
 
     @abstractmethod
     def length(self) -> int:
@@ -704,6 +709,7 @@ class DataReaderTimestep(DataReaderBase):
         data_start_time: NPDT64 | None = None,
         data_end_time: NPDT64 | None = None,
         period: NPTDel64 | None = None,
+        domain=None,
     ) -> None:
         """
         Parameters
@@ -724,7 +730,7 @@ class DataReaderTimestep(DataReaderBase):
         None
         """
 
-        super().__init__(tw_handler, stream_info)
+        super().__init__(tw_handler, stream_info, domain=domain)
         self.data_start_time = data_start_time or tw_handler.t_start
         self.data_end_time = data_end_time
         self.period = period

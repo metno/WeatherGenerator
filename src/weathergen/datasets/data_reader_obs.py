@@ -28,9 +28,10 @@ _logger = logging.getLogger(__name__)
 
 class DataReaderObs(DataReaderBase):
     def __init__(
-        self, tw_handler: TimeWindowHandler, filename: Path, stream_info: dict, stage: Stage
+        self, tw_handler: TimeWindowHandler, filename: Path, stream_info: dict, stage: Stage,
+        domain=None,
     ) -> None:
-        super().__init__(tw_handler, stream_info)
+        super().__init__(tw_handler, stream_info, domain=domain)
 
         self.filename = filename
         self.z = zarr.open(filename, mode="r")
@@ -286,6 +287,11 @@ class DataReaderObs(DataReaderBase):
         # compute mask to enforce it
         t_win = self.time_window_handler.window(idx)
         t_mask = np.logical_and(datetimes >= t_win.start, datetimes < t_win.end)
+
+        if self.domain is not None and not self.domain.is_global:
+            t_mask = np.logical_and(
+                t_mask, self.domain.bbox_point_mask(coords[:, 0], coords[:, 1])
+            )
 
         rdata = ReaderData(
             coords=coords[t_mask],

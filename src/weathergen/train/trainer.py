@@ -476,6 +476,20 @@ class Trainer(TrainerBase):
                     dtype=self.mixed_precision_dtype,
                     enabled=cf.with_mixed_precision,
                 ):
+                    # TEMP diagnostic -- remove after
+#                    if bidx < 2:
+#                        _ss = batch.get_source_samples()
+#                        for _i, _sample in enumerate(_ss.get_samples()):
+#                            for _sname, _sd in _sample.streams_data.items():
+#                                for _step, _t in enumerate(_sd.source_tokens_cells):
+#                                    if _t is None:
+#                                        print(f"SRC sample={_i} {_sname} step={_step}: None")
+#                                        continue
+#                                    _n = torch.isnan(_t).sum().item()
+#                                    print(f"SRC sample={_i} {_sname} step={_step}: "
+#                                          f"shape={tuple(_t.shape)} nan={_n}/{_t.numel()} "
+#                                          f"absmax={_t.abs().max().item():.3e}")
+
                     preds = self.model(
                         model_params=self.model_params,
                         batch=batch.get_source_samples(),

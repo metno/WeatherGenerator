@@ -238,4 +238,5 @@ config/streams/metno_*/
 # ignore backup for py files
 *.py.bak
 *.py.bak1
+*.py.bak2
 diagnose_target_coords.py

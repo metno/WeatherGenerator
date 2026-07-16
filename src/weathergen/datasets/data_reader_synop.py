@@ -34,6 +34,7 @@ class DataReaderSynop(DataReaderTimestep):
         tw_handler: TimeWindowHandler,
         filename: Path,
         stream_info: dict,
+        domain=None,
     ) -> None:
         """
         Construct data reader for anemoi dataset
@@ -59,7 +60,7 @@ class DataReaderSynop(DataReaderTimestep):
         if tw_handler.t_start >= ds.time.max() or tw_handler.t_end <= ds.time.min():
             name = stream_info["name"]
             _logger.warning(f"{name} is not supported over data loader window. Stream is skipped.")
-            super().__init__(tw_handler, stream_info)
+            super().__init__(tw_handler, stream_info, domain=domain)
             self._init_empty()
             return
 
@@ -79,6 +80,7 @@ class DataReaderSynop(DataReaderTimestep):
             data_start_time,
             data_end_time,
             period,
+            domain=domain,
         )
         # If there is no overlap with the time range, no need to keep the dataset.
         if tw_handler.t_start >= data_end_time or tw_handler.t_end <= data_start_time:
@@ -102,7 +104,19 @@ class DataReaderSynop(DataReaderTimestep):
         self.geoinfo_idx = [self.channels_file.index(ch) for ch in self.geoinfo_channels]
         # cache geoinfos
         self.geoinfo_data = np.stack([np.array(ds[ch], dtype=np32) for ch in self.geoinfo_channels])
-        self.geoinfo_data = self.geoinfo_data.transpose()
+        self.geoinfo_data = self.geoinfo_data.transpose()    # now (n_stations, n_geo)
+
+        # ADD
+        if domain is not None and not domain.is_global:
+            self.domain_mask = domain.bbox_point_mask(self.latitudes, self.longitudes)
+            self.latitudes = self.latitudes[self.domain_mask]
+            self.longitudes = self.longitudes[self.domain_mask]
+            if self.geoinfo_data.shape[0] > 0:
+                self.geoinfo_data = self.geoinfo_data[self.domain_mask]
+            _logger.info(
+                "%s: domain pre-filter keeps %d of %d stations",
+                stream_info["name"], int(self.domain_mask.sum()), len(self.domain_mask),
+            )
 
         # select/filter requested source channels
         self.source_idx = self.select_channels(ds, "source")
@@ -198,6 +212,13 @@ class DataReaderSynop(DataReaderTimestep):
         data = self.ds[sel_channels].isel(time=slice(didx_start, didx_end)).to_array().values
         # flatten along time dimension
         data = data.transpose([1, 2, 0]).reshape((data.shape[1] * data.shape[2], data.shape[0]))
+
+        if self.domain_mask is not None:
+            data = data[np.tile(self.domain_mask, len(t_idxs))]
+
+        print("ds[sel_channels].isel(time=slice(0,2)).to_array().dims")
+        print(ds[sel_channels].isel(time=slice(0,2)).to_array().dims)
+
         # set invalid values to NaN
         mask = data == self.fillvalue
         data[mask] = np.nan

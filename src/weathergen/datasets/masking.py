@@ -112,15 +112,20 @@ class Masker:
                                         specific to the masking strategy. See above.
     """
 
-    def __init__(self, healpix_level: int, stage: Stage, streams=None, mode_cfg=None):
+    def __init__(self, healpix_level: int, stage: Stage, streams=None, mode_cfg=None, domain=None):
         self.rng = None
 
         self.mask_value = 0.0
         self.dim_time_enc = 6
 
+        if domain is None:
+            from weathergen.datasets.domain import Domain
+            domain = Domain.global_(healpix_level)
+        self.domain = domain     
+
         # number of healpix cells
         self.healpix_level_data = healpix_level
-        self.healpix_num_cells = 12 * (4**healpix_level)
+        self.healpix_num_cells = len(domain)
 
         self.stage = stage
 
@@ -541,6 +546,16 @@ class Masker:
         assert num_cells == self.healpix_num_cells, (
             "num_cells inconsistent with configured healpix level."
         )
+
+        if not self.domain.is_global and strategy in ("healpix", "cropping_healpix"):
+            raise NotImplementedError(
+                f"Masking strategy '{strategy}' relies on healpix nested-index parent/child "
+                "algebra (children of parent p are the contiguous block [p*k, (p+1)*k)), which "
+                "does not hold for compact domain-local indices. To support it on a regional "
+                "domain, map compact -> global via domain.active_cells, do the parent/child "
+                "selection in global indexing, then map back with domain.remap(). "
+                "Not implemented yet since the 'forecast' strategy in use does not need it."
+            )
 
         # generate cell mask
 

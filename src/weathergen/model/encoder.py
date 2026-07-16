@@ -25,7 +25,7 @@ from weathergen.model.engines import (
 # from weathergen.model.model import ModelParams
 from weathergen.model.parametrised_prob_dist import LatentInterpolator
 from weathergen.model.positional_encoding import positional_encoding_harmonic
-
+from weathergen.datasets.domain import Domain
 
 class EncoderModule(torch.nn.Module):
     name: "EncoderModule"
@@ -42,7 +42,7 @@ class EncoderModule(torch.nn.Module):
         self.cf = cf
 
         self.healpix_level = cf.healpix_level
-        self.num_healpix_cells = 12 * 4**self.healpix_level
+        self.num_healpix_cells = len(Domain.from_config(cf))
 
         self.cf = cf
         self.sources_size = sources_size
@@ -137,6 +137,18 @@ class EncoderModule(torch.nn.Module):
             use_reentrant=False,
         )
 
+        # TEMP latent check -- remove after
+        from weathergen.model.plot_latent_check import plot_latent_map
+        plot_latent_map(
+            tokens_global,
+            self.domain,
+            components=[0, 1, 2, 3],
+            num_extra_tokens=self.num_register_tokens + self.num_class_tokens,
+            num_queries=self.cf.ae_local_num_queries,
+            tag="step0",
+            out_dir="/home/cristianl/weathergenerator/plots/domain_check",
+        )
+
         return tokens_global, posteriors
 
     def interpolate_latents(self, tokens: torch.Tensor) -> (torch.Tensor, torch.Tensor):
@@ -165,6 +177,9 @@ class EncoderModule(torch.nn.Module):
 
         # subdivision factor for required splitting
         clen = self.num_healpix_cells // (2 if self.cf.healpix_level <= 5 else 8)
+        # A small regional domain can make clen 0 (or 0-length chunks), which would
+        # make the loop below iterate zero times and silently return nothing.
+        clen = max(1, clen)                                             # <-- ADD
         tokens_global_unmasked = []
         posteriors = []
 
@@ -186,6 +201,11 @@ class EncoderModule(torch.nn.Module):
             toks_global = tokens_global[i * clen : i_end]
             cell_lens_cur = torch.cat([zero_pad, cell_lens[i * clen : i_end]])
             q_cells_lens_cur = q_cells_lens[: cell_lens_cur.shape[0]]
+
+            # TEMP diagnostic
+#            _z = (cell_lens_cur[1:] == 0).sum().item()
+#            print(f"chunk {i}: cells={cell_lens_cur.shape[0]-1} zero_len={_z} "
+#                  f"toks={toks.shape[0]} maxlen={cell_lens_cur.max().item()}", flush=True)
 
             # local assimilation model
             toks = self.ae_local_engine(toks, cell_lens_cur, use_reentrant=False)

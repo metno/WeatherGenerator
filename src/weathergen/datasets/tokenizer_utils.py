@@ -126,8 +126,11 @@ def encode_times_target(times, time_win) -> torch.tensor:
     return time_tensor + 0.5
 
 
-def hpy_cell_splits(coords: torch.tensor, hl: int):
+def hpy_cell_splits(coords: torch.tensor, hl: int, domain=None):
     """Compute healpix cell id for each coordinate on given level hl
+
+    Points outside `domain` are dropped. Cell ids returned are COMPACT indices,
+    i.e. indices into domain.active_cells, not global nested indices.
 
     Returns
       hpy_idxs_ord_split : list of per cell indices into thetas,phis,posr3
@@ -135,8 +138,34 @@ def hpy_cell_splits(coords: torch.tensor, hl: int):
       phis : phis in rad
     """
     thetas, phis = theta_phi_to_standard_coords(coords)
-    # healpix cells for all points
+    # healpix cells for all points, in GLOBAL nested indexing
     hpy_idxs = ang2pix(2**hl, thetas, phis, nest=True)
+
+    # map to compact (domain-local) indexing and drop points outside the domain.
+    # For a global domain this is the identity and nothing is dropped, so the
+    # behaviour below is unchanged.
+    if domain is not None and not domain.is_global:
+        keep = domain.inside_mask(hpy_idxs)
+        # `keep_idxs` maps positions in the filtered arrays back to positions in
+        # the ORIGINAL point arrays. This matters: the indices stored in
+        # hpy_idxs_ord_split are later used to index rdata.coords / .data /
+        # .datetimes, which are NOT filtered. So we must index into the original
+        # point numbering, never into a compacted point numbering.
+        # TEMP diagnostic
+#        print(f"TOK: pts={len(hpy_idxs)} kept={keep.sum()} "
+#              f"uniq_global_cells={len(np.unique(hpy_idxs))} "
+#              f"active={len(domain)} "
+#              f"global_range=[{hpy_idxs.min()},{hpy_idxs.max()}] "
+#              f"active_range=[{domain.active_cells.min()},{domain.active_cells.max()}] "
+#              f"lat_range=[{coords[:,0].min():.1f},{coords[:,0].max():.1f}] "
+#              f"lon_range=[{coords[:,1].min():.1f},{coords[:,1].max():.1f}]", flush=True)
+
+        keep_idxs = np.flatnonzero(keep)
+        hpy_idxs = domain.remap(hpy_idxs[keep])
+        num_cells = len(domain)
+    else:
+        keep_idxs = None
+        num_cells = 12 * 4**hl
 
     # extract information to split according to cells by first sorting and then finding split idxs
     hpy_idxs_ord = np.argsort(hpy_idxs, **numpy_argsort_args)
@@ -144,16 +173,18 @@ def hpy_cell_splits(coords: torch.tensor, hl: int):
 
     # extract per cell data
     hpy_idxs_ord_temp = np.split(hpy_idxs_ord, splits + 1)
-    hpy_idxs_ord_split = [np.array([], dtype=np.int64) for _ in range(12 * 4**hl)]
+    hpy_idxs_ord_split = [np.array([], dtype=np.int64) for _ in range(num_cells)]
     # TODO: split smarter (with a augmented splits list?) so that this loop is not needed
-    for b, x in zip(np.unique(np.unique(hpy_idxs[hpy_idxs_ord])), hpy_idxs_ord_temp, strict=True):
-        hpy_idxs_ord_split[b] = x
+    if len(hpy_idxs) > 0:
+        for b, x in zip(np.unique(hpy_idxs[hpy_idxs_ord]), hpy_idxs_ord_temp, strict=True):
+            # translate positions in the filtered arrays back to original point ids
+            hpy_idxs_ord_split[b] = x if keep_idxs is None else keep_idxs[x]
 
     return (hpy_idxs_ord_split, thetas, phis)
 
-
 def hpy_splits(
-    coords: torch.Tensor, hl: int, token_size: int, pad_tokens: bool, offset_step: int = 0
+    coords: torch.Tensor, hl: int, token_size: int, pad_tokens: bool, offset_step: int = 0,
+    domain=None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor]:
     """Compute healpix cell for each data point and splitting information per cell;
        when the token_size is exceeded then splitting based on lat is used;
@@ -166,7 +197,7 @@ def hpy_splits(
     """
 
     # list of data points per healpix cell
-    (hpy_idxs_ord_split, thetas, phis) = hpy_cell_splits(coords, hl)
+    (hpy_idxs_ord_split, thetas, phis) = hpy_cell_splits(coords, hl, domain)
 
     # if token_size is exceeed split based on latitude
     # TODO: split by hierarchically traversing healpix scheme
@@ -210,11 +241,12 @@ def tokenize_space(
     hl,
     pad_tokens=True,
     offset_step=0,
+    domain=None,
 ):
     """Process one window into tokens"""
 
     # idx_ord_lens is length is number of tokens per healpix cell
-    idxs_ord, idxs_ord_lens = hpy_splits(rdata.coords, hl, token_size, pad_tokens, offset_step)
+    idxs_ord, idxs_ord_lens = hpy_splits(rdata.coords, hl, token_size, pad_tokens, offset_step, domain)
 
     return idxs_ord, idxs_ord_lens
 
@@ -224,12 +256,13 @@ def tokenize_spacetime(
     token_size,
     hl,
     pad_tokens=True,
+    domain=None,
 ):
     """Tokenize respecting an intrinsic time step in the data, i.e. each time step is tokenized
     separately
     """
 
-    num_healpix_cells = 12 * 4**hl
+    num_healpix_cells = 12 * 4**hl if domain is None else len(domain)
     idxs_cells = [[] for _ in range(num_healpix_cells)]
     idxs_cells_lens = [[] for _ in range(num_healpix_cells)]
 
@@ -241,7 +274,7 @@ def tokenize_spacetime(
         rdata_cur = IOReaderData(
             rdata.coords[mask], rdata.geoinfos[mask], rdata.data[mask], rdata.datetimes[mask]
         )
-        idxs_cur, idxs_cur_lens = tokenize_space(rdata_cur, token_size, hl, pad_tokens, offset_step)
+        idxs_cur, idxs_cur_lens = tokenize_space(rdata_cur, token_size, hl, pad_tokens, offset_step, domain)
 
         # collect data for all time steps
         idxs_cells = [t + tc for t, tc in zip(idxs_cells, idxs_cur, strict=True)]

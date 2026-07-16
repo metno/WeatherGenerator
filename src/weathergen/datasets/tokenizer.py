@@ -18,29 +18,47 @@ from weathergen.datasets.utils import (
     r3tos2,
 )
 
+def _subset(t: torch.Tensor, cells) -> torch.Tensor:
+    """Take rows of a per-cell table for the active cells (identity if global)."""
+    return t[torch.from_numpy(cells)]
 
 class Tokenizer:
     """
     Base class for tokenizers.
     """
 
-    def __init__(self, healpix_level: int):
+    def __init__(self, healpix_level: int, domain=None):
         ref = torch.tensor([1.0, 0.0, 0.0])
+
+        if domain is None:
+            from weathergen.datasets.domain import Domain
+            domain = Domain.global_(healpix_level)
+        self.domain = domain
 
         self.healpix_level = healpix_level
         self.hl_source = healpix_level
         self.hl_target = healpix_level
 
-        self.num_healpix_cells_source = 12 * 4**self.hl_source
-        self.num_healpix_cells_target = 12 * 4**self.hl_target
+        self.num_healpix_cells_source = len(domain)
+        self.num_healpix_cells_target = len(domain)
 
         self.size_time_embedding = 6
+
+        cells = domain.active_cells
 
         verts00, verts00_rots = healpix_verts_rots(self.hl_source, 0.0, 0.0)
         verts10, verts10_rots = healpix_verts_rots(self.hl_source, 1.0, 0.0)
         verts11, verts11_rots = healpix_verts_rots(self.hl_source, 1.0, 1.0)
         verts01, verts01_rots = healpix_verts_rots(self.hl_source, 0.0, 1.0)
         vertsmm, vertsmm_rots = healpix_verts_rots(self.hl_source, 0.5, 0.5)
+
+        # keep only active cells
+        verts00, verts00_rots = _subset(verts00, cells), _subset(verts00_rots, cells)
+        verts10, verts10_rots = _subset(verts10, cells), _subset(verts10_rots, cells)
+        verts11, verts11_rots = _subset(verts11, cells), _subset(verts11_rots, cells)
+        verts01, verts01_rots = _subset(verts01, cells), _subset(verts01_rots, cells)
+        vertsmm, vertsmm_rots = _subset(vertsmm, cells), _subset(vertsmm_rots, cells)
+
         self.hpy_verts = [
             verts00.to(torch.float32),
             verts10.to(torch.float32),
@@ -61,6 +79,14 @@ class Tokenizer:
         verts11, verts11_rots = healpix_verts_rots(self.hl_target, 1.0, 1.0)
         verts01, verts01_rots = healpix_verts_rots(self.hl_target, 0.0, 1.0)
         vertsmm, vertsmm_rots = healpix_verts_rots(self.hl_target, 0.5, 0.5)
+
+        # keep only active cells
+        verts00, verts00_rots = _subset(verts00, cells), _subset(verts00_rots, cells)
+        verts10, verts10_rots = _subset(verts10, cells), _subset(verts10_rots, cells)
+        verts11, verts11_rots = _subset(verts11, cells), _subset(verts11_rots, cells)
+        verts01, verts01_rots = _subset(verts01, cells), _subset(verts01_rots, cells)
+        vertsmm, vertsmm_rots = _subset(vertsmm, cells), _subset(vertsmm_rots, cells)
+
         self.hpy_verts = [
             verts00.to(torch.float32),
             verts10.to(torch.float32),
@@ -101,16 +127,13 @@ class Tokenizer:
 
         # add local coords wrt to center of neighboring cells
         # (since the neighbors are used in the prediction)
-        num_healpix_cells = 12 * 4**self.hl_target
-        with warnings.catch_warnings(action="ignore"):
-            temp = hp.neighbours(
-                np.arange(num_healpix_cells), 2**self.hl_target, order="nested"
-            ).transpose()
-        # fix missing nbors with references to self
-        for i, row in enumerate(temp):
-            temp[i][row == -1] = i
+        # Domain.neighbours_compact() already: computes global neighbours, remaps to
+        # compact indexing, and falls back to self for both healpix-corner (-1) and
+        # out-of-domain neighbours -- i.e. the same convention as the loop it replaces.
+        num_healpix_cells = len(domain)
+        temp = domain.neighbours_compact()
         self.hpy_nctrs_target = (
-            vertsmm[temp.flatten()]
+            vertsmm[temp.flatten()]                # vertsmm is already subset above
             .reshape((num_healpix_cells, 8, 3))
             .transpose(1, 0)
             .to(torch.float32)

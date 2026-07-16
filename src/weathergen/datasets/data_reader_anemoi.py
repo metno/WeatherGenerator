@@ -41,6 +41,7 @@ class DataReaderAnemoi(DataReaderTimestep):
         filename: Path,
         stream_info: dict,
         stage: Stage,
+        domain=None,
     ) -> None:
         """
         Construct data reader for anemoi dataset
@@ -76,7 +77,7 @@ class DataReaderAnemoi(DataReaderTimestep):
         if tw_handler.t_start >= ds0.dates[-1] or tw_handler.t_end <= ds0.dates[0]:
             name = stream_info["name"]
             _logger.warning(f"{name} is not supported over data loader window. Stream is skipped.")
-            super().__init__(tw_handler, stream_info)
+            super().__init__(tw_handler, stream_info, domain=domain)
             self.init_empty()
             return
 
@@ -107,6 +108,7 @@ class DataReaderAnemoi(DataReaderTimestep):
             data_start_time,
             data_end_time,
             period,
+            domain=domain,
         )
         # If there is no overlap with the time range, no need to keep the dataset.
         if tw_handler.t_start >= data_end_time or tw_handler.t_end <= data_start_time:
@@ -119,6 +121,30 @@ class DataReaderAnemoi(DataReaderTimestep):
         # caches lats and lons
         self.latitudes = _clip_lat(ds.latitudes)
         self.longitudes = _clip_lon(ds.longitudes)
+
+        # ADD THIS BLOCK
+        # Static per-gridpoint domain mask; the anemoi grid is fixed so compute once.
+        # This is a PRE-FILTER only: the authoritative filter is the cell remap in
+        # hpy_cell_splits(). bbox_point_mask() is deliberately permissive (it widens
+        # the box to cover pad_rings), so it never drops a point the tokenizer keeps.
+        if domain is not None and not domain.is_global:
+            self.domain_mask = domain.bbox_point_mask(self.latitudes, self.longitudes)
+            n_keep = int(self.domain_mask.sum())
+            _logger.info(
+                "%s: domain pre-filter keeps %d of %d grid points (%.2f%%)",
+                stream_info["name"], n_keep, len(self.domain_mask),
+                100.0 * n_keep / max(len(self.domain_mask), 1),
+            )
+            if n_keep == 0:
+                _logger.warning(
+                    "%s: no grid points inside the domain; stream will be empty.",
+                    stream_info["name"],
+                )
+            # Pre-subset the cached coords: they are read ONLY to build `latlon` in
+            # _get() (verified by repo-wide grep -- 4 hits, all in this file), so
+            # subsetting here means _get() needs no coords change at all.
+            self.latitudes = self.latitudes[self.domain_mask]
+            self.longitudes = self.longitudes[self.domain_mask]
 
         # select/filter requested source channels
         if stream_info.get(str(stage) + "_source_channels") is None:
@@ -223,6 +249,9 @@ class DataReaderAnemoi(DataReaderTimestep):
         # coords-first representation and collapse multiple steps
         data = data.transpose([0, 2, 1]).reshape((data.shape[0] * data.shape[2], -1))
 
+        if self.domain_mask is not None:
+            data = data[np.tile(self.domain_mask, len(t_idxs))]
+
         # extract geoinfo channels (can be time-varying, so read from dataset)
         geoinfos = data[:, list(self.geoinfo_idx)]
         # extract channels
@@ -242,6 +271,16 @@ class DataReaderAnemoi(DataReaderTimestep):
         # date time matching #data points of data
         # Assuming a fixed frequency for the dataset
         datetimes = np.repeat(self.ds.dates[didx_start:didx_end], len(data) // len(t_idxs))
+
+        # TEMP §11 layout check -- remove after verifying
+#        _logger.warning(
+#            "§11 %s: T=%d G=%d nvars=%d | geoinfo_idx=%s -> geoinfos%s | "
+#            "data%s coords%s datetimes%s | G==len(lat)? %s",
+#            self.stream_info["name"], len(t_idxs), len(self.latitudes),
+#            len(self.ds.variables), list(self.geoinfo_idx), geoinfos.shape,
+#            data.shape, coords.shape, datetimes.shape,
+#            coords.shape[0] == len(t_idxs) * len(self.latitudes),
+#        )
 
         rd = ReaderData(
             coords=coords,

@@ -113,18 +113,45 @@ class MultiSelfAttentionHeadVarlen(torch.nn.Module):
 
         # set dropout rate according to training/eval mode as required by flash_attn
         dropout_rate = self.dropout_rate if self.training else 0.0
+
+        # x_lens arrives as [0, l0, l1, ...]: the leading 0 is the padding element
+        # required by flash_attn's cu_seqlens API, NOT a real sequence. Only [1:]
+        # are actual per-cell lengths. Filtering the full array with `> 0` silently
+        # removes that pad and yields a cu_seqlens starting at l0 instead of 0, with
+        # length batch instead of batch+1 -> flash reads garbage segment boundaries
+        # -> NaN from finite inputs.
         cum_x_lens = torch.cumsum(x_lens, 0, dtype=torch.int32)
 
-        # Guard against zero-length sequences (flash_attn fails on them)
-        valid_mask = x_lens > 0
-        if valid_mask.any():
-            valid_lens = x_lens[valid_mask]
-            cum_valid_lens = torch.cumsum(valid_lens, 0, dtype=torch.int32)
+        lens = x_lens[1:]
+        valid_mask = lens > 0
+
+        if valid_mask.all():
+            # Fast path: no empty sequences, pass cu_seqlens straight through.
+            # This is the common case for dense grids and skips the Python loop below.
+            outs = flash_attn_varlen_func(
+                qs,
+                ks,
+                vs,
+                cum_x_lens,
+                cum_x_lens,
+                int(lens.max()),
+                int(lens.max()),
+                softcap=self.softcap,
+                dropout_p=dropout_rate,
+            )
+        elif valid_mask.any():
+            valid_lens = lens[valid_mask]
+            # rebuild cu_seqlens WITH the mandatory leading zero
+            zero = torch.zeros(1, dtype=torch.int32, device=valid_lens.device)
+            cum_valid_lens = torch.cat(
+                [zero, torch.cumsum(valid_lens, 0, dtype=torch.int32)]
+            )
+            # With lens = x_lens[1:], sequence i spans [cum_x_lens[i], cum_x_lens[i+1]).
+            # No i-1 special case: cum_x_lens[0] == 0 by construction of the pad.
+            valid_idx = torch.nonzero(valid_mask).flatten()
             keep = torch.cat([
-                torch.arange(
-                    cum_x_lens[i - 1] if i > 0 else 0, cum_x_lens[i], device=qs.device
-                )
-                for i, v in enumerate(valid_mask) if v
+                torch.arange(cum_x_lens[i], cum_x_lens[i + 1], device=qs.device)
+                for i in valid_idx
             ])
             # ordering of tensors (seq, heads, embed) (differs from torch's flash attention impl)
             valid_outs = flash_attn_varlen_func(
@@ -133,8 +160,8 @@ class MultiSelfAttentionHeadVarlen(torch.nn.Module):
                 vs[keep],
                 cum_valid_lens,
                 cum_valid_lens,
-                valid_lens.max(),
-                valid_lens.max(),
+                int(valid_lens.max()),
+                int(valid_lens.max()),
                 softcap=self.softcap,
                 dropout_p=dropout_rate,
             )
@@ -463,27 +490,62 @@ class MultiCrossAttentionHeadVarlen(torch.nn.Module):
 #        else:
 #            assert False
         if x_kv_lens is not None:
+            # x_q_lens / x_kv_lens arrive as [0, l0, l1, ...]: the leading 0 is the
+            # padding element required by flash_attn's cu_seqlens API, NOT a real
+            # sequence. Only [1:] are actual per-sequence lengths. Filtering with
+            # `> 0` on the full array silently removes that pad and produces a
+            # cu_seqlens that starts at l0 instead of 0 -> flash reads garbage
+            # segment boundaries -> NaN from finite inputs.
             cum_x_q_lens = torch.cumsum(x_q_lens, 0, dtype=torch.int32)
             cum_x_kv_lens = torch.cumsum(x_kv_lens, 0, dtype=torch.int32)
 
-            # A sequence is valid only if BOTH q and kv are non-zero
-            valid_mask = (x_q_lens > 0) & (x_kv_lens > 0)
+            q_lens = x_q_lens[1:]
+            kv_lens = x_kv_lens[1:]
 
-            if valid_mask.any():
-                valid_q_lens = x_q_lens[valid_mask]
-                valid_kv_lens = x_kv_lens[valid_mask]
-                cum_valid_q_lens = torch.cumsum(valid_q_lens, 0, dtype=torch.int32)
-                cum_valid_kv_lens = torch.cumsum(valid_kv_lens, 0, dtype=torch.int32)
+            # A sequence can be attended only if BOTH q and kv are non-empty.
+            # Sequences with q > 0 but kv == 0 keep their zero output here and are
+            # carried by the residual below (attend to nothing -> contribute nothing).
+            valid_mask = (q_lens > 0) & (kv_lens > 0)
 
-                # Select only tokens from valid sequences
-                # Build index of which tokens to keep
+            if valid_mask.all():
+                # Fast path: nothing to filter, pass the cu_seqlens straight through.
+                # This is the common case for dense grids (every cell populated) and
+                # avoids the Python loop below entirely.
+                outs = flash_attn_varlen_func(
+                    qs,
+                    ks,
+                    vs,
+                    cum_x_q_lens,
+                    cum_x_kv_lens,
+                    int(q_lens.max()),
+                    int(kv_lens.max()),
+                    softcap=self.softcap,
+                    dropout_p=dropout_rate,
+                )
+            elif valid_mask.any():
+                valid_q_lens = q_lens[valid_mask]
+                valid_kv_lens = kv_lens[valid_mask]
+
+                # rebuild cu_seqlens WITH the mandatory leading zero
+                zero = torch.zeros(1, dtype=torch.int32, device=valid_q_lens.device)
+                cum_valid_q_lens = torch.cat(
+                    [zero, torch.cumsum(valid_q_lens, 0, dtype=torch.int32)]
+                )
+                cum_valid_kv_lens = torch.cat(
+                    [zero, torch.cumsum(valid_kv_lens, 0, dtype=torch.int32)]
+                )
+
+                # Select tokens of valid sequences. With q_lens = x_q_lens[1:],
+                # sequence i spans [cum_x_q_lens[i], cum_x_q_lens[i+1]) -- no i-1
+                # special case is needed, because cum_x_q_lens[0] == 0 by construction.
+                valid_idx = torch.nonzero(valid_mask).flatten()
                 q_keep = torch.cat([
-                    torch.arange(cum_x_q_lens[i-1] if i > 0 else 0, cum_x_q_lens[i], device=qs.device)
-                    for i, v in enumerate(valid_mask) if v
+                    torch.arange(cum_x_q_lens[i], cum_x_q_lens[i + 1], device=qs.device)
+                    for i in valid_idx
                 ])
                 kv_keep = torch.cat([
-                    torch.arange(cum_x_kv_lens[i-1] if i > 0 else 0, cum_x_kv_lens[i], device=ks.device)
-                    for i, v in enumerate(valid_mask) if v
+                    torch.arange(cum_x_kv_lens[i], cum_x_kv_lens[i + 1], device=ks.device)
+                    for i in valid_idx
                 ])
 
                 valid_outs = flash_attn_varlen_func(
@@ -492,19 +554,24 @@ class MultiCrossAttentionHeadVarlen(torch.nn.Module):
                     vs[kv_keep],
                     cum_valid_q_lens,
                     cum_valid_kv_lens,
-                    valid_q_lens.max(),
-                    valid_kv_lens.max(),
+                    int(valid_q_lens.max()),
+                    int(valid_kv_lens.max()),
                     softcap=self.softcap,
                     dropout_p=dropout_rate,
                 )
 
-                # Scatter results back into full output tensor
+                # Scatter results back into the full output tensor
                 outs = torch.zeros_like(qs)
                 outs[q_keep] = valid_outs
             else:
                 outs = torch.zeros_like(qs)
+        else:
+            # No kv lengths given: nothing to attend over. Previously this fell
+            # through to `outs.flatten(...)` with `outs` unbound -> UnboundLocalError.
+            outs = torch.zeros_like(qs)
 
         outs = self.proj_out(outs.flatten(-2, -1))
+
         if gate is not None:
             # gated residual (DiT-style): x <- x + g * sublayer(x)
             outs = gate * outs

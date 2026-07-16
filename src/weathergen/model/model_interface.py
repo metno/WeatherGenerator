@@ -171,6 +171,26 @@ def init_model_and_shard(
     model_params.reset_parameters(cf)
     model_params = model_params.to(f"cuda:{cf.local_rank}")
 
+    # TEMP diagnostic -- remove after
+#    def _nan_hook(mod, inp, out):
+#        def _bad(x):
+#            return isinstance(x, torch.Tensor) and x.is_floating_point() and torch.isnan(x).any()
+#        outs = out if isinstance(out, tuple) else (out,)
+#        ins = [i for i in inp if isinstance(i, torch.Tensor)]
+#        if any(_bad(o) for o in outs) and not any(_bad(i) for i in ins):
+#            print(f"FIRST NaN CREATED IN: {mod.__class__.__name__}", flush=True)
+#            for _n, _p in mod.named_parameters(recurse=False):
+#                print(f"   param {_n}: shape={tuple(_p.shape)} "
+#                      f"nan={torch.isnan(_p).any().item()} "
+#                      f"absmax={_p.abs().max().item():.3e}", flush=True)
+#            for _i, _t in enumerate(ins):
+#                print(f"   input[{_i}]: shape={tuple(_t.shape)} "
+#                      f"absmax={_t.abs().max().item():.3e}", flush=True)
+#            raise SystemExit(1)
+#
+#    for _m in model.modules():
+#        _m.register_forward_hook(_nan_hook)
+
     return model, model_params
 
 

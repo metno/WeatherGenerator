@@ -42,6 +42,7 @@ from weathergen.model.layers import MLP, NamedLinear
 from weathergen.model.utils import get_num_parameters
 from weathergen.utils.distributed import is_root
 from weathergen.utils.utils import get_dtype, is_stream_forcing
+from weathergen.datasets.domain import Domain
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +93,8 @@ class ModelParams(torch.nn.Module):
         self.cf = cf
 
         self.healpix_level = cf.healpix_level
-        self.num_healpix_cells = 12 * 4**cf.healpix_level
+        self.domain = Domain.from_config(cf)
+        self.num_healpix_cells = len(self.domain)
         self.dtype = get_dtype(cf.attention_dtype)
 
         # Positional embeddings
@@ -138,15 +140,10 @@ class ModelParams(torch.nn.Module):
             self.rope_coords = None
             self.rope_cell_coords = None
 
-        # HEALPix neighbours
-        hlc = self.healpix_level
-        with warnings.catch_warnings(action="ignore"):
-            temp = hp.neighbours(
-                np.arange(self.num_healpix_cells), 2**hlc, order="nested"
-            ).transpose()
-        # fix missing nbors with references to self
-        for i, row in enumerate(temp):
-            temp[i][row == -1] = i
+        # HEALPix neighbours, in compact (domain-local) indexing.
+        # Out-of-domain neighbours fall back to self, exactly as healpix-corner
+        # cells with no 8th neighbour already do.
+        temp = self.domain.neighbours_compact()
         self.hp_nbours = torch.nn.Parameter(
             torch.empty((temp.shape[0], (temp.shape[1] + 1)), dtype=torch.int32),
             requires_grad=False,
@@ -205,6 +202,7 @@ class ModelParams(torch.nn.Module):
             # Precompute per-cell center coordinates (lat, lon in radians) for 2D RoPE.
             # Shape: (num_healpix_cells, ae_local_num_queries, 2)
             verts, _ = healpix_verts_rots(self.healpix_level, 0.5, 0.5)
+            verts = verts[torch.from_numpy(self.domain.active_cells)]
             coords = r3tos2(verts.to(self.rope_coords.device)).to(self.rope_coords.dtype)
             # Per-cell coords for QueryAggregationEngine (no query expansion)
             self.rope_cell_coords.data.copy_(coords)
@@ -241,15 +239,8 @@ class ModelParams(torch.nn.Module):
             .repeat((1, cf.ae_local_num_queries, 1))
         )
 
-        # healpix neighborhood structure
-
-        hlc = self.healpix_level
-        num_healpix_cells = self.num_healpix_cells
-        with warnings.catch_warnings(action="ignore"):
-            temp = hp.neighbours(np.arange(num_healpix_cells), 2**hlc, order="nested").transpose()
-        # fix missing nbors with references to self
-        for i, row in enumerate(temp):
-            temp[i][row == -1] = i
+        # healpix neighborhood structure (compact indexing, see __init__)
+        temp = self.domain.neighbours_compact()
         # nbors *and* self
         self.hp_nbours.data[:, 0] = torch.arange(temp.shape[0], device=self.hp_nbours.device)
         self.hp_nbours.data[:, 1:] = torch.from_numpy(temp).to(self.hp_nbours.device)
@@ -315,7 +306,7 @@ class Model(torch.nn.Module):
         super(Model, self).__init__()
 
         self.healpix_level = cf.healpix_level
-        self.num_healpix_cells = 12 * 4**self.healpix_level
+        self.num_healpix_cells = len(Domain.from_config(cf))
 
         self.cf = cf
         self.dtype = get_dtype(self.cf.attention_dtype)
