@@ -202,15 +202,32 @@ class ModelParams(torch.nn.Module):
             # Precompute per-cell center coordinates (lat, lon in radians) for 2D RoPE.
             # Shape: (num_healpix_cells, ae_local_num_queries, 2)
             verts, _ = healpix_verts_rots(self.healpix_level, 0.5, 0.5)
+            print(f"A verts full: {tuple(verts.shape)}", flush=True)
+            # TEMP -- remove after
+            ac = self.domain.active_cells
+            print(f"DOMAIN IN MODELPARAMS: n={len(ac)} range=[{ac.min()},{ac.max()}] "
+                  f"first5={ac[:5].tolist()} is_global={self.domain.is_global}", flush=True)
+            import weathergen.datasets.utils as _u
+            print(f"UTILS FROM: {_u.__file__}", flush=True)
             verts = verts[torch.from_numpy(self.domain.active_cells)]
+            print(f"B verts sub:  {tuple(verts.shape)}", flush=True)
             coords = r3tos2(verts.to(self.rope_coords.device)).to(self.rope_coords.dtype)
+            coords[:, 1] = torch.remainder(coords[:, 1], 2 * torch.pi)
+            _lo = torch.rad2deg(coords[:, 1].float())
+            print(f"C coords:     {tuple(coords.shape)} lon=[{_lo.min():.1f}, {_lo.max():.1f}]", flush=True)
             # Per-cell coords for QueryAggregationEngine (no query expansion)
             self.rope_cell_coords.data.copy_(coords)
+            _lo2 = torch.rad2deg(self.rope_cell_coords[:, 1].float())
+            print(f"D buffer:     lon=[{_lo2.min():.1f}, {_lo2.max():.1f}]", flush=True)
             coords = coords.unsqueeze(1).repeat(1, cf.ae_local_num_queries, 1)
             coords_flat = coords.flatten(0, 1).unsqueeze(0)
             offset = self.num_extra_tokens * cf.ae_local_num_queries
             self.rope_coords.data.fill_(0.0)
             self.rope_coords.data[:, offset : offset + coords_flat.shape[1], :].copy_(coords_flat)
+            _c = self.rope_cell_coords.detach().cpu()
+            print(f"ROPE cell: n={_c.shape[0]} lat=[{torch.rad2deg(_c[:,0]).min():.1f}, "
+                  f"{torch.rad2deg(_c[:,0]).max():.1f}] lon=[{torch.rad2deg(_c[:,1]).min():.1f}, "
+                  f"{torch.rad2deg(_c[:,1]).max():.1f}]", flush=True)
 
         # pe_global: always initialized. RoPE handles relative position in Q/K, but pe_global
         # provides per-cell token identity which is critical for masked cells that have no
