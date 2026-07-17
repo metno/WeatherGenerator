@@ -202,58 +202,127 @@ class ModelParams(torch.nn.Module):
             # Precompute per-cell center coordinates (lat, lon in radians) for 2D RoPE.
             # Shape: (num_healpix_cells, ae_local_num_queries, 2)
             verts, _ = healpix_verts_rots(self.healpix_level, 0.5, 0.5)
-            print(f"A verts full: {tuple(verts.shape)}", flush=True)
+#            print(f"A verts full: {tuple(verts.shape)}", flush=True)
             # TEMP -- remove after
-            ac = self.domain.active_cells
-            print(f"DOMAIN IN MODELPARAMS: n={len(ac)} range=[{ac.min()},{ac.max()}] "
-                  f"first5={ac[:5].tolist()} is_global={self.domain.is_global}", flush=True)
-            import weathergen.datasets.utils as _u
-            print(f"UTILS FROM: {_u.__file__}", flush=True)
+#            ac = self.domain.active_cells
+#            print(f"DOMAIN IN MODELPARAMS: n={len(ac)} range=[{ac.min()},{ac.max()}] "
+#                  f"first5={ac[:5].tolist()} is_global={self.domain.is_global}", flush=True)
+#            import weathergen.datasets.utils as _u
+#            print(f"UTILS FROM: {_u.__file__}", flush=True)
             verts = verts[torch.from_numpy(self.domain.active_cells)]
-            print(f"B verts sub:  {tuple(verts.shape)}", flush=True)
+#            print(f"B verts sub:  {tuple(verts.shape)}", flush=True)
             coords = r3tos2(verts.to(self.rope_coords.device)).to(self.rope_coords.dtype)
             coords[:, 1] = torch.remainder(coords[:, 1], 2 * torch.pi)
-            _lo = torch.rad2deg(coords[:, 1].float())
-            print(f"C coords:     {tuple(coords.shape)} lon=[{_lo.min():.1f}, {_lo.max():.1f}]", flush=True)
+#            _lo = torch.rad2deg(coords[:, 1].float())
+#            print(f"C coords:     {tuple(coords.shape)} lon=[{_lo.min():.1f}, {_lo.max():.1f}]", flush=True)
             # Per-cell coords for QueryAggregationEngine (no query expansion)
             self.rope_cell_coords.data.copy_(coords)
-            _lo2 = torch.rad2deg(self.rope_cell_coords[:, 1].float())
-            print(f"D buffer:     lon=[{_lo2.min():.1f}, {_lo2.max():.1f}]", flush=True)
+#            _lo2 = torch.rad2deg(self.rope_cell_coords[:, 1].float())
+#            print(f"D buffer:     lon=[{_lo2.min():.1f}, {_lo2.max():.1f}]", flush=True)
             coords = coords.unsqueeze(1).repeat(1, cf.ae_local_num_queries, 1)
             coords_flat = coords.flatten(0, 1).unsqueeze(0)
             offset = self.num_extra_tokens * cf.ae_local_num_queries
             self.rope_coords.data.fill_(0.0)
             self.rope_coords.data[:, offset : offset + coords_flat.shape[1], :].copy_(coords_flat)
-            _c = self.rope_cell_coords.detach().cpu()
-            print(f"ROPE cell: n={_c.shape[0]} lat=[{torch.rad2deg(_c[:,0]).min():.1f}, "
-                  f"{torch.rad2deg(_c[:,0]).max():.1f}] lon=[{torch.rad2deg(_c[:,1]).min():.1f}, "
-                  f"{torch.rad2deg(_c[:,1]).max():.1f}]", flush=True)
+#            _c = self.rope_cell_coords.detach().cpu()
+#            print(f"ROPE cell: n={_c.shape[0]} lat=[{torch.rad2deg(_c[:,0]).min():.1f}, "
+#                  f"{torch.rad2deg(_c[:,0]).max():.1f}] lon=[{torch.rad2deg(_c[:,1]).min():.1f}, "
+#                  f"{torch.rad2deg(_c[:,1]).max():.1f}]", flush=True)
 
         # pe_global: always initialized. RoPE handles relative position in Q/K, but pe_global
         # provides per-cell token identity which is critical for masked cells that have no
         # content from local assimilation. Without it, masked cells are identical and the
         # teacher representation (evaluated without dropout) collapses to low rank.
+#        self.pe_global.data.fill_(0.0)
+#        xs = 2.0 * np.pi * torch.arange(0, dim_embed, 2, device=self.pe_global.device) / dim_embed
+#        self.pe_global.data[..., 0::2] = 0.5 * torch.sin(
+#            torch.outer(8 * torch.arange(cf.ae_local_num_queries, device=self.pe_global.device), xs)
+#        )
+#        self.pe_global.data[..., 0::2] += (
+#            torch.sin(
+#                torch.outer(torch.arange(self.num_healpix_cells, device=self.pe_global.device), xs)
+#            )
+#            .unsqueeze(1)
+#            .repeat((1, cf.ae_local_num_queries, 1))
+#        )
+#        self.pe_global.data[..., 1::2] = 0.5 * torch.cos(
+#            torch.outer(8 * torch.arange(cf.ae_local_num_queries, device=self.pe_global.device), xs)
+#        )
+#        self.pe_global.data[..., 1::2] += (
+#            torch.cos(
+#                torch.outer(torch.arange(self.num_healpix_cells, device=self.pe_global.device), xs)
+#            )
+#            .unsqueeze(1)
+#            .repeat((1, cf.ae_local_num_queries, 1))
+#        )
+        # pe_global: always initialized. RoPE handles relative position in Q/K, but pe_global
+        # provides per-cell token identity which is critical for masked cells that have no
+        # content from local assimilation. Without it, masked cells are identical and the
+        # teacher representation (evaluated without dropout) collapses to low rank.
+        #
+        # The encoding is GEOGRAPHIC, not index-based. The previous version used
+        # sin(c * xs_k) on the compact cell index c; because active_cells is sorted, c is
+        # monotone in the global nested index and hence in the level-5 parent, so the
+        # lowest-frequency components (period ~1024 in c) were near-constant within each
+        # coarse parent and showed up as visible blocks in the latent. A multi-scale
+        # sin/cos encoding of (lat, lon) is continuous across the sphere, has no
+        # hierarchical seams, and still gives every cell a distinct code.
         self.pe_global.data.fill_(0.0)
         xs = 2.0 * np.pi * torch.arange(0, dim_embed, 2, device=self.pe_global.device) / dim_embed
+
+        # --- query-identity term (unchanged) -----------------------------------
+        # With ae_local_num_queries == 1 this is a constant; kept so that >1 still works.
         self.pe_global.data[..., 0::2] = 0.5 * torch.sin(
             torch.outer(8 * torch.arange(cf.ae_local_num_queries, device=self.pe_global.device), xs)
-        )
-        self.pe_global.data[..., 0::2] += (
-            torch.sin(
-                torch.outer(torch.arange(self.num_healpix_cells, device=self.pe_global.device), xs)
-            )
-            .unsqueeze(1)
-            .repeat((1, cf.ae_local_num_queries, 1))
         )
         self.pe_global.data[..., 1::2] = 0.5 * torch.cos(
             torch.outer(8 * torch.arange(cf.ae_local_num_queries, device=self.pe_global.device), xs)
         )
-        self.pe_global.data[..., 1::2] += (
-            torch.cos(
-                torch.outer(torch.arange(self.num_healpix_cells, device=self.pe_global.device), xs)
+
+        # --- geographic cell-identity term -------------------------------------
+        # Cell centres in the codebase's convention. r3tos2 returns azimuth wrapped to
+        # (-pi, pi] by atan2; remainder() unwraps it to [0, 2pi) so that a domain
+        # straddling the wrap is continuous. Recomputed here rather than reused from the
+        # rope_2D block above, because pe_global is initialised unconditionally while
+        # that block is not.
+        pe_verts, _ = healpix_verts_rots(self.healpix_level, 0.5, 0.5)
+        pe_verts = pe_verts[torch.from_numpy(self.domain.active_cells)]
+        pe_coords = r3tos2(pe_verts.to(self.pe_global.device)).to(torch.float32)
+        pe_lat = pe_coords[:, 0]
+        pe_lon = torch.remainder(pe_coords[:, 1], 2 * torch.pi)
+
+        # GLOBAL normalisation to [0, 1]: portable across domains, so a checkpoint's PE
+        # means the same thing for a regional and a global run. lat in [-pi/2, pi/2],
+        # lon in [0, 2pi).
+        u_lat = (pe_lat + torch.pi / 2) / torch.pi
+        u_lon = pe_lon / (2 * torch.pi)
+
+        # Geometric frequency ladder from 1 cycle per globe up to ~4 cycles per healpix
+        # cell, so the finest scale resolves individual cells while the coarsest is
+        # smooth over the sphere. dim_embed is split 4 ways: sin/cos x lat/lon.
+        n_freq = dim_embed // 4
+        cell_frac = (58.6 / (2**self.healpix_level)) / 360.0
+        max_freq = 4.0 / cell_frac
+        freqs = torch.exp(
+            torch.linspace(
+                0.0, float(np.log(max_freq)), n_freq, device=self.pe_global.device
             )
-            .unsqueeze(1)
-            .repeat((1, cf.ae_local_num_queries, 1))
+        )
+
+        ang_lat = 2 * torch.pi * torch.outer(u_lat, freqs)
+        ang_lon = 2 * torch.pi * torch.outer(u_lon, freqs)
+        pe_geo = torch.cat(
+            [torch.sin(ang_lat), torch.cos(ang_lat), torch.sin(ang_lon), torch.cos(ang_lon)],
+            dim=-1,
+        )  # (num_healpix_cells, 4 * n_freq)
+
+        assert pe_geo.shape[-1] == dim_embed, (
+            f"geographic pe_global width {pe_geo.shape[-1]} != dim_embed {dim_embed}; "
+            "ae_global_dim_embed must be divisible by 4."
+        )
+
+        self.pe_global.data += (
+            pe_geo.to(self.pe_global.dtype).unsqueeze(1).repeat((1, cf.ae_local_num_queries, 1))
         )
 
         # healpix neighborhood structure (compact indexing, see __init__)

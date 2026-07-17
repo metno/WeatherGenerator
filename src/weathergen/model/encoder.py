@@ -147,7 +147,7 @@ class EncoderModule(torch.nn.Module):
                 components=[0, 1, 2, 3],
                 num_extra_tokens=self.num_register_tokens + self.num_class_tokens,
                 num_queries=self.cf.ae_local_num_queries,
-                every=730,                    # <-- your actual epoch length
+                every=10,                    # <-- your actual epoch length
                 out_dir="/home/cristianl/weathergenerator/plots/domain_check",
             )
 
