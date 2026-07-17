@@ -260,10 +260,28 @@ class MetnoParser(CfParser):
         ilon = ds.lon.values[:]
         Isort = self.get_sorting(ilat, ilon, olat.flatten(), olon.flatten())
 
-        if Npoints != len(Isort):
+        from scipy.spatial import cKDTree
+        _tree = cKDTree(np.stack([ilat, ilon], axis=1))
+        _dist, _ = _tree.query(np.stack([olat.flatten(), olon.flatten()], axis=1), k=1)
+        _outside = _dist > 0.5      # degrees; make it a CLI arg
+
+        # For a regional domain, Npoints < len(Isort) is EXPECTED: the zarr holds only
+        # in-domain points while the template spans the full grid. get_sorting returns one
+        # input index per OUTPUT point, so len(Isort) == len(olat) regardless of Npoints.
+        if Npoints > len(Isort):
             raise ValueError(
-                f"Point count mismatch between input ({Npoints}) and template ({len(Isort)})."
+                f"Input has more points ({Npoints}) than template ({len(Isort)})."
             )
+        if Npoints < len(Isort):
+            _logger.warning(
+                f"Input ({Npoints}) covers only part of the template ({len(Isort)}). "
+                "Template points outside the data domain are filled by nearest neighbour "
+                "(constant extrapolation) unless masked."
+            )
+#        if Npoints != len(Isort):
+#            raise ValueError(
+#                f"Point count mismatch between input ({Npoints}) and template ({len(Isort)})."
+#            )
 
         # forecast_step, ipoint, channel, ensemble_member
         all_values = ds.values
