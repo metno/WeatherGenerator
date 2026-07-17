@@ -49,7 +49,7 @@ import torch
 _logger = logging.getLogger(__name__)
 
 _PLOTTED: set = set()
-
+_CALLS: dict = {"n": 0}
 
 def plot_latent_map(
     tokens_global: torch.Tensor,
@@ -61,6 +61,7 @@ def plot_latent_map(
     out_dir: str | Path = "./plots/domain_check",
     tag: str = "",
     once: bool = True,
+    every: int | None = None,
 ) -> None:
     """
     Plot latent components, L2 norm and PCA of the global latent, on a lat/lon map.
@@ -81,6 +82,16 @@ def plot_latent_map(
     sample_idx :
         Which element of the leading (rs) dimension to plot.
     """
+
+    # Count every call, plot only every Nth. This sidesteps cf.general.istep, which
+    # is a snapshot on the encoder and never advances.
+    if every is not None:
+        n = _CALLS["n"]
+        _CALLS["n"] += 1
+        if n % every != 0:
+            return
+        tag = f"{tag}_c{n:06d}" if tag else f"c{n:06d}"
+        once = False               # the counter is the gate now, not the key
 
     components = [0, 1, 2, 3] if components is None else components
 
@@ -232,3 +243,4 @@ def plot_latent_map(
 def reset() -> None:
     """Forget what has been plotted."""
     _PLOTTED.clear()
+    _CALLS["n"] = 0

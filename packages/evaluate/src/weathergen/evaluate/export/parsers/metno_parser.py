@@ -264,6 +264,8 @@ class MetnoParser(CfParser):
         _tree = cKDTree(np.stack([ilat, ilon], axis=1))
         _dist, _ = _tree.query(np.stack([olat.flatten(), olon.flatten()], axis=1), k=1)
         _outside = _dist > 0.5      # degrees; make it a CLI arg
+        _logger.info(f"Masking {_outside.sum()} of {len(_outside)} template points "
+                     f"(dist > 0.5 deg from nearest input point)")
 
         # For a regional domain, Npoints < len(Isort) is EXPECTED: the zarr holds only
         # in-domain points while the template spans the full grid. get_sorting returns one
@@ -290,6 +292,16 @@ class MetnoParser(CfParser):
         for i, channel in enumerate(ds.channel.to_numpy()):
             _logger.info(f"Processing {channel}")
             values = all_values[:, Isort, i, :]
+
+            # Mask template points with no nearby input point. NearestNDInterpolator has
+            # no distance cutoff, so without this, points outside the regional domain are
+            # filled with the nearest domain-EDGE value (constant extrapolation) and the
+            # output looks complete while being wrong.
+            # Must be applied HERE, before the transpose: the point axis is axis 1 at this
+            # stage but becomes axis 2 in the has_ens branch below.
+            values = values.astype(np.float32, copy=True)   # writable + NaN-capable
+            values[:, _outside, :] = np.nan
+
             if has_ens:
                 values = values.transpose(0, 2, 1)      # (T, P, M) -> (T, M, P)
             else:
