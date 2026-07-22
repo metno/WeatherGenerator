@@ -97,12 +97,10 @@ class VerifParser(CfParser):
                 f"Reference time {ref_time} not found in observation data. Skipping sample."
             )
             return
-
         da_fs = []
         for result in fstep_iterator_results:
             if result is None:
                 continue
-            # result is already a materialized xarray DataArray (built in the worker).
             if not isinstance(result, xr.DataArray):
                 result = result.as_xarray().squeeze()
             result = result.sel(channel=self.channels)
@@ -117,11 +115,28 @@ class VerifParser(CfParser):
                 self.zarr_coords = get_grid_points(da_fs[0])
                 self.zarr_dt = self.get_zarr_dt(source_interval_start, source_interval_end)
             # check consistency of grid points across forecast steps
+#            if len(da_fs) > 1:
+#                assert np.array_equal(get_grid_points(da_fs[1]), get_grid_points(da_fs[0])), (
+#                    "Grid points between forecast steps are not consistent."
+#                    "Check that inference was not performed with masking"
+#                )
             if len(da_fs) > 1:
-                assert np.array_equal(get_grid_points(da_fs[1]), get_grid_points(da_fs[0])), (
-                    "Grid points between forecast steps are not consistent."
-                    "Check that inference was not performed with masking"
-                )
+                g0 = get_grid_points(da_fs[0])
+                g1 = get_grid_points(da_fs[1])
+                lat2d = da_fs[0].lat.values
+#                print(f"lat constant across valid_time now: {np.all(lat2d == lat2d[:, [0]])}",flush=True)
+                print(f"grid shapes: {g0.shape} {g1.shape}",flush=True)
+                print(f"lat dims: {da_fs[0].lat.dims} {da_fs[0].lat.values.shape}",flush=True)
+                print(f"grid equal: {np.array_equal(g0, g1)}",flush=True)
+                if g0.shape == g1.shape:
+                    diff = ~np.all(g0 == g1, axis=1)
+                    print(f"n differing rows: {diff.sum()} of {g0.shape[0]}",flush=True)
+                    # are they the same SET of points, just ordered differently?
+                    if g0.ndim == 2 and g0.shape[1] == 2:
+                        s0 = g0[np.lexsort((g0[:,1], g0[:,0]))]
+                        s1 = g1[np.lexsort((g1[:,1], g1[:,0]))]
+                        print(f"same set after re-sort: {np.array_equal(s0, s1)}",flush=True)
+                assert np.array_equal(g1, g0), (...)
             da_fs = self.concatenate(da_fs)
             da_fs = self.assign_frt(da_fs, ref_time)
             da_fs = self.add_attrs(da_fs)
@@ -187,62 +202,81 @@ class VerifParser(CfParser):
     def reshape(self, data: xr.DataArray) -> xr.Dataset:
         """
         Reshape dataset while preserving grid structure (regular or Gaussian).
-
         Parameters
         ----------
         data : xr.DataArray
             Input data with dimensions (ipoint, channel)
-
         Returns
         -------
         xr.Dataset
             Reshaped dataset appropriate for the grid type
         """
-        grid_type = self.grid_type
-
-        # Original logic
         var_dict = find_pl(data.channel.values)
-        data_vars = {}
+        n_vt = np.unique(data["valid_time"].values).size
+        n_ipoint = data.sizes["ipoint"]
+        assert n_ipoint % n_vt == 0, (
+            f"ipoint ({n_ipoint}) is not divisible by n valid_time ({n_vt})"
+        )
+        n_points = n_ipoint // n_vt
 
+        # Prediction data carries an `ensemble_member` axis (possibly length 1);
+        # target data does not. Squeeze it once here if present so the per-channel
+        # selections below are uniformly 1D/2D regardless of data type.
+        if "ensemble_member" in data.dims:
+            data = data.squeeze("ensemble_member", drop=True)
+
+        # ipoint is a flattened (valid_time, spatial_point) axis in TIME-MAJOR
+        # (C) order: index = t * n_points + point. So the first n_points entries
+        # are all valid_time[0], the next n_points are valid_time[1], etc.
+        # Reshape to (n_vt, n_points) then transpose to (ncells, valid_time).
+        def _unflatten(values_1d):
+            return np.asarray(values_1d).reshape(n_vt, n_points).T  # -> (n_points, n_vt)
+
+        lat_2d = _unflatten(data["lat"].values)
+        lon_2d = _unflatten(data["lon"].values)
+        # Each spatial point must have a constant location across valid_time.
+        assert np.all(lat_2d == lat_2d[:, [0]]), "lat varies within a point across valid_time"
+        assert np.all(lon_2d == lon_2d[:, [0]]), "lon varies within a point across valid_time"
+        lat_1d = lat_2d[:, 0]
+        lon_1d = lon_2d[:, 0]
+
+        # valid_time must be constant across points within a time column.
+        vt_2d = _unflatten(data["valid_time"].values)  # (n_points, n_vt)
+        assert np.all(vt_2d == vt_2d[[0], :]), "valid_time varies across points within a time"
+        valid_times = vt_2d[0, :]  # (n_vt,)
+
+        data_vars = {}
         for new_var, pls in var_dict.items():
             if pls[0] is not None:
                 old_vars = [f"{new_var}_{p}" for p in pls]
+                sel = data.sel(channel=old_vars).values
+                # (n_ipoint, n_pl) -> (n_vt, n_points, n_pl) -> (n_points, n_vt, n_pl)
+                arr = sel.reshape(n_vt, n_points, len(pls)).transpose(1, 0, 2)
                 data_vars[new_var] = xr.DataArray(
-                    data.sel(channel=old_vars).values,
-                    dims=["ipoint", "pressure_level"],
+                    arr,
+                    dims=["ncells", "valid_time", "pressure_level"],
                     coords={"pressure_level": pls},
                 )
             else:
+                sel = data.sel(channel=new_var).values
                 data_vars[new_var] = xr.DataArray(
-                    data.sel(channel=new_var).values,
-                    dims=["ipoint"],
+                    _unflatten(sel),
+                    dims=["ncells", "valid_time"],
                 )
 
         reshaped_dataset = xr.Dataset(data_vars)
         reshaped_dataset = reshaped_dataset.assign_coords(
-            ipoint=data.coords["ipoint"],
+            ncells=np.arange(n_points),
+            valid_time=("valid_time", valid_times),
+            lat=("ncells", lat_1d),
+            lon=("ncells", lon_1d),
         )
 
-        # order using pressure_level coord
         if "pressure_level" in reshaped_dataset.coords:
             reshaped_dataset = reshaped_dataset.sortby("pressure_level")
 
-        if grid_type == "regular":
-            # Use original reshape logic for regular grids
-            # This is safe for regular grids
-            reshaped_dataset = reshaped_dataset.set_index(
-                ipoint=("valid_time", "lat", "lon")
-            ).unstack("ipoint")
-        else:
-            # Use new logic for Gaussian/unstructured grids
-            reshaped_dataset = reshaped_dataset.set_index(ipoint2=("ipoint", "valid_time")).unstack(
-                "ipoint2"
-            )
-            # rename ipoint to ncells
-            reshaped_dataset = reshaped_dataset.rename_dims({"ipoint": "ncells"})
-            reshaped_dataset = reshaped_dataset.rename_vars({"ipoint": "ncells"})
-
         return reshaped_dataset
+
 
     def obs_preprocess(self, ds_var, verif_var: str) -> xr.DataArray:
         """
@@ -434,7 +468,11 @@ class VerifParser(CfParser):
 
     def assign_frt(self, ds: xr.Dataset, reference_time: np.datetime64) -> xr.Dataset:
         """
-        Assign forecast reference time coordinate to the dataset.
+        Assign forecast reference time and derive forecast_step / leadtime.
+
+        With the flat reshape, the dataset carries `valid_time` as a dimension
+        rather than a per-step `forecast_step` coordinate. Lead time is therefore
+        derived as (valid_time - reference_time), in hours.
 
         Parameters
         ----------
@@ -443,16 +481,26 @@ class VerifParser(CfParser):
 
         Returns
         -------
-            xarray Dataset with assigned forecast reference time coordinate.
+            xarray Dataset with forecast_reference_time, time and forecast_step.
         """
         ds = ds.assign_coords(forecast_reference_time=reference_time)
 
         if "sample" in ds.coords:
             ds = ds.drop_vars("sample")
-        n_hours = self.fstep_hours.astype("int64")
-        ds["forecast_step"] = ds["forecast_step"] * n_hours
-        return ds
 
+        # Derive lead time in hours from valid_time - reference_time.
+        vt = ds["valid_time"].values.astype("datetime64[h]")
+        ref = np.datetime64(reference_time, "h")
+        lead_hours = (vt - ref).astype("timedelta64[h]").astype("int64")
+
+        # Replace the valid_time dimension with an integer forecast_step (hours),
+        # matching what regrid/obs_preprocess expect (a `leadtime`-like coord in hours
+        # plus a `time` reference coord).
+        ds = ds.assign_coords(forecast_step=("valid_time", lead_hours))
+        ds = ds.swap_dims({"valid_time": "forecast_step"})
+        ds = ds.assign_coords(time=reference_time)
+
+        return ds
     def add_attrs(self, ds: xr.Dataset) -> xr.Dataset:
         """
         Add CF-compliant attributes to the dataset variables.

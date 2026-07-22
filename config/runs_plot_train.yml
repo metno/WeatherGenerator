@@ -1,31 +1,22 @@
 train : 
   plot :
-    q7ur75dg : 
-      slurm_id: 987050
-      description: "e0"
+    h3obc6lj : 
+      slurm_id: 1002612
+      description: "e15"
       eval: vgbndhco
-    cs5r6jj2 : 
-      slurm_id: 987052
-      description: "e1"
+#    f9074xu6 : 
+#      slurm_id: 999608
+#      description: "e14"
+#      eval: vgbndhco
+    vufyq3kx : 
+      slurm_id: 1006259
+      description: "e15cont"
       eval: vgbndhco
-    h324ro85 : 
-      slurm_id: 987056
-      description: "e2"
-      eval: vgbndhco
-    rqtcbquc : 
-      slurm_id: 987058
-      description: "e3"
-      eval: vgbndhco
-    huu9gdad : 
-      slurm_id: 987060
-      description: "e4"
-      eval: vgbndhco
-    bnep6c2t : 
-      slurm_id: 989272
-      description: "e5"
-      eval: vgbndhco
-    v0wxilno : 
-      slurm_id: 990248
-      description: "e6"
-      eval: vgbndhco
-
+#    cqc8wr39 : 
+#      slurm_id: 1004108
+#      description: "e16"
+#      eval: vgbndhco
+#    siq6bwu9 : 
+#      slurm_id: 1005025
+#      description: "e16a"
+#      eval: vgbndhco

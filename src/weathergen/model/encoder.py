@@ -139,17 +139,17 @@ class EncoderModule(torch.nn.Module):
         )
 
         # TEMP latent check -- remove after
-        from weathergen.model.plot_latent_check import plot_latent_map
-        if self.training:
-            plot_latent_map(
-                tokens_global,
-                self.domain,
-                components=[0, 1, 2, 3],
-                num_extra_tokens=self.num_register_tokens + self.num_class_tokens,
-                num_queries=self.cf.ae_local_num_queries,
-                every=10,                    # <-- your actual epoch length
-                out_dir="/home/cristianl/weathergenerator/plots/domain_check",
-            )
+#        from weathergen.model.plot_latent_check import plot_latent_map
+#        if self.training:
+#            plot_latent_map(
+#                tokens_global,
+#                self.domain,
+#                components=[0, 1, 2, 3],
+#                num_extra_tokens=self.num_register_tokens + self.num_class_tokens,
+#                num_queries=self.cf.ae_local_num_queries,
+#                every=10,                    # <-- your actual epoch length
+#                out_dir="/home/cristianl/weathergenerator/plots/domain_check",
+#            )
 
         return tokens_global, posteriors
 
