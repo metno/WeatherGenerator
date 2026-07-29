@@ -1,16 +1,16 @@
 train : 
   plot :
-    h3obc6lj : 
-      slurm_id: 1002612
-      description: "e15"
+    g7pzmqx3 : 
+      slurm_id: 999606
+      description: "e13"
       eval: vgbndhco
 #    f9074xu6 : 
 #      slurm_id: 999608
 #      description: "e14"
 #      eval: vgbndhco
-    vufyq3kx : 
-      slurm_id: 1006259
-      description: "e15cont"
+    v74kw3m5 : 
+      slurm_id: 1006247
+      description: "e13cont"
       eval: vgbndhco
 #    cqc8wr39 : 
 #      slurm_id: 1004108
