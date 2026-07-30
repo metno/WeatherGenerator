@@ -76,6 +76,7 @@ class Domain:
         active_cells: NDArray[np.int64],
         is_global: bool = False,
         bbox: tuple | None = None,
+        pad_rings: int = 0,
     ) -> None:
         num_total = 12 * 4**healpix_level
 
@@ -83,6 +84,7 @@ class Domain:
         self.active_cells = np.asarray(active_cells, dtype=np.int64)
         self.is_global = is_global
         self.bbox = bbox
+        self.pad_rings = pad_rings
 
         assert self.active_cells.ndim == 1, "active_cells must be 1D"
         assert len(self.active_cells) > 0, (
@@ -284,8 +286,10 @@ class Domain:
         lon_min, lon_max, lat_min, lat_max = self.bbox
 
         # cell diagonal at this level, times number of padding rings, plus slack
+#        cell_deg = 58.6 / (2**self.healpix_level)
+#        margin = cell_deg * 2.0
         cell_deg = 58.6 / (2**self.healpix_level)
-        margin = cell_deg * 2.0
+        margin = cell_deg * (self.pad_rings + 2)
 
         in_lat = (lats >= lat_min - margin) & (lats <= lat_max + margin)
         if lon_min <= lon_max:
