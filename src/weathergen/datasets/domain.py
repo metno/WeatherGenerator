@@ -216,6 +216,7 @@ class Domain:
             selected,
             is_global=(len(selected) == num_total),
             bbox=(lon_min, lon_max, lat_min, lat_max),
+            pad_rings=pad_rings,
         )
 
     @classmethod
