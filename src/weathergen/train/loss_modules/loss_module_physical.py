@@ -418,6 +418,7 @@ class LossPhysical(LossModuleBase):
         target, pred, target_coords_raw, weights_channels,
         stream_name="", template_path="",
         detail_weight=2.0, num_levels=3, var_weight_epsilon=1e-3,
+        regrid_method="nearest",
     ):
         if target.shape[0] == 0:
             return (
@@ -432,6 +433,7 @@ class LossPhysical(LossModuleBase):
             detail_weight=detail_weight, num_levels=num_levels,
             var_weight_epsilon=var_weight_epsilon,
             stream_name=stream_name,
+            regrid_method=regrid_method,
         )
 
     @staticmethod
@@ -764,12 +766,22 @@ class LossPhysical(LossModuleBase):
                                 )
 
                         elif loss_fct_name == "global_haar_wavelet_reshape_varweighted":
+                            # regrid_method is resolved PER STREAM: a value in the
+                            # stream config (stream_info) wins over the global loss
+                            # config (loss_fct_params), which in turn falls back to
+                            # "nearest". This lets ERA5 use "linear" and MEPS use
+                            # "nearest" in the same run.
+                            _regrid = stream_info.get(
+                                "regrid_method",
+                                loss_fct_params.get("regrid_method", "nearest"),
+                            )
                             loss_lfct, loss_lfct_chs = self._loss_global_haar_varweighted(
                                 target, pred, targets_coords_batch[target_idx],
                                 weights_channels, stream_name=stream_name,
                                 template_path=stream_info.get("template_path", ""),
+                                regrid_method=_regrid,
                                 **{k: v for k, v in loss_fct_params.items()
-                                   if k != "template_path"},
+                                   if k not in ("template_path", "regrid_method")},
                             )
 
                         elif loss_fct_name == "global_haar_wavelet_reshape_varweighted_crps":

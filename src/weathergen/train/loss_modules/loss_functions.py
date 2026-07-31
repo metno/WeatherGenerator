@@ -2203,6 +2203,7 @@ def global_haar_wavelet_reshape_varweighted(
     num_levels: int = 3,
     var_weight_epsilon: float = 1e-3,
     stream_name: str = "",
+    regrid_method: str = "nearest",
 ):
     """
     Global 2D Haar wavelet MSE with inverse-variance spatial weighting.
@@ -2320,9 +2321,155 @@ def global_haar_wavelet_reshape_varweighted(
     Isort   = interpolator(template_grid).astype(int)
     Isort_t = torch.from_numpy(Isort).long().to(dev)
 
+    # --- domain crop: mask template cells with no nearby data point ---
+    # When a regional `domain:` is configured, `target`/`target_coords_raw` hold
+    # only in-domain points, but `template_grid` is the FULL (uncropped) grid from
+    # template_path. NearestNDInterpolator then extrapolates: every template cell
+    # outside the domain is filled by the nearest in-domain edge point, smearing a
+    # few boundary points across the whole grid and swamping the real signal.
+    #
+    # Guard against this by measuring, for each template cell, the great-circle-ish
+    # distance to its assigned nearest data point and invalidating cells that are
+    # too far. "Too far" is scaled to the template's own cell spacing, so the test
+    # is resolution-independent and a no-op for the global case (every cell then
+    # has a data point within ~one cell spacing).
+    from scipy.spatial import cKDTree as _cKDTree_vw
+
+    # median nearest-neighbour spacing of the template grid (degrees)
+    _tree_tmpl = _cKDTree_vw(template_grid)
+    _tmpl_nn, _ = _tree_tmpl.query(template_grid, k=2)
+    _tmpl_dx = float(_np_vw.median(_tmpl_nn[:, 1]))
+
+    # median nearest-neighbour spacing of the DATA point set (degrees).
+    # This is what lets a legitimately coarse stream (e.g. ERA5 o96, ~1 deg)
+    # share a fine template (e.g. MEPS 2.5 km): the "is there a nearby data
+    # point?" radius is scaled to the data's own resolution, not the template's,
+    # so each data point is allowed to fill roughly its own footprint on the
+    # fine grid instead of being masked out. For a stream whose data already
+    # matches the template (MEPS on MEPS) _data_dx ~ _tmpl_dx and behaviour is
+    # unchanged. k=2 needs at least 2 points; guard the degenerate case.
+    if ipoints.shape[0] >= 2:
+        _tree_self = _cKDTree_vw(ipoints)
+        _self_nn, _ = _tree_self.query(ipoints, k=2)
+        _data_dx = float(_np_vw.median(_self_nn[:, 1]))
+    else:
+        _data_dx = _tmpl_dx
+
+    # allow a cell if it is within ~2 cells of EITHER yardstick, taking the
+    # coarser of the two so coarse-on-fine is admitted while the out-of-domain
+    # extrapolation (points genuinely absent) is still rejected.
+    _max_dist = max(max(_tmpl_dx, _data_dx) * 2.0, 1e-6)
+
+    # distance from each template cell to the nearest ACTUAL data point
+    _tree_data = _cKDTree_vw(ipoints)
+    _data_nn, _ = _tree_data.query(template_grid, k=1)
+    valid_cell = torch.from_numpy(_data_nn <= _max_dist).to(dev)  # (ny*nx,)
+
     # --- gather values onto 2D grid ---
     t_flat = target.float()[Isort_t]
     p_flat = pred_mean.float()[Isort_t]
+
+    # On invalid (out-of-domain) cells force target == pred so that all Haar detail
+    # coefficients of (target - pred) vanish there and the cell contributes exactly
+    # zero to every subband loss. We copy the (detached) target onto pred; using a
+    # neutral fill (e.g. the domain mean) would work equally for the difference but
+    # this keeps target's own spatial statistics intact for the field_var/local_var
+    # normalisation below.
+    _valid_c = valid_cell.unsqueeze(-1)  # (ny*nx, 1)
+    p_flat = torch.where(_valid_c, p_flat, t_flat.detach())
+
+    # --- optional bilinear (linear barycentric) regridding ---------------
+    # regrid_method:
+    #   "nearest" (default) : block replication via Isort — index gather, exact
+    #                         reproduction of the original behaviour.
+    #   "linear"            : barycentric (bilinear-on-a-triangulation) resampling
+    #                         of the scattered source points onto the template grid.
+    #                         Removes the staircase step-edges that nearest injects
+    #                         when the source is much coarser than the template
+    #                         (e.g. ERA5 o96 on a MEPS 2.5 km template), so the Haar
+    #                         detail bands measure real structure instead of the
+    #                         regridding stencil.
+    #
+    # The linear weights depend ONLY on coordinates (constant within a step), so we
+    # build them once as a sparse (ny*nx, N) matrix W and apply it as W @ values to
+    # BOTH target and pred. This keeps the operation fully differentiable and
+    # identical for target and pred, exactly like the index gather it replaces.
+    # Cells outside the source convex hull (barycentric interpolation is undefined
+    # there) fall back to the nearest value already in t_flat/p_flat.
+    if regrid_method == "linear" and ipoints.shape[0] >= 3:
+        try:
+            from scipy.spatial import Delaunay as _Delaunay_vw
+
+            _tri = _Delaunay_vw(ipoints)
+            _simplex = _tri.find_simplex(template_grid)          # (ny*nx,), -1 outside hull
+            _inside = _simplex >= 0
+
+            if _inside.any():
+                # barycentric coordinates of each inside cell w.r.t. its simplex
+                _sx = _simplex[_inside]
+                _T = _tri.transform[_sx, :2]                     # (M, 2, 2)
+                _r = template_grid[_inside] - _tri.transform[_sx, 2]  # (M, 2)
+                _bary2 = _np_vw.einsum("mij,mj->mi", _T, _r)     # (M, 2)
+                _bary = _np_vw.concatenate(
+                    [_bary2, 1.0 - _bary2.sum(axis=1, keepdims=True)], axis=1
+                )                                                # (M, 3)
+                _verts = _tri.simplices[_sx]                     # (M, 3) source-point indices
+
+                _M = _bary.shape[0]
+                _rows = _np_vw.repeat(_np_vw.flatnonzero(_inside), 3)
+                _cols = _verts.reshape(-1)
+                _wts = _bary.reshape(-1).astype(_np_vw.float32)
+
+                _W = torch.sparse_coo_tensor(
+                    torch.from_numpy(_np_vw.stack([_rows, _cols])).long(),
+                    torch.from_numpy(_wts),
+                    size=(template_grid.shape[0], ipoints.shape[0]),
+                    device=dev,
+                    check_invariants=False,
+                ).coalesce()
+
+                # W @ values, differentiable; only overwrite the inside cells so
+                # hull-exterior cells keep their nearest fallback.
+                _t_lin = torch.sparse.mm(_W, target.float())     # (ny*nx, C)
+                _p_lin = torch.sparse.mm(_W, pred_mean.float())
+                _inside_t = torch.from_numpy(_inside).to(dev).unsqueeze(-1)
+                t_flat = torch.where(_inside_t, _t_lin, t_flat)
+                p_flat = torch.where(_inside_t, _p_lin, p_flat)
+                # re-apply the domain validity mask (linear may have touched cells
+                # that are inside the hull but far from any data point in a concave
+                # region; keep them loss-neutral)
+                p_flat = torch.where(_valid_c, p_flat, t_flat.detach())
+        except Exception as _e_lin:
+            _key = f"_vw_linear_failed_{stream_name}"
+            if not getattr(global_haar_wavelet_reshape_varweighted, _key, False):
+                setattr(global_haar_wavelet_reshape_varweighted, _key, True)
+                print(
+                    f"[global_haar_varweighted] stream={stream_name} "
+                    f"linear regrid failed ({_e_lin}); falling back to nearest."
+                )
+    elif regrid_method not in ("nearest", "linear"):
+        _key = f"_vw_bad_regrid_{stream_name}"
+        if not getattr(global_haar_wavelet_reshape_varweighted, _key, False):
+            setattr(global_haar_wavelet_reshape_varweighted, _key, True)
+            print(
+                f"[global_haar_varweighted] stream={stream_name} "
+                f"unknown regrid_method={regrid_method!r}; using nearest."
+            )
+
+    if not bool(valid_cell.any()):
+        _key = f'_vw_empty_domain_reported_{stream_name}'
+        if not getattr(global_haar_wavelet_reshape_varweighted, _key, False):
+            setattr(global_haar_wavelet_reshape_varweighted, _key, True)
+            print(
+                f"[global_haar_varweighted] stream={stream_name} "
+                f"no template cell within {_max_dist:.3g} deg of any data point; "
+                f"check that template_path matches the configured domain. "
+                f"Setting loss to zero."
+            )
+        return (
+            torch.tensor(0.0, device=dev, requires_grad=True),
+            torch.zeros(num_channels, device=dev),
+        )
 
     t_grid_raw = t_flat.view(ny, nx, num_channels)
     p_grid_raw = p_flat.view(ny, nx, num_channels)
@@ -2332,14 +2479,20 @@ def global_haar_wavelet_reshape_varweighted(
     ny_p   = int(_math_vw.ceil(ny / factor)) * factor
     nx_p   = int(_math_vw.ceil(nx / factor)) * factor
 
+    valid_grid_raw = valid_cell.view(ny, nx)  # (ny, nx) bool
     if ny_p > ny or nx_p > nx:
         t_grid = torch.zeros(ny_p, nx_p, num_channels, device=dev)
         p_grid = torch.zeros(ny_p, nx_p, num_channels, device=dev)
         t_grid[:ny, :nx, :] = t_grid_raw
         p_grid[:ny, :nx, :] = p_grid_raw
+        # padded region is invalid too (target==pred==0 there, so it is already
+        # loss-neutral, but exclude it from the field_var normaliser)
+        valid_grid = torch.zeros(ny_p, nx_p, dtype=torch.bool, device=dev)
+        valid_grid[:ny, :nx] = valid_grid_raw
     else:
         t_grid = t_grid_raw
         p_grid = p_grid_raw
+        valid_grid = valid_grid_raw
 
     # --- debug parameters ---
     DEBUG_VW_PLOT      = False
@@ -2637,7 +2790,15 @@ def global_haar_wavelet_reshape_varweighted(
             t_field = t_LL
             p_field = p_LL
 
-        field_var    = t_grid[:, :, c].var().clamp(min=1e-8)
+        # normalise by the target field variance over IN-DOMAIN cells only.
+        # Including the masked out-of-domain cells (which hold smeared edge
+        # values) would bias this normaliser; restrict to valid_grid. Falls back
+        # to the full-grid variance if for some reason nothing is valid.
+        _tvals = t_grid[:, :, c]
+        if bool(valid_grid.any()):
+            field_var = _tvals[valid_grid].var().clamp(min=1e-8)
+        else:
+            field_var = _tvals.var().clamp(min=1e-8)
         loss_chs[c] = level_loss / (num_levels * field_var)
 
     if weights_channels is not None:
