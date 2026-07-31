@@ -418,7 +418,7 @@ class LossPhysical(LossModuleBase):
         target, pred, target_coords_raw, weights_channels,
         stream_name="", template_path="",
         detail_weight=2.0, num_levels=3, var_weight_epsilon=1e-3,
-        regrid_method="nearest",
+        regrid_method="nearest", level_start=0,
     ):
         if target.shape[0] == 0:
             return (
@@ -434,6 +434,7 @@ class LossPhysical(LossModuleBase):
             var_weight_epsilon=var_weight_epsilon,
             stream_name=stream_name,
             regrid_method=regrid_method,
+            level_start=level_start,
         )
 
     @staticmethod
@@ -466,6 +467,7 @@ class LossPhysical(LossModuleBase):
         target, pred, target_coords_raw, weights_channels,
         stream_name="", template_path="",
         num_levels=3, var_weight_epsilon=1e-3,
+        regrid_method="nearest", var_weight_rel=0.0, level_start=0,
     ):
         if target.shape[0] == 0:
             return (
@@ -480,6 +482,9 @@ class LossPhysical(LossModuleBase):
             num_levels=num_levels,
             var_weight_epsilon=var_weight_epsilon,
             stream_name=stream_name,
+            regrid_method=regrid_method,
+            var_weight_rel=var_weight_rel,
+            level_start=level_start,
         )
 
     @staticmethod
@@ -766,22 +771,25 @@ class LossPhysical(LossModuleBase):
                                 )
 
                         elif loss_fct_name == "global_haar_wavelet_reshape_varweighted":
-                            # regrid_method is resolved PER STREAM: a value in the
-                            # stream config (stream_info) wins over the global loss
-                            # config (loss_fct_params), which in turn falls back to
-                            # "nearest". This lets ERA5 use "linear" and MEPS use
-                            # "nearest" in the same run.
-                            _regrid = stream_info.get(
-                                "regrid_method",
-                                loss_fct_params.get("regrid_method", "nearest"),
-                            )
+                            # Per-stream overrides: any key in the stream config's
+                            # `haar_overrides` block wins over the global loss config
+                            # (loss_fct_params). regrid_method may also be given at the
+                            # top level of the stream config for convenience. This lets
+                            # ERA5 (coarse) and MEPS (fine) run the SAME loss term with
+                            # different num_levels / detail_weight / regrid_method /
+                            # var_weight_rel in one training run.
+                            _ov = dict(loss_fct_params)
+                            _ov.update(stream_info.get("haar_overrides", {}))
+                            if "regrid_method" in stream_info:
+                                _ov["regrid_method"] = stream_info["regrid_method"]
+                            _regrid = _ov.pop("regrid_method", "nearest")
+                            _ov.pop("template_path", None)
                             loss_lfct, loss_lfct_chs = self._loss_global_haar_varweighted(
                                 target, pred, targets_coords_batch[target_idx],
                                 weights_channels, stream_name=stream_name,
                                 template_path=stream_info.get("template_path", ""),
                                 regrid_method=_regrid,
-                                **{k: v for k, v in loss_fct_params.items()
-                                   if k not in ("template_path", "regrid_method")},
+                                **_ov,
                             )
 
                         elif loss_fct_name == "global_haar_wavelet_reshape_varweighted_crps":
@@ -794,12 +802,20 @@ class LossPhysical(LossModuleBase):
                             )
 
                         elif loss_fct_name == "global_haar_ll_reshape_varweighted":
+                            _ov = dict(loss_fct_params)
+                            _ov.update(stream_info.get("haar_ll_overrides", {}))
+                            if "regrid_method" in stream_info:
+                                _ov["regrid_method"] = stream_info["regrid_method"]
+                            _regrid = _ov.pop("regrid_method", "nearest")
+                            _ov.pop("template_path", None)
+                            # drop keys the LL fn does not accept (e.g. detail_weight)
+                            _ov.pop("detail_weight", None)
                             loss_lfct, loss_lfct_chs = self._loss_global_haar_ll_varweighted(
                                 target, pred, targets_coords_batch[target_idx],
                                 weights_channels, stream_name=stream_name,
                                 template_path=stream_info.get("template_path", ""),
-                                **{k: v for k, v in loss_fct_params.items()
-                                   if k != "template_path"},
+                                regrid_method=_regrid,
+                                **_ov,
                             )
 
                         elif loss_fct_name == "healpix_cell_mse":
@@ -856,9 +872,21 @@ class LossPhysical(LossModuleBase):
                         ):
                             self.dynamic_loss_ema.update(stream_name, loss_lfct_chs)
 
+                        # Per-stream loss-weight override: a stream may scale the
+                        # contribution of an individual loss function via
+                        #   loss_weight_overrides: { <loss_fct_name>: <factor> }
+                        # in its stream config. Defaults to 1.0 (no change), so runs
+                        # without the block are unaffected. This is how ERA5 can down-
+                        # weight the detail-band haar while MEPS keeps it at full weight.
+                        _stream_lw = stream_info.get("loss_weight_overrides", {})
+                        _lw_factor = float(_stream_lw.get(loss_fct_name, 1.0))
+
                         # Add the weighted and normalized loss from this loss function to the total
                         # batch loss
-                        loss_cur_w = spoof_weight * loss_fct_weight * loss_lfct * output_step_weight
+                        loss_cur_w = (
+                            spoof_weight * loss_fct_weight * _lw_factor
+                            * loss_lfct * output_step_weight
+                        )
                         loss_st_corr = loss_st_corr + loss_cur_w
                         ctr_loss_fcts += 1 if (loss_cur_w > 0.0 and not is_spoof) else 0
 
