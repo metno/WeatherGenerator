@@ -24,7 +24,7 @@ stat_loss_fcts = ["stats", "kernel_crps"]  # Names of loss functions that need s
 HAAR_DEBUG_ENABLE = True
 HAAR_DEBUG_STREAMS = {"MEPS", "ERA5"}
 HAAR_DEBUG_OUT_DIR = "/lustre/storeB/project/nwp/weathergen/tmp/debug_run/"
-HAAR_DEBUG_EVERY_N = 100  # plot every Nth counted call (per stream)
+HAAR_DEBUG_EVERY_N = 10  # plot every Nth counted call (per stream)
 
 
 def _haar_debug_on(stream_name: str) -> bool:
