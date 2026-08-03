@@ -43,6 +43,7 @@ from weathergen.model.utils import get_num_parameters
 from weathergen.utils.distributed import is_root
 from weathergen.utils.utils import get_dtype, is_stream_forcing
 from weathergen.datasets.domain import Domain
+from weathergen.datasets.domain_pyramid import build_domain_pyramid
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,12 @@ class ModelParams(torch.nn.Module):
         self.cf = cf
 
         self.healpix_level = cf.healpix_level
-        self.domain = Domain.from_config(cf)
+        # Phase 2: build the (single-level) latent domain via the pyramid helper.
+        # With no `latent_levels` in config this is bit-identical to
+        # Domain.from_config(cf); it introduces the seam that later steps use to
+        # add coarse/fine levels without re-plumbing every call site.
+        self.domain_pyramid = build_domain_pyramid(cf)
+        self.domain = self.domain_pyramid.domain(self.domain_pyramid.finest)
         self.num_healpix_cells = len(self.domain)
         self.dtype = get_dtype(cf.attention_dtype)
 
@@ -392,7 +398,9 @@ class Model(torch.nn.Module):
         super(Model, self).__init__()
 
         self.healpix_level = cf.healpix_level
-        self.num_healpix_cells = len(Domain.from_config(cf))
+        # Phase 2: single-level domain via the pyramid helper (see ModelParams).
+        self.domain_pyramid = build_domain_pyramid(cf)
+        self.num_healpix_cells = len(self.domain_pyramid.domain(self.domain_pyramid.finest))
 
         self.cf = cf
         self.dtype = get_dtype(self.cf.attention_dtype)

@@ -25,7 +25,7 @@ from weathergen.model.engines import (
 # from weathergen.model.model import ModelParams
 from weathergen.model.parametrised_prob_dist import LatentInterpolator
 from weathergen.model.positional_encoding import positional_encoding_harmonic
-from weathergen.datasets.domain import Domain
+from weathergen.datasets.domain_pyramid import build_domain_pyramid
 
 class EncoderModule(torch.nn.Module):
     name: "EncoderModule"
@@ -42,8 +42,10 @@ class EncoderModule(torch.nn.Module):
         self.cf = cf
 
         self.healpix_level = cf.healpix_level
-        self.domain = Domain.from_config(cf)
-        self.num_healpix_cells = len(Domain.from_config(cf))
+        # Phase 2: single-level domain via the pyramid helper (see ModelParams).
+        self.domain_pyramid = build_domain_pyramid(cf)
+        self.domain = self.domain_pyramid.domain(self.domain_pyramid.finest)
+        self.num_healpix_cells = len(self.domain)
 
         self.cf = cf
         self.sources_size = sources_size
@@ -139,17 +141,17 @@ class EncoderModule(torch.nn.Module):
         )
 
         # TEMP latent check -- remove after
-        from weathergen.model.plot_latent_check import plot_latent_map
-        if self.training:
-            plot_latent_map(
-                tokens_global,
-                self.domain,
-                components=[0, 1, 2, 3],
-                num_extra_tokens=self.num_register_tokens + self.num_class_tokens,
-                num_queries=self.cf.ae_local_num_queries,
-                every=10,                    # <-- your actual epoch length
-                out_dir="/home/cristianl/weathergenerator/plots/domain_check",
-            )
+#        from weathergen.model.plot_latent_check import plot_latent_map
+#        if self.training:
+#            plot_latent_map(
+#                tokens_global,
+#                self.domain,
+#                components=[0, 1, 2, 3],
+#                num_extra_tokens=self.num_register_tokens + self.num_class_tokens,
+#                num_queries=self.cf.ae_local_num_queries,
+#                every=10,                    # <-- your actual epoch length
+#                out_dir="/home/cristianl/weathergenerator/plots/domain_check",
+#            )
 
         return tokens_global, posteriors
 

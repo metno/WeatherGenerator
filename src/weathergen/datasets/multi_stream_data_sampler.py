@@ -39,6 +39,7 @@ from weathergen.train.utils import Stage, get_batch_size_from_config
 from weathergen.utils.distributed import is_root
 
 from weathergen.datasets.domain import Domain
+from weathergen.datasets.domain_pyramid import build_domain_pyramid
 
 type AnyDataReader = DataReaderBase | DataReaderAnemoi | DataReaderObs
 type StreamName = str
@@ -113,7 +114,10 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         # The domain is the single source of truth for which cells exist. For a
         # global run (no `domain:` block in the config) len(domain) == 12 * 4**hl
         # and every mapping below is the identity.
-        self.domain = Domain.from_config(cf)                            # <-- ADD
+        # Phase 2: obtain it via the pyramid helper (bit-identical to
+        # Domain.from_config(cf) with one level; seam for per-stream levels later).
+        self.domain_pyramid = build_domain_pyramid(cf)
+        self.domain = self.domain_pyramid.domain(self.domain_pyramid.finest)
         self.num_healpix_cells = len(self.domain)                       # <-- CHANGE
         self.masker = Masker(
             cf.healpix_level, stage, cf.streams, self.mode_cfg, domain=self.domain   # <-- ADD

@@ -285,3 +285,36 @@ class DomainPyramid:
     def child_valid(self, coarse_level: int, fine_level: int) -> NDArray[np.bool_]:
         """(num_coarse_active, 4**(lf-lc)) bool mask of valid children."""
         return self._child_valid[self._pair_key(coarse_level, fine_level)]
+
+
+def build_domain_pyramid(cf) -> DomainPyramid:
+    """
+    Single entry point for constructing the latent-domain pyramid from config.
+
+    Phase 2 contract
+    ----------------
+    With no `latent_levels` block in the config, this returns a one-level pyramid
+    whose single domain is exactly `Domain.from_config(cf)`. Model code that asks
+    for `pyramid.domain(pyramid.finest)` therefore receives the *identical* Domain
+    object it would have built directly today -- so introducing the pyramid at the
+    construction boundary changes nothing observable until additional levels are
+    configured.
+
+    All three model construction sites (ModelParams, Model, EncoderModule) should
+    build the pyramid through THIS function so that Step 3+ can add levels in one
+    place.
+    """
+    return DomainPyramid.from_config(cf)
+
+
+def model_domain(cf) -> Domain:
+    """
+    The single Domain the current (single-latent) model consumes.
+
+    This is the finest level of the pyramid. With one configured level it is
+    `Domain.from_config(cf)` unchanged; once multiple levels exist, the finest
+    level is the one the existing single-latent code path corresponds to (the
+    fine latent), and coarser levels are added around it by later steps.
+    """
+    pyr = build_domain_pyramid(cf)
+    return pyr.domain(pyr.finest)
