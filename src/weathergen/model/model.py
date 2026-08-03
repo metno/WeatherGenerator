@@ -1069,7 +1069,12 @@ class Model(torch.nn.Module):
 
         output = ModelOutput(batch.get_output_len())
 
-        tokens, posteriors = self.encoder(model_params, batch)
+        tokens_by_level, posteriors_by_level = self.encoder(model_params, batch)
+        # 3c-3a: encoder returns per-level dicts. Until the dual-level decoder
+        # (3c-3b), consume the finest level only -> identical to single-latent.
+        _finest = self.domain_pyramid.finest
+        tokens = tokens_by_level[_finest]
+        posteriors = posteriors_by_level[_finest]
         output.add_latent_prediction(0, "posteriors", posteriors)
 
         # recover batch dimension and separate input_steps

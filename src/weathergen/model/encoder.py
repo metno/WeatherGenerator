@@ -185,10 +185,9 @@ class EncoderModule(torch.nn.Module):
             tokens_global_by_level[lvl] = tokens_global_l
             posteriors_by_level[lvl] = posteriors_l
 
-        # single-level: return the plain tensor + posteriors, exactly as before.
-        # (3c-3 will return the dicts and teach the decoder to read per level.)
-        only = levels[0]
-        return tokens_global_by_level[only], posteriors_by_level[only]
+        # 3c-3a: return per-level dicts. Model.forward unwraps the finest so the
+        # decoder/forecast path is unchanged (single-level == baseline).
+        return tokens_global_by_level, posteriors_by_level
 
     def interpolate_latents(self, tokens: torch.Tensor) -> (torch.Tensor, torch.Tensor):
         """ "
