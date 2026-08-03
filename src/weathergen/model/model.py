@@ -88,18 +88,25 @@ class ModelOutput:
 class ModelParams(torch.nn.Module):
     """Creation of query and embedding parameters of the model."""
 
-    def __init__(self, cf) -> None:
+    def __init__(self, cf, level: int | None = None, domain=None) -> None:
         super(ModelParams, self).__init__()
 
         self.cf = cf
 
-        self.healpix_level = cf.healpix_level
         # Phase 2: build the (single-level) latent domain via the pyramid helper.
         # With no `latent_levels` in config this is bit-identical to
         # Domain.from_config(cf); it introduces the seam that later steps use to
         # add coarse/fine levels without re-plumbing every call site.
+        # 3c-1: a ModelParams instance is built FOR ONE LEVEL. With no explicit
+        # level/domain it defaults to the pyramid's finest -> byte-identical to
+        # before. ModelParamsPyramid passes level+domain explicitly per level.
         self.domain_pyramid = build_domain_pyramid(cf)
-        self.domain = self.domain_pyramid.domain(self.domain_pyramid.finest)
+        if level is None:
+            level = self.domain_pyramid.finest
+        if domain is None:
+            domain = self.domain_pyramid.domain(level)
+        self.healpix_level = level
+        self.domain = domain
         self.num_healpix_cells = len(self.domain)
         self.dtype = get_dtype(cf.attention_dtype)
 
@@ -344,6 +351,52 @@ class ModelParams(torch.nn.Module):
         # ensure all params have grad set to False
 
         return
+
+
+class ModelParamsPyramid(torch.nn.Module):
+    """
+    Holds one `ModelParams` per latent level (Step 3c-1).
+
+    Each level's tables (pe_global, rope_coords, hp_nbours, q_cells_lens, ...) are
+    sized to that level's Domain. This is the structural seam for multi-resolution
+    encoding: the encoder (3c-2) will call `params_for(level)` to run that level's
+    stack.
+
+    3c-1 is INERT: this class is defined and unit-tested, but the live model path
+    still constructs a single `ModelParams` exactly as before (see model_interface).
+    `primary` returns the finest-level ModelParams, which for a single-level config
+    is byte-identical to `ModelParams(cf).create(cf)`. 3c-2 will switch the live
+    path to a ModelParamsPyramid and select per-level params.
+    """
+
+    def __init__(self, cf) -> None:
+        super().__init__()
+        self.cf = cf
+        self.pyramid = build_domain_pyramid(cf)
+        self.levels = self.pyramid.levels
+        self._primary_level = self.pyramid.finest
+
+        params = {}
+        for lvl in self.levels:
+            dom = self.pyramid.domain(lvl)
+            params[str(lvl)] = ModelParams(cf, level=lvl, domain=dom).create(cf)
+        self._params = torch.nn.ModuleDict(params)  # keys are str(level)
+
+    def params_for(self, level: int) -> "ModelParams":
+        """The ModelParams tables for a specific level."""
+        return self._params[str(level)]
+
+    @property
+    def primary(self) -> "ModelParams":
+        """The finest-level ModelParams (== single-latent behaviour)."""
+        return self._params[str(self._primary_level)]
+
+    def reset_parameters(self, cf) -> None:
+        for lvl in self.levels:
+            self._params[str(lvl)].reset_parameters(cf)
+
+    def create(self, cf) -> "ModelParamsPyramid":
+        return self
 
 
 class Model(torch.nn.Module):

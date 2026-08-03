@@ -87,20 +87,43 @@ class EncoderModule(torch.nn.Module):
         else:
             self.ae_local_global_engine = Local2GlobalAssimilationEngine(cf)
 
-        # learnable queries
+        # learnable queries + global/aggregation engines, built PER LEVEL (3c-1).
+        # Shared engines (embed, local, local-global) are unchanged (built above).
+        from weathergen.datasets.stream_levels import assign_stream_levels
+        self.stream_encode_level, self.stream_decode_levels = assign_stream_levels(
+            cf, ladder=self.domain_pyramid.levels
+        )
+
+        self._q_cells_param_dict = torch.nn.ParameterDict()
+        self._ae_aggregation_per_level = torch.nn.ModuleDict()
+        self._ae_global_per_level = torch.nn.ModuleDict()
+        for lvl in self.domain_pyramid.levels:
+            n_cells_l = len(self.domain_pyramid.domain(lvl))
+            q_l = self._build_q_cells(cf, n_cells_l, lvl)
+            self._q_cells_param_dict[str(lvl)] = torch.nn.Parameter(q_l, requires_grad=True)
+            self._ae_aggregation_per_level[str(lvl)] = QueryAggregationEngine(cf, n_cells_l)
+            self._ae_global_per_level[str(lvl)] = GlobalAssimilationEngine(cf, n_cells_l)
+
+        # backward-compat aliases -> finest level == current single-latent stack.
+        _finest = str(self.domain_pyramid.finest)
+        self.q_cells = self._q_cells_param_dict[_finest]
+        self.ae_aggregation_engine = self._ae_aggregation_per_level[_finest]
+        self.ae_global_engine = self._ae_global_per_level[_finest]
+
+    def _build_q_cells(self, cf, num_cells: int, healpix_level: int) -> torch.Tensor:
+        """
+        Learnable query bank for one level. Byte-identical to the old inline
+        construction when called with (num_healpix_cells, cf.healpix_level).
+        """
         if cf.ae_local_queries_per_cell:
-            s = (self.num_healpix_cells, cf.ae_local_num_queries, cf.ae_global_dim_embed)
-            q_cells = torch.rand(s, requires_grad=True) / cf.ae_global_dim_embed
-            # add meta data
+            s = (num_cells, cf.ae_local_num_queries, cf.ae_global_dim_embed)
+            q_cells = torch.rand(s) / cf.ae_global_dim_embed
             q_cells[:, :, -8:-6] = (
-                (torch.arange(self.num_healpix_cells) / self.num_healpix_cells)
-                .unsqueeze(1)
-                .unsqueeze(1)
+                (torch.arange(num_cells) / num_cells)
+                .unsqueeze(1).unsqueeze(1)
                 .repeat((1, cf.ae_local_num_queries, 2))
             )
-            theta, phi = healpy.pix2ang(
-                nside=2**self.healpix_level, ipix=torch.arange(self.num_healpix_cells)
-            )
+            theta, phi = healpy.pix2ang(nside=2**healpix_level, ipix=torch.arange(num_cells))
             q_cells[:, :, -6:-3] = (
                 torch.cos(theta).unsqueeze(1).unsqueeze(1).repeat((1, cf.ae_local_num_queries, 3))
             )
@@ -111,14 +134,8 @@ class EncoderModule(torch.nn.Module):
             q_cells[:, :, -10] = torch.arange(cf.ae_local_num_queries)
         else:
             s = (1, cf.ae_local_num_queries, cf.ae_global_dim_embed)
-            q_cells = torch.rand(s, requires_grad=True) / cf.ae_global_dim_embed
-        self.q_cells = torch.nn.Parameter(q_cells, requires_grad=True)
-
-        # query aggregation engine
-        self.ae_aggregation_engine = QueryAggregationEngine(cf, self.num_healpix_cells)
-
-        # global assimilation engine
-        self.ae_global_engine = GlobalAssimilationEngine(cf, self.num_healpix_cells)
+            q_cells = torch.rand(s) / cf.ae_global_dim_embed
+        return q_cells
 
     def forward(self, model_params, batch):
         """
