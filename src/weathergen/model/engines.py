@@ -49,6 +49,9 @@ class EmbeddingEngine(torch.nn.Module):
         self.sources_size = sources_size  # KCT:iss130, what is this?
         self.embeds = torch.nn.ModuleDict()
         self.streams = cf.streams
+        # per-stream encode level (set by the encoder after construction; default
+        # all-zero single level)
+        self.stream_level = {name: 0 for name in self.streams.keys()}
 
         for i, (stream_name, si) in enumerate(self.streams.items()):
             if si.get("diagnostic", False) or self.sources_size[i] == 0:
@@ -80,68 +83,85 @@ class EmbeddingEngine(torch.nn.Module):
 
     def forward(self, batch, pe_embed):
         num_steps_input = batch.get_num_source_steps()
+        tl = batch.tokens_lens
+        if not isinstance(tl, dict):
+            tl = {0: tl}
 
-        num_tokens = torch.sum(batch.tokens_lens, 2).flatten().sum().item()
-        tokens_all = torch.empty(
-            (num_tokens, self.cf.ae_local_dim_embed), dtype=self.dtype, device=batch.get_device()
-        )
+        # group stream names by level
+        levels = {}
+        for name in self.streams.keys():
+            levels.setdefault(self.stream_level.get(name, 0), []).append(name)
 
-        # iterate over all streams
-        x_embeds = []
-        for stream_name in self.streams.keys():
-            # collect all source tokens from all input_steps and all samples in the batch
-            sdata = []
-            for istep in range(num_steps_input):
-                for sample in batch.get_samples():
-                    sdata += [sample.streams_data[stream_name].source_tokens_cells[istep]]
+        out = {}
+        for lvl, names_l in levels.items():
+            tokens_lens_l = tl[lvl]
+            num_tokens = torch.sum(tokens_lens_l, 2).flatten().sum().item()
+            tokens_all = torch.empty(
+                (num_tokens, self.cf.ae_local_dim_embed),
+                dtype=self.dtype, device=batch.get_device(),
+            )
+            x_embeds = []
+            for stream_name in names_l:
+                sdata = []
+                for istep in range(num_steps_input):
+                    for sample in batch.get_samples():
+                        sdata += [sample.streams_data[stream_name].source_tokens_cells[istep]]
+                if all(s is None for s in sdata):
+                    continue
+                sdata = torch.cat(sdata).to(tokens_all.dtype)
+                if sdata.numel() == 0:
+                    continue
+                x_embeds += [self.embeds[stream_name](sdata).flatten(0, 1)]
 
-            if all(s is None for s in sdata):
-                continue
+            max_tokens = self.cf.get("ae_local_max_tokens_per_cell", 64)
+            assert tokens_lens_l.flatten(0, 2).sum(0).max() <= max_tokens, (
+                "max number of tokens per cell for positional encoding exceeded."
+            )
 
-            sdata = torch.cat(sdata).to(tokens_all.dtype)
-            # skip empty stream
-            if sdata.numel() == 0:
-                continue
+            if tokens_lens_l.shape[2] == 1:
+                tokens_all = torch.cat(x_embeds)
+            else:
+                scatter_idxs = self._scatter_idxs(tokens_lens_l)
+                scatter_idxs = scatter_idxs.unsqueeze(1).repeat((1, self.cf.ae_local_dim_embed))
+                tokens_all.scatter_(0, scatter_idxs, torch.cat(x_embeds))
 
-            # embedding from physical space to per patch latent representation
-            x_embeds += [self.embeds[stream_name](sdata).flatten(0, 1)]
+            pe_idxs = self._pe_idxs(tokens_lens_l)
+            tokens_all = tokens_all + pe_embed[pe_idxs]
+            out[lvl] = tokens_all
 
-        # switch from stream to cell-based ordering and apply per cell positional encoding
+        return out
 
-        # if the assert is hit, max_number_tokens_local_per_cell in config needs to be increased
-        max_tokens = self.cf.get("ae_local_max_tokens_per_cell", 64)
-        assert batch.tokens_lens.flatten(0, 2).sum(0).max() <= max_tokens, (
-            "max number of tokens per cell for positional encoding exceeded."
-        )
-        " Increase ae_local_max_tokens_per_cell in config."
-
-        if batch.tokens_lens.shape[2] == 1:
-            # trivial with one stream
-            tokens_all = torch.cat(x_embeds)
-
-        else:
-            scatter_idxs = self.get_scatter_idxs_vectorized(batch)
-            scatter_idxs = scatter_idxs.unsqueeze(1).repeat((1, self.cf.ae_local_dim_embed))
-
-            # actual scatter operation and apply per cell positional encoding
-            tokens_all.scatter_(0, scatter_idxs, torch.cat(x_embeds))
-
-        pe_idxs = self.get_pe_idxs_vectorized(batch)
-        tokens_all = tokens_all + pe_embed[pe_idxs]
-
-        return tokens_all
-
-    def get_pe_idxs_vectorized(self, batch):
+    def _pe_idxs(self, tokens_lens):
         """
-        Compute per cell indices into positional encoding
+        Compute per cell indices into positional encoding, for ONE level's
+        tokens_lens tensor (num_steps, num_samples, num_streams, num_cells).
         """
-
-        tok_counts = batch.tokens_lens.permute([2, 0, 1, 3]).sum(0).flatten()
+        tok_counts = tokens_lens.permute([2, 0, 1, 3]).sum(0).flatten()
         rows = torch.arange(tok_counts.max(), device=tok_counts.device).unsqueeze(0)
         rows = rows.expand(tok_counts.shape[0], -1)
         pe_idxs = rows[rows < tok_counts.unsqueeze(1)]
-
         return pe_idxs
+
+    def _scatter_idxs(self, tokens_lens):
+        """
+        Compute reordering index so that tokens from different streams but same
+        cell are contiguous, for ONE level's tokens_lens tensor.
+        Vectorized version.
+        """
+        dev = tokens_lens.device
+        # tokens_lens : (num_steps_input, num_samples, num_streams, num_cells)
+        tok_counts = tokens_lens.permute([2, 0, 1, 3]).flatten(1, -1)
+        # partial sums for per cell offsets
+        pad = torch.zeros((1, tok_counts.shape[1]), dtype=torch.int64, device=dev)
+        offset = torch.cat([pad, tok_counts.cumsum(0)])[:-1]
+        offset[:, 1:] += tok_counts.sum(0).cumsum(0)[:-1]
+        ranges = torch.arange(tok_counts.max(), device=dev).repeat((tok_counts.numel(), 1))
+        idxs = (offset.flatten() + ranges.transpose(1, 0)).transpose(1, 0)
+        # select idxs[i][:ranges[i]] for each i; vectorized version
+        col_indices = torch.arange(idxs.shape[1], device=dev).unsqueeze(0)
+        valid_mask = col_indices < tok_counts.flatten().unsqueeze(1)
+        scatter_idxs = idxs[valid_mask].to(torch.int64)
+        return scatter_idxs
 
     def get_scatter_idxs(self, batch):
         """
@@ -171,34 +191,6 @@ class EmbeddingEngine(torch.nn.Module):
         scatter_idxs = torch.cat(scatter_idxs).to(torch.int64)
 
         return scatter_idxs
-
-    def get_scatter_idxs_vectorized(self, batch):
-        """
-        Compute reordering index so that tokens from different streams but same cell are
-        continguous
-
-        Vectorized version
-        """
-
-        dev = batch.get_device()
-        # batch.tokens_lens : (num_steps_input, num_samples, num_streams, num_cells)
-        # flatten leasds to streams x tokens per cell (across all cells for input steps and samples)
-        tok_counts = batch.tokens_lens.permute([2, 0, 1, 3]).flatten(1, -1)
-
-        # partial sums for per cell offsets
-        pad = torch.zeros((1, tok_counts.shape[1]), dtype=torch.int64, device=dev)
-        offset = torch.cat([pad, tok_counts.cumsum(0)])[:-1]
-        offset[:, 1:] += tok_counts.sum(0).cumsum(0)[:-1]
-
-        ranges = torch.arange(tok_counts.max(), device=dev).repeat((tok_counts.numel(), 1))
-        idxs = (offset.flatten() + ranges.transpose(1, 0)).transpose(1, 0)
-        # select idxs[i][:ranges[i]] for each i; vectorized version
-        col_indices = torch.arange(idxs.shape[1], device=dev).unsqueeze(0)
-        valid_mask = col_indices < tok_counts.flatten().unsqueeze(1)
-        scatter_idxs = idxs[valid_mask].to(torch.int64)
-
-        return scatter_idxs
-
 
 class LocalAssimilationEngine(torch.nn.Module):
     name: "LocalAssimilationEngine"

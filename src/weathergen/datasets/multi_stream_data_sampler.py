@@ -785,19 +785,17 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         return max(1, self.output_offset + num_forecast_steps)
 
     def _preprocess_model_batch(
-        self, batch: ModelBatch, source_input_steps: int, target_input_steps: int
+        self, batch, source_input_steps, target_input_steps
     ):
-        """
-        Perform necessary pre-processing of model batch
-        """
         stream_names = list(self.streams_datasets.keys())
         batch.source_samples.tokens_lens = get_tokens_lens(
-            stream_names, batch.source_samples, source_input_steps
+            stream_names, batch.source_samples, source_input_steps,
+            stream_level=self.stream_encode_level,
         )
         batch.target_samples.tokens_lens = get_tokens_lens(
-            stream_names, batch.target_samples, target_input_steps
+            stream_names, batch.target_samples, target_input_steps,
+            stream_level=self.stream_encode_level,
         )
-
         return batch
 
     def _get_batch(self, idx: int, num_forecast_steps: int):

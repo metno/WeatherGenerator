@@ -285,29 +285,48 @@ def add_local_vert_coords_ctrs2(verts_local, tcs_lens, a, zi, geoinfo_offset):
 
 
 def get_tokens_lens(
-    streams_names: list[str], batch_data: BatchSamples, input_steps: int
-) -> torch.Tensor:
+    streams_names: list[str],
+    batch_data,
+    input_steps: int,
+    stream_level: dict[str, int] | None = None,
+) -> dict[int, torch.Tensor] | torch.Tensor:
     """
-    Extract tokens_lens for (num_steps, num_samples, num_streams)
-    """
-    # collect source_tokens_lens for all stream datas
-    source_tokens_lens = torch.stack(
-        [
-            torch.stack(
-                [
-                    torch.stack(
-                        [
-                            sample.streams_data[stream_name].source_tokens_lens[i]
-                            for stream_name in streams_names
-                        ]
-                    )
-                    for sample in batch_data.samples
-                ]
-                if len(batch_data.samples)
-                else [torch.zeros((0, 0))]
-            )
-            for i in range(input_steps)
-        ]
-    )
+    Extract tokens_lens grouped BY LEVEL.
 
-    return source_tokens_lens
+    Returns a dict {level: tensor(num_steps, num_samples, num_streams_at_level,
+    num_cells_at_level)}. Streams are grouped by their encode level (stream_level);
+    within a level all streams share the same cell count so they stack cleanly.
+
+    If stream_level is None (single-level / legacy), all streams go to level 0 and
+    the behaviour is identical to the previous single-tensor version, just wrapped
+    in {0: tensor}.
+    """
+    if stream_level is None:
+        stream_level = {name: 0 for name in streams_names}
+
+    # group stream names by level, preserving order
+    levels: dict[int, list[str]] = {}
+    for name in streams_names:
+        levels.setdefault(stream_level[name], []).append(name)
+
+    out: dict[int, torch.Tensor] = {}
+    for lvl, names_l in levels.items():
+        out[lvl] = torch.stack(
+            [
+                torch.stack(
+                    [
+                        torch.stack(
+                            [
+                                sample.streams_data[stream_name].source_tokens_lens[i]
+                                for stream_name in names_l
+                            ]
+                        )
+                        for sample in batch_data.samples
+                    ]
+                    if len(batch_data.samples)
+                    else [torch.zeros((0, 0))]
+                )
+                for i in range(input_steps)
+            ]
+        )
+    return out

@@ -139,53 +139,49 @@ class EncoderModule(torch.nn.Module):
 
     def forward(self, model_params, batch):
         """
-        Encoder forward.
+        Encoder forward (multi-level, 3c-3b).
 
-        3c-2: the forward is now organised as a loop over latent levels. Each level
-        runs its own stack (assimilate_local with that level's q_cells + global
-        engine). For a single-level config the loop runs once and returns the same
-        single `tokens_global` tensor as before -- byte-identical.
-
-        Multi-level currently requires the downstream decoder to consume a dict of
-        latents (3c-3). Until that lands, we assert a single level so this step is
-        provably inert and independently runnable; the per-level machinery below is
-        exercised by the one active level and by unit tests.
+        The embed engine returns a dict {level: tokens_all}. Each level runs its
+        own stack (assimilate_local with that level's q_cells + tokens_lens +
+        params, then that level's global engine). Returns per-level dicts of
+        latents and posteriors. Single-level -> one entry -> baseline behaviour.
         """
         levels = self.domain_pyramid.levels
-        # 3c-3b: multi-level end-to-end is now supported (decoder reads the dict).
-        # The forecast engine still rolls the finest level; coarse levels are
-        # decode-only context until Phase 4 (cascade).
 
-        # embed is shared across levels (per-cell / per-token operation)
-        stream_cell_tokens = checkpoint(
+        # make the embed engine level-aware, then embed (returns {level: tokens})
+        self.embed_engine.stream_level = self.stream_encode_level
+        stream_cell_tokens_by_level = checkpoint(
             self.embed_engine, batch, model_params.pe_embed, use_reentrant=False
         )
+
+        _has_pyr = hasattr(model_params, "params_for")
 
         tokens_global_by_level = {}
         posteriors_by_level = {}
         for lvl in levels:
             q_cells_l = self._q_cells_param_dict[str(lvl)]
             ae_global_l = self._ae_global_per_level[str(lvl)]
+            mp_l = model_params.params_for(lvl) if _has_pyr else model_params
+            stream_cell_tokens_l = stream_cell_tokens_by_level[lvl]
 
             tokens_global_l, posteriors_l = checkpoint(
                 self.assimilate_local,
-                model_params,
-                stream_cell_tokens,
+                mp_l,
+                stream_cell_tokens_l,
                 batch,
                 q_cells_l,
+                lvl,
                 use_reentrant=False,
             )
             tokens_global_l = checkpoint(
                 ae_global_l,
                 tokens_global_l,
-                coords=model_params.rope_coords,
+                coords=mp_l.rope_coords,
                 use_reentrant=False,
             )
             tokens_global_by_level[lvl] = tokens_global_l
             posteriors_by_level[lvl] = posteriors_l
 
-        # 3c-3a: return per-level dicts. Model.forward unwraps the finest so the
-        # decoder/forecast path is unchanged (single-level == baseline).
         return tokens_global_by_level, posteriors_by_level
 
     def interpolate_latents(self, tokens: torch.Tensor) -> (torch.Tensor, torch.Tensor):
@@ -202,7 +198,7 @@ class EncoderModule(torch.nn.Module):
 
         return tokens, posteriors
 
-    def assimilate_local_project_chunked(self, tokens, tokens_global, cell_lens, q_cells_lens):
+    def assimilate_local_project_chunked(self, tokens, tokens_global, cell_lens, q_cells_lens, num_cells=None):
         """
         Apply the local assimilation engine and then the
         local-to-global adapter using a chunking in the number of tokens
@@ -213,7 +209,8 @@ class EncoderModule(torch.nn.Module):
         zero_pad = torch.zeros(1, device=tokens.device, dtype=torch.int32)
 
         # subdivision factor for required splitting
-        clen = self.num_healpix_cells // (2 if self.cf.healpix_level <= 5 else 8)
+        _ncells = num_cells if num_cells is not None else self.num_healpix_cells
+        clen = _ncells // (2 if self.cf.healpix_level <= 5 else 8)
         # A small regional domain can make clen 0 (or 0-length chunks), which would
         # make the loop below iterate zero times and silently return nothing.
         clen = max(1, clen)                                             # <-- ADD
@@ -277,11 +274,14 @@ class EncoderModule(torch.nn.Module):
         tokens_global_unmasked,
         tokens_global_register_class,
         tokens_lens,
+        ae_agg=None,
         rope_cell_coords=None,
     ):
         """
         Aggregation engine on the global latents of unmasked cells
         """
+        if ae_agg is None:
+            ae_agg = self.ae_aggregation_engine
 
         zero_pad = torch.zeros(1, device=tokens_global_unmasked.device, dtype=torch.int32)
 
@@ -323,32 +323,38 @@ class EncoderModule(torch.nn.Module):
 
         batch_lens = batch_lens + (self.num_class_tokens + self.num_register_tokens)
         batch_lens_patched = torch.cat([zero_pad, batch_lens], dim=0)
-        tokens_global_unmasked = self.ae_aggregation_engine(
+        tokens_global_unmasked = ae_agg(
             tokens_global_unmasked, batch_lens_patched, use_reentrant=False, coords=packed_coords
         )
 
         return tokens_global_unmasked
 
     def assimilate_local(
-        self, model_params, tokens: torch.Tensor, batch: ModelBatch, q_cells=None
+        self, model_params, tokens: torch.Tensor, batch: ModelBatch, q_cells=None, level=None
     ) -> torch.Tensor:
         """
-        Processes embedded tokens locally and prepares them for the global assimilation
+        Processes embedded tokens locally and prepares them for global assimilation.
 
-        Args:
-            model_params : Query and embedding parameters
-            tokens : Input tokens to be processed by local assimilation
-            q_cells : learnable query bank for THIS level (3c-2). Defaults to
-                self.q_cells (finest level) -> byte-identical to previous behaviour.
-            cell_lens : Used to identify range of tokens to use from generated tokens in cell
-                embedding
-        Returns:
-            Tokens for global assimilation
+        3c-3b: parameterised by `level`. Uses that level's tokens_lens, cell count,
+        q_cells and aggregation engine. level=None -> finest (baseline).
         """
         if q_cells is None:
             q_cells = self.q_cells
 
-        cell_lens = torch.sum(batch.tokens_lens, 2).flatten()
+        # per-level tokens_lens + cell count + aggregation engine
+        _tl = batch.tokens_lens
+        if isinstance(_tl, dict):
+            tokens_lens_l = _tl[level]
+        else:
+            tokens_lens_l = _tl
+        if level is None:
+            num_cells_l = self.num_healpix_cells
+            ae_agg_l = self.ae_aggregation_engine
+        else:
+            num_cells_l = len(self.domain_pyramid.domain(level))
+            ae_agg_l = self._ae_aggregation_per_level[str(level)]
+
+        cell_lens = torch.sum(tokens_lens_l, 2).flatten()
 
         num_steps_input = batch.get_num_source_steps()
         rs = num_steps_input * len(batch)
@@ -362,29 +368,29 @@ class EncoderModule(torch.nn.Module):
         if self.cf.ae_local_queries_per_cell:
             tokens_global = (q_cells + model_params.pe_global).repeat(rs, 1, 1)
         else:
-            num_tokens = self.num_healpix_cells
+            num_tokens = num_cells_l
             tokens_global = q_cells.repeat(num_tokens, 1, 1) + model_params.pe_global
             tokens_global = tokens_global.repeat(rs, 1, 1)
 
         # apply local assimilation engine and project onto global latent vectors
         tokens_global_unmasked, posteriors = self.assimilate_local_project_chunked(
-            tokens, tokens_global, cell_lens, model_params.q_cells_lens
+            tokens, tokens_global, cell_lens, model_params.q_cells_lens, num_cells_l
         )
 
-        # apply aggregation engine on unmasked tokens
+        # apply aggregation engine on unmasked tokens (per-level engine)
         tokens_global_unmasked = self.aggregation_engine_unmasked(
             tokens_global_unmasked,
             tokens_global_register_class,
-            batch.tokens_lens,
+            tokens_lens_l,
+            ae_agg_l,
             rope_cell_coords=model_params.rope_cell_coords,
         )
 
         # final processing
-
         tokens_global = (
             torch.permute(tokens_global, [1, 0, 2])
             .squeeze()
-            .reshape(rs, self.num_healpix_cells, -1)
+            .reshape(rs, num_cells_l, -1)
         )
         # TODO, TODO, TODO: do we need this
         tokens_global = torch.cat([tokens_global_register_class, tokens_global], dim=1)
@@ -399,14 +405,14 @@ class EncoderModule(torch.nn.Module):
             .unsqueeze(0)
             .repeat(rs, 1)
         )
-        cell_lens_r = cell_lens.unsqueeze(0).reshape(rs, self.num_healpix_cells)
+        cell_lens_r = cell_lens.unsqueeze(0).reshape(rs, num_cells_l)
         mask = torch.cat([mask_reg_class_tokens, cell_lens_r.to(torch.bool)], dim=1)
 
         # fill empty tensor using mask for positions of unmasked tokens
         tokens_global[mask] = tokens_global_unmasked.to(tokens_global.dtype)
 
         # recover batch dimension and build global token list
-        num_tokens_tot = self.num_healpix_cells + self.num_register_tokens + self.num_class_tokens
+        num_tokens_tot = num_cells_l + self.num_register_tokens + self.num_class_tokens
         q_c_shape = q_cells.shape
         tokens_global = (
             tokens_global.reshape([rs, num_tokens_tot, q_c_shape[-2], q_c_shape[-1]])

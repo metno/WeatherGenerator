@@ -188,6 +188,15 @@ class BatchSamples:
             self.tokens_lens.to(device, non_blocking=True) if self.tokens_lens is not None else None
         )
 
+        if self.tokens_lens is None:
+            pass
+        elif isinstance(self.tokens_lens, dict):
+            self.tokens_lens = {
+                k: v.to(device, non_blocking=True) for k, v in self.tokens_lens.items()
+            }
+        else:
+            self.tokens_lens = self.tokens_lens.to(device, non_blocking=True)
+
         self.device = device
 
         return self
@@ -203,8 +212,16 @@ class BatchSamples:
             # create copy and then select subset for samples and tokens_lens
             bs = copy.deepcopy(self)
             bs.samples = [bs.samples[i] for i in subset]
-            torch_idxs = torch.tensor(subset, dtype=torch.long, device=bs.tokens_lens.device)
-            bs.tokens_lens = torch.index_select(bs.tokens_lens, 1, torch_idxs)
+            torch_idxs = torch.tensor(subset, dtype=torch.long)
+            if isinstance(bs.tokens_lens, dict):
+                bs.tokens_lens = {
+                    k: torch.index_select(v, 1, torch_idxs.to(v.device))
+                    for k, v in bs.tokens_lens.items()
+                }
+            else:
+                bs.tokens_lens = torch.index_select(
+                    bs.tokens_lens, 1, torch_idxs.to(bs.tokens_lens.device)
+                )
             return bs
 
     def get_num_source_steps(self) -> int:
@@ -269,7 +286,9 @@ class BatchSamples:
             sample.pin_memory()
 
         # pin source_tokens_lens
-        if isinstance(self.tokens_lens, torch.Tensor):
+        if isinstance(self.tokens_lens, dict):
+            self.tokens_lens = {k: v.pin_memory() for k, v in self.tokens_lens.items()}
+        elif isinstance(self.tokens_lens, torch.Tensor):
             self.tokens_lens = self.tokens_lens.pin_memory()
 
         return self
