@@ -212,17 +212,17 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         """Emit a compact table of the per-stream level assignment, once."""
         if not is_root():
             return
-        _logger.info("Step 3b latent-level layout (%d level(s)):",
+        logger.info("Step 3b latent-level layout (%d level(s)):",
                      self.domain_pyramid.num_levels)
         for lvl in self.domain_pyramid.levels:
             dom = self.domain_pyramid.domain(lvl)
             streams = [s for s, l in self.stream_encode_level.items() if l == lvl]
-            _logger.info(
+            logger.info(
                 "  hl%-2d  cells=%-7d  encode_streams=%s",
                 lvl, len(dom), streams if streams else "(none)",
             )
         for s in self.stream_encode_level:
-            _logger.info(
+            logger.info(
                 "  stream %-12s encode@hl%d  decode@%s",
                 s, self.stream_encode_level[s],
                 ",".join(f"hl{x}" for x in self.stream_decode_levels[s]),
@@ -241,7 +241,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
         except Exception as e:  # pragma: no cover
-            _logger.warning("plot_level_layout: matplotlib unavailable (%s)", e)
+            logger.warning("plot_level_layout: matplotlib unavailable (%s)", e)
             return
 
         os.makedirs(out_dir, exist_ok=True)
@@ -267,7 +267,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         out = os.path.join(out_dir, "level_layout.png")
         fig.savefig(out, dpi=120, bbox_inches="tight")
         plt.close(fig)
-        _logger.info("plot_level_layout: wrote %s", out)
+        logger.info("plot_level_layout: wrote %s", out)
 
     def check_samples(self, fsm: int):
         """Check if samples_per_mini_epoch is suitable
