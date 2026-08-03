@@ -28,7 +28,7 @@ from weathergen.model.attention import (
     MultiSelfAttentionHeadVarlen,
 )
 from weathergen.model.layers import MLP
-from weathergen.model.model import Model, ModelParams
+from weathergen.model.model import Model, ModelParams, ModelParamsPyramid
 from weathergen.model.utils import apply_fct_to_blocks, freeze_weights
 from weathergen.utils.distributed import is_root
 from weathergen.utils.performance import register_nvtx_hooks
@@ -167,7 +167,7 @@ def init_model_and_shard(
                 model.reset_parameters()
 
     # model params
-    model_params = ModelParams(cf).create(cf)
+    model_params = ModelParamsPyramid(cf).create(cf)
     model_params.reset_parameters(cf)
     model_params = model_params.to(f"cuda:{cf.local_rank}")
 

@@ -398,6 +398,19 @@ class ModelParamsPyramid(torch.nn.Module):
     def create(self, cf) -> "ModelParamsPyramid":
         return self
 
+    def __getattr__(self, name):
+        # nn.Module attrs (_params, cf, pyramid, levels, ...) resolve normally;
+        # any other attribute delegates to the finest-level ModelParams so that
+        # legacy `model_params.pe_global / .hp_nbours / .rope_coords / .pe_embed`
+        # reads keep working unchanged. Coarse-level tables are reached explicitly
+        # via params_for(level).
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            params = super().__getattr__("_params")
+            prim = params[str(self.__dict__["_primary_level"])]
+            return getattr(prim, name)
+
 
 class Model(torch.nn.Module):
     """WeatherGenerator model architecture
@@ -1077,10 +1090,15 @@ class Model(torch.nn.Module):
         posteriors = posteriors_by_level[_finest]
         output.add_latent_prediction(0, "posteriors", posteriors)
 
-        # recover batch dimension and separate input_steps
-        shape = (len(batch), batch.get_num_source_steps(), *tokens.shape[1:])
-        # collapse along input step dimension
-        tokens = tokens.reshape(shape).sum(axis=1)
+        # recover batch dimension and collapse input-step dimension, PER LEVEL.
+        # tokens (finest) drives the forecast engine as before; tokens_lvl holds
+        # every level's collapsed latent for the multi-level decoder (3c-3b).
+        def _collapse(t):
+            sh = (len(batch), batch.get_num_source_steps(), *t.shape[1:])
+            return t.reshape(sh).sum(axis=1)
+
+        tokens_lvl = {lvl: _collapse(t) for lvl, t in tokens_by_level.items()}
+        tokens = tokens_lvl[_finest]
 
         # Allow for pushforward trick
         p_fwd = self.cf.training_config.get("forecast", {}).get("pushforward", False)
@@ -1093,8 +1111,10 @@ class Model(torch.nn.Module):
                 continue
 
             tokens = self.forecast_engine(tokens, step, model_params.rope_coords)
-            # decoder predictions
-            output = self.predict_decoders(model_params, step, tokens, batch, output)
+            # decoder predictions (fine streams read coarse+fine via tokens_lvl)
+            output = self.predict_decoders(
+                model_params, step, tokens, batch, output, tokens_lvl=tokens_lvl
+            )
             # latent predictions (raw and with SSL heads)
             output = self.predict_latent(model_params, step, tokens, batch, output)
 
@@ -1130,6 +1150,7 @@ class Model(torch.nn.Module):
         tokens: torch.Tensor,
         batch: ModelBatch,
         output: ModelOutput,
+        tokens_lvl: dict | None = None,
     ) -> ModelOutput:
         """
         Compute decoder-based predictions
@@ -1151,22 +1172,87 @@ class Model(torch.nn.Module):
         if not self.pred_heads:
             return output
 
-        # remove register  and class tokens
+        # remove register and class tokens (finest tokens, used as default)
         tokens = tokens[:, self.num_aux_tokens :]
-
-        # get 1-ring neighborhood for prediction
         batch_size = len(batch)
-        s = [batch_size, self.num_healpix_cells, self.cf.ae_local_num_queries, tokens.shape[-1]]
-        idxs = model_params.hp_nbours.unsqueeze(0).repeat((batch_size, 1, 1)).flatten(0, 1)
-        tokens_nbors = tokens.reshape(s).flatten(0, 1)[idxs.flatten()].flatten(0, 1)
-        # TODO: precompute in model_params?
-        tokens_nbors_lens = torch.full(
-            (s[0] * s[1] + 1,), fill_value=9, dtype=torch.int32, device=tokens_nbors.device
-        )
-        tokens_nbors_lens[0] = 0
+
+        # 3c-3b: per-level 1-ring gather. `tokens_lvl` (if provided) maps level ->
+        # collapsed latent for that level. Each stream reads the rings of the
+        # levels in self.stream_decode_levels[stream] and concatenates them per
+        # target cell. For a single-level config this reduces to the old single
+        # gather with 9 neighbours per cell.
+        if tokens_lvl is None:
+            tokens_lvl = {self.domain_pyramid.finest: tokens}
+
+        def _ring_for_level(lvl):
+            """Return (nbors_flat, ncells, ring) for one level's collapsed latent."""
+            mp_l = model_params.params_for(lvl) if hasattr(model_params, "params_for") else model_params
+            toks_l = tokens_lvl[lvl][:, self.num_aux_tokens :] if lvl != self.domain_pyramid.finest else tokens
+            ncells_l = len(self.domain_pyramid.domain(lvl))
+            sl = [batch_size, ncells_l, self.cf.ae_local_num_queries, toks_l.shape[-1]]
+            idxs_l = mp_l.hp_nbours.unsqueeze(0).repeat((batch_size, 1, 1)).flatten(0, 1)
+            ring = mp_l.hp_nbours.shape[1]  # self + neighbours (=9)
+            nbors_l = toks_l.reshape(sl).flatten(0, 1)[idxs_l.flatten()].flatten(0, 1)
+            return nbors_l, ncells_l, ring
+
+        # Precompute the finest-level ring once (default / decode fallback).
+        _finest = self.domain_pyramid.finest
 
         # pair with tokens from assimilation engine to obtain target tokens
         for stream_name in self.streams.keys():
+            # levels this stream decodes from (3a); default to finest.
+            dec_levels = getattr(self, "stream_decode_levels", {}).get(stream_name, [_finest])
+
+            # Build this stream's KV neighbour pool by concatenating each decode
+            # level's 1-ring per cell. Single level -> identical to old behaviour.
+            if len(dec_levels) == 1:
+                nbors, ncells, ring = _ring_for_level(dec_levels[0])
+                tokens_nbors = nbors
+                tokens_nbors_lens = torch.full(
+                    (batch_size * ncells + 1,), fill_value=ring,
+                    dtype=torch.int32, device=nbors.device,
+                )
+                tokens_nbors_lens[0] = 0
+            else:
+                # multi-level: fine stream reads coarse+fine. The target cells are
+                # the FINEST level's cells; each fine cell's coarse counterpart is
+                # its parent. We concatenate, per fine cell, the fine ring and the
+                # parent's coarse ring.
+                nbors_f, ncells_f, ring_f = _ring_for_level(_finest)
+                # reshape fine ring to (bs*ncells_f, ring_f, D)
+                Df = nbors_f.shape[-1]
+                nbors_f = nbors_f.reshape(batch_size * ncells_f, ring_f, Df)
+
+                parts = [nbors_f]
+                ring_total = ring_f
+                for lvl in dec_levels:
+                    if lvl == _finest:
+                        continue
+                    nbors_c, ncells_c, ring_c = _ring_for_level(lvl)
+                    Dc = nbors_c.shape[-1]
+                    nbors_c = nbors_c.reshape(batch_size * ncells_c, ring_c, Dc)
+                    # map each fine cell -> its parent coarse compact index
+                    poc = self.domain_pyramid.parent_of_child(lvl, _finest)  # (ncells_f,)
+                    poc_t = torch.as_tensor(poc, device=nbors_c.device, dtype=torch.long)
+                    # per-batch offset into the flattened (bs*ncells_c) coarse rows
+                    b_off = (torch.arange(batch_size, device=nbors_c.device)
+                             .repeat_interleave(ncells_f) * ncells_c)
+                    parent_rows = poc_t.repeat(batch_size) + b_off
+                    # unpaired (-1) fine cells: clamp to 0 then zero them out
+                    valid = parent_rows >= b_off  # parent index >=0
+                    parent_rows_clamped = torch.clamp(parent_rows, min=0)
+                    coarse_ring = nbors_c[parent_rows_clamped]  # (bs*ncells_f, ring_c, D)
+                    coarse_ring = coarse_ring * valid.view(-1, 1, 1).to(coarse_ring.dtype)
+                    parts.append(coarse_ring)
+                    ring_total += ring_c
+
+                tokens_nbors = torch.cat(parts, dim=1).reshape(batch_size * ncells_f * ring_total, Df)
+                tokens_nbors_lens = torch.full(
+                    (batch_size * ncells_f + 1,), fill_value=ring_total,
+                    dtype=torch.int32, device=tokens_nbors.device,
+                )
+                tokens_nbors_lens[0] = 0
+
             # extract target coords for current stream and fstep and convert to one tensor
             t_coords = [
                 batch.samples[i_b].streams_data[stream_name].target_coords[step]

@@ -152,10 +152,9 @@ class EncoderModule(torch.nn.Module):
         exercised by the one active level and by unit tests.
         """
         levels = self.domain_pyramid.levels
-        assert len(levels) == 1, (
-            "3c-2: multi-level end-to-end requires the dual-level decoder (3c-3). "
-            f"Configured levels={levels}. Run with a single level for now."
-        )
+        # 3c-3b: multi-level end-to-end is now supported (decoder reads the dict).
+        # The forecast engine still rolls the finest level; coarse levels are
+        # decode-only context until Phase 4 (cascade).
 
         # embed is shared across levels (per-cell / per-token operation)
         stream_cell_tokens = checkpoint(
