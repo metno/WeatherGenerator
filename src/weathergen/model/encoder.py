@@ -139,38 +139,56 @@ class EncoderModule(torch.nn.Module):
 
     def forward(self, model_params, batch):
         """
-        Encoder forward
-        """
+        Encoder forward.
 
+        3c-2: the forward is now organised as a loop over latent levels. Each level
+        runs its own stack (assimilate_local with that level's q_cells + global
+        engine). For a single-level config the loop runs once and returns the same
+        single `tokens_global` tensor as before -- byte-identical.
+
+        Multi-level currently requires the downstream decoder to consume a dict of
+        latents (3c-3). Until that lands, we assert a single level so this step is
+        provably inert and independently runnable; the per-level machinery below is
+        exercised by the one active level and by unit tests.
+        """
+        levels = self.domain_pyramid.levels
+        assert len(levels) == 1, (
+            "3c-2: multi-level end-to-end requires the dual-level decoder (3c-3). "
+            f"Configured levels={levels}. Run with a single level for now."
+        )
+
+        # embed is shared across levels (per-cell / per-token operation)
         stream_cell_tokens = checkpoint(
             self.embed_engine, batch, model_params.pe_embed, use_reentrant=False
         )
 
-        tokens_global, posteriors = checkpoint(
-            self.assimilate_local, model_params, stream_cell_tokens, batch, use_reentrant=False
-        )
+        tokens_global_by_level = {}
+        posteriors_by_level = {}
+        for lvl in levels:
+            q_cells_l = self._q_cells_param_dict[str(lvl)]
+            ae_global_l = self._ae_global_per_level[str(lvl)]
 
-        tokens_global = checkpoint(
-            self.ae_global_engine,
-            tokens_global,
-            coords=model_params.rope_coords,
-            use_reentrant=False,
-        )
+            tokens_global_l, posteriors_l = checkpoint(
+                self.assimilate_local,
+                model_params,
+                stream_cell_tokens,
+                batch,
+                q_cells_l,
+                use_reentrant=False,
+            )
+            tokens_global_l = checkpoint(
+                ae_global_l,
+                tokens_global_l,
+                coords=model_params.rope_coords,
+                use_reentrant=False,
+            )
+            tokens_global_by_level[lvl] = tokens_global_l
+            posteriors_by_level[lvl] = posteriors_l
 
-        # TEMP latent check -- remove after
-#        from weathergen.model.plot_latent_check import plot_latent_map
-#        if self.training:
-#            plot_latent_map(
-#                tokens_global,
-#                self.domain,
-#                components=[0, 1, 2, 3],
-#                num_extra_tokens=self.num_register_tokens + self.num_class_tokens,
-#                num_queries=self.cf.ae_local_num_queries,
-#                every=10,                    # <-- your actual epoch length
-#                out_dir="/home/cristianl/weathergenerator/plots/domain_check",
-#            )
-
-        return tokens_global, posteriors
+        # single-level: return the plain tensor + posteriors, exactly as before.
+        # (3c-3 will return the dicts and teach the decoder to read per level.)
+        only = levels[0]
+        return tokens_global_by_level[only], posteriors_by_level[only]
 
     def interpolate_latents(self, tokens: torch.Tensor) -> (torch.Tensor, torch.Tensor):
         """ "
@@ -314,7 +332,7 @@ class EncoderModule(torch.nn.Module):
         return tokens_global_unmasked
 
     def assimilate_local(
-        self, model_params, tokens: torch.Tensor, batch: ModelBatch
+        self, model_params, tokens: torch.Tensor, batch: ModelBatch, q_cells=None
     ) -> torch.Tensor:
         """
         Processes embedded tokens locally and prepares them for the global assimilation
@@ -322,11 +340,15 @@ class EncoderModule(torch.nn.Module):
         Args:
             model_params : Query and embedding parameters
             tokens : Input tokens to be processed by local assimilation
+            q_cells : learnable query bank for THIS level (3c-2). Defaults to
+                self.q_cells (finest level) -> byte-identical to previous behaviour.
             cell_lens : Used to identify range of tokens to use from generated tokens in cell
                 embedding
         Returns:
             Tokens for global assimilation
         """
+        if q_cells is None:
+            q_cells = self.q_cells
 
         cell_lens = torch.sum(batch.tokens_lens, 2).flatten()
 
@@ -336,14 +358,14 @@ class EncoderModule(torch.nn.Module):
         # create register and latent tokens and prepend to latent spatial tokens
         num_extra_tokens = self.num_register_tokens + self.num_class_tokens
         pos_enc = positional_encoding_harmonic
-        tokens_global_register_class = pos_enc(self.q_cells.repeat(rs, num_extra_tokens, 1))
+        tokens_global_register_class = pos_enc(q_cells.repeat(rs, num_extra_tokens, 1))
 
         # TODO: re-enable or remove ae_local_queries_per_cell
         if self.cf.ae_local_queries_per_cell:
-            tokens_global = (self.q_cells + model_params.pe_global).repeat(rs, 1, 1)
+            tokens_global = (q_cells + model_params.pe_global).repeat(rs, 1, 1)
         else:
             num_tokens = self.num_healpix_cells
-            tokens_global = self.q_cells.repeat(num_tokens, 1, 1) + model_params.pe_global
+            tokens_global = q_cells.repeat(num_tokens, 1, 1) + model_params.pe_global
             tokens_global = tokens_global.repeat(rs, 1, 1)
 
         # apply local assimilation engine and project onto global latent vectors
@@ -387,7 +409,7 @@ class EncoderModule(torch.nn.Module):
 
         # recover batch dimension and build global token list
         num_tokens_tot = self.num_healpix_cells + self.num_register_tokens + self.num_class_tokens
-        q_c_shape = self.q_cells.shape
+        q_c_shape = q_cells.shape
         tokens_global = (
             tokens_global.reshape([rs, num_tokens_tot, q_c_shape[-2], q_c_shape[-1]])
             #  removing this line because else they get added twice? + model_params.pe_global
