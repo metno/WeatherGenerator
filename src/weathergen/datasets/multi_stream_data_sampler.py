@@ -40,6 +40,7 @@ from weathergen.utils.distributed import is_root
 
 from weathergen.datasets.domain import Domain
 from weathergen.datasets.domain_pyramid import build_domain_pyramid
+from weathergen.datasets.stream_levels import assign_stream_levels
 
 type AnyDataReader = DataReaderBase | DataReaderAnemoi | DataReaderObs
 type StreamName = str
@@ -114,17 +115,31 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         # The domain is the single source of truth for which cells exist. For a
         # global run (no `domain:` block in the config) len(domain) == 12 * 4**hl
         # and every mapping below is the identity.
-        # Phase 2: obtain it via the pyramid helper (bit-identical to
-        # Domain.from_config(cf) with one level; seam for per-stream levels later).
+        # Phase 2 seam + Step 3b: build the level pyramid, then one tokenizer per
+        # level and a per-stream level assignment. With a single-level ladder this
+        # is byte-for-byte identical to the previous single tokenizer.
         self.domain_pyramid = build_domain_pyramid(cf)
         self.domain = self.domain_pyramid.domain(self.domain_pyramid.finest)
-        self.num_healpix_cells = len(self.domain)                       # <-- CHANGE
-        self.masker = Masker(
-            cf.healpix_level, stage, cf.streams, self.mode_cfg, domain=self.domain   # <-- ADD
+        self.num_healpix_cells = len(self.domain)
+
+        # per-stream latent level (encode) + read levels (decode), via 3a policy
+        self.stream_encode_level, self.stream_decode_levels = assign_stream_levels(
+            cf, ladder=self.domain_pyramid.levels
         )
-        self.tokenizer = TokenizerMasking(
-            cf.healpix_level, self.masker, domain=self.domain           # <-- ADD
-        )
+
+        # one masker + tokenizer PER configured level, each on that level's domain
+        self._maskers: dict[int, Masker] = {}
+        self._tokenizers: dict[int, TokenizerMasking] = {}
+        for lvl in self.domain_pyramid.levels:
+            dom_l = self.domain_pyramid.domain(lvl)
+            masker_l = Masker(lvl, stage, cf.streams, self.mode_cfg, domain=dom_l)
+            self._maskers[lvl] = masker_l
+            self._tokenizers[lvl] = TokenizerMasking(lvl, masker_l, domain=dom_l)
+
+        # backward-compat aliases: legacy single-tokenizer references resolve to
+        # the finest level (== self.domain). New per-stream code uses self._tok().
+        self.masker = self._maskers[self.domain_pyramid.finest]
+        self.tokenizer = self._tokenizers[self.domain_pyramid.finest]
 
         forecast_cfg = FORECAST_DEFAULTS | OmegaConf.to_object(mode_cfg.get("forecast", {}))
         self.output_offset = forecast_cfg["offset"]
@@ -168,6 +183,91 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self.data_loader_rng_seed = rs if rs > nw else rs * 97
 
         self.rng = None
+
+        # Step 3b: one-time debug summary of the stream->level layout.
+        self._log_level_layout()
+
+    # ------------------------------------------------------------------ 3b
+    def _stream_name(self, stream) -> str:
+        """Accept either a stream name (str) or a stream_info dict (uses its
+        loader-stamped 'name' field, which equals the cf.streams key)."""
+        if isinstance(stream, str):
+            return stream
+        return stream["name"]
+
+    def _tok(self, stream) -> "TokenizerMasking":
+        """Tokenizer for this stream's assigned ENCODE level."""
+        return self._tokenizers[self.stream_encode_level[self._stream_name(stream)]]
+
+    def _mask_for(self, stream) -> "Masker":
+        """Masker for this stream's assigned encode level."""
+        return self._maskers[self.stream_encode_level[self._stream_name(stream)]]
+
+    def _ncells(self, stream) -> int:
+        """Number of active latent cells at this stream's encode level."""
+        lvl = self.stream_encode_level[self._stream_name(stream)]
+        return len(self.domain_pyramid.domain(lvl))
+
+    def _log_level_layout(self) -> None:
+        """Emit a compact table of the per-stream level assignment, once."""
+        if not is_root():
+            return
+        _logger.info("Step 3b latent-level layout (%d level(s)):",
+                     self.domain_pyramid.num_levels)
+        for lvl in self.domain_pyramid.levels:
+            dom = self.domain_pyramid.domain(lvl)
+            streams = [s for s, l in self.stream_encode_level.items() if l == lvl]
+            _logger.info(
+                "  hl%-2d  cells=%-7d  encode_streams=%s",
+                lvl, len(dom), streams if streams else "(none)",
+            )
+        for s in self.stream_encode_level:
+            _logger.info(
+                "  stream %-12s encode@hl%d  decode@%s",
+                s, self.stream_encode_level[s],
+                ",".join(f"hl{x}" for x in self.stream_decode_levels[s]),
+            )
+
+    def plot_level_layout(self, out_dir: str = "./plots/level_layout") -> None:
+        """
+        DEBUG visual: scatter the active cell centres of every latent level on a
+        lon/lat map, one colour per level, so the per-stream domains/resolutions
+        are visible at a glance. Side-effect free; writes one PNG. Safe to call
+        from a notebook or a one-shot at run start. Never touches the train path.
+        """
+        try:
+            import os
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as e:  # pragma: no cover
+            _logger.warning("plot_level_layout: matplotlib unavailable (%s)", e)
+            return
+
+        os.makedirs(out_dir, exist_ok=True)
+        fig, ax = plt.subplots(figsize=(11, 6))
+        # coarse levels first (bigger markers underneath), fine on top
+        cmap = plt.get_cmap("viridis")
+        n = max(self.domain_pyramid.num_levels, 1)
+        for i, lvl in enumerate(self.domain_pyramid.levels):
+            dom = self.domain_pyramid.domain(lvl)
+            lons, lats = dom.centres_lonlat()
+            size = 90.0 / (2 ** i) if len(lons) < 5000 else 6.0 / (2 ** i)
+            ax.scatter(
+                lons, lats, s=max(size, 1.0),
+                color=cmap(i / max(n - 1, 1)),
+                label=f"hl{lvl} ({len(dom)} cells)",
+                edgecolors="none", alpha=0.6,
+            )
+        ax.set_xlabel("longitude [deg]")
+        ax.set_ylabel("latitude [deg]")
+        ax.set_title("Latent level layout (active cell centres per level)")
+        ax.legend(loc="upper right", fontsize=8, framealpha=0.9)
+        ax.grid(alpha=0.3, lw=0.5)
+        out = os.path.join(out_dir, "level_layout.png")
+        fig.savefig(out, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        _logger.info("plot_level_layout: wrote %s", out)
 
     def check_samples(self, fsm: int):
         """Check if samples_per_mini_epoch is suitable
@@ -351,8 +451,9 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         else:
             raise ValueError(f"Unknown forecast policy {self.forecast_policy}")
 
-        # reset tokenizer RNG
-        self.tokenizer.reset_rng(self.rng)
+        # reset tokenizer RNG on every per-level tokenizer (3b)
+        for _tk in self._tokenizers.values():
+            _tk.reset_rng(self.rng)
         return (perms, fs)
 
     def _get_fsm(self) -> int:
@@ -457,7 +558,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                     continue
 
                 # preprocess data for model input
-                (source_cells, source_cells_lens) = self.tokenizer.get_source(
+                (source_cells, source_cells_lens) = self._tok(stream_info).get_source(
                     stream_info,
                     rdata,
                     token_data,
@@ -501,7 +602,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 continue
 
             if "target_coords" in mode:
-                (tc, tc_l) = self.tokenizer.get_target_coords(
+                (tc, tc_l) = self._tok(stream_info).get_target_coords(
                     stream_info,
                     rdata,
                     token_data,
@@ -511,7 +612,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 stream_data.add_target_coords(self._stage, timestep_idx, tc, tc_l, rdata.is_spoof)
 
             if "target_values" in mode:
-                (tt_cells, tt_t, tt_c, idxs_inv) = self.tokenizer.get_target_values(
+                (tt_cells, tt_t, tt_c, idxs_inv) = self._tok(stream_info).get_target_values(
                     stream_info,
                     rdata,
                     token_data,
@@ -528,7 +629,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 # get_target_values does not provide these and target_coords
                 # mode is not active in this path
                 if "target_coords" not in mode:
-                    (tc, tc_l) = self.tokenizer.get_target_coords(
+                    (tc, tc_l) = self._tok(stream_info).get_target_coords(
                         stream_info,
                         rdata,
                         token_data,
@@ -579,7 +680,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             base_idx,
             num_steps_input,
             num_output_steps,
-            self.num_healpix_cells,
+            self._ncells(stream_info),
         )
 
         stream_data = self._build_stream_data_input(
@@ -668,9 +769,9 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         for stream_name, stream_data in self.streams_datasets.items():
             stream_info = stream_data.info
             # Build source and target sample masks
-            masks[stream_name] = self.tokenizer.build_samples_for_stream(
+            masks[stream_name] = self._tok(stream_name).build_samples_for_stream(
                 training_mode,
-                self.num_healpix_cells,
+                self._ncells(stream_name),
                 stream_info,
             )
             # identical for all streams
@@ -753,8 +854,8 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
             # tokenize windows
             # *_tokens = [ (cells_idx, cells_idx_lens), ... ] with length = #time_steps
-            input_tokens = self.tokenizer.get_tokens_windows(stream_info, input_data, True)
-            output_tokens = self.tokenizer.get_tokens_windows(stream_info, output_data, False)
+            input_tokens = self._tok(stream_info).get_tokens_windows(stream_info, input_data, True)
+            output_tokens = self._tok(stream_info).get_tokens_windows(stream_info, output_data, False)
 
             for sidx, source_mask in enumerate(source_masks.masks):
                 # Map each source to its target
