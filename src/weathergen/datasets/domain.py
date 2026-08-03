@@ -115,6 +115,24 @@ class Domain:
         """Number of cells the full sphere would have at this level."""
         return 12 * 4**self.healpix_level
 
+    def to_compact_safe(self, global_idxs: NDArray) -> NDArray[np.int64]:
+        """
+        Bounds-safe global->compact lookup: returns the compact index for each
+        global nested index, or -1 if the index is inactive OR out of range.
+
+        Unlike `remap()` (which assumes valid in-range indices and returns the
+        identity for a global domain), this never indexes out of bounds and always
+        consults `to_compact`, so it is correct for cross-level parent/child maps
+        where a computed parent/child index may fall outside this level's active
+        set. Works identically for global and regional domains, since `to_compact`
+        is a full-length table in both cases (identity for global).
+        """
+        g = np.asarray(global_idxs, dtype=np.int64)
+        out = np.full(g.shape, -1, dtype=np.int64)
+        in_range = (g >= 0) & (g < self.num_total_cells)
+        out[in_range] = self.to_compact[g[in_range]]
+        return out
+
     # -----------------------------------------------------------------------
     # constructors
     # -----------------------------------------------------------------------
