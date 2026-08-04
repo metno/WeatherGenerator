@@ -194,7 +194,7 @@ class EncoderModule(torch.nn.Module):
                     num_extra_tokens=self.num_register_tokens + self.num_class_tokens,
                     num_queries=self.cf.ae_local_num_queries,
                     once=False,
-                    tag=f"hl{lvl}",
+                    tag=f"hl{lvl}_c{self._plot_step:06d}",
                     out_dir=f"/home/cristianl/weathergenerator/plots/latent_hl{lvl}",
                 )
             posteriors_by_level[lvl] = posteriors_l
