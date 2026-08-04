@@ -267,6 +267,7 @@ class Trainer(TrainerBase):
 
         # create data loaders
         self.dataset = MultiStreamDataSampler(cf, self.training_cfg, stage=TRAIN)
+        self.dataset.plot_level_layout("/home/cristianl/weathergenerator/plots/level_layout")
         self.dataset_val = MultiStreamDataSampler(cf, self.validation_cfg, stage=VAL)
 
         loader_params = {
