@@ -794,12 +794,13 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         """
         stream_names = list(self.streams_datasets.keys())
         batch.source_samples.tokens_lens = get_tokens_lens(
-            stream_names, batch.source_samples, source_input_steps
+            stream_names, batch.source_samples, source_input_steps,
+            stream_level=self.stream_encode_level,
         )
         batch.target_samples.tokens_lens = get_tokens_lens(
-            stream_names, batch.target_samples, target_input_steps
+            stream_names, batch.target_samples, target_input_steps,
+            stream_level=self.stream_encode_level,
         )
-
         return batch
 
     def _get_batch(self, idx: int, num_forecast_steps: int):
