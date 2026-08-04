@@ -183,11 +183,6 @@ class BatchSamples:
     def to_device(self, device):
         for sample in self.samples:
             sample.to_device(device)
-
-        self.tokens_lens = (
-            self.tokens_lens.to(device, non_blocking=True) if self.tokens_lens is not None else None
-        )
-
         if self.tokens_lens is None:
             pass
         elif isinstance(self.tokens_lens, dict):
@@ -196,9 +191,7 @@ class BatchSamples:
             }
         else:
             self.tokens_lens = self.tokens_lens.to(device, non_blocking=True)
-
         self.device = device
-
         return self
 
     def get_samples(self) -> list[Sample]:
