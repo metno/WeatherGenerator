@@ -1201,7 +1201,9 @@ class Model(torch.nn.Module):
         # pair with tokens from assimilation engine to obtain target tokens
         for stream_name in self.streams.keys():
             # levels this stream decodes from (3a); default to finest.
-            dec_levels = getattr(self, "stream_decode_levels", {}).get(stream_name, [_finest])
+            dec_levels = getattr(self.encoder, "stream_decode_levels", {}).get(
+                stream_name, [_finest]
+            )
 
             # Build this stream's KV neighbour pool by concatenating each decode
             # level's 1-ring per cell. Single level -> identical to old behaviour.
