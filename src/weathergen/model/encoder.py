@@ -110,6 +110,8 @@ class EncoderModule(torch.nn.Module):
         self.ae_aggregation_engine = self._ae_aggregation_per_level[_finest]
         self.ae_global_engine = self._ae_global_per_level[_finest]
 
+        self._plot_step = 0
+
     def _build_q_cells(self, cf, num_cells: int, healpix_level: int) -> torch.Tensor:
         """
         Learnable query bank for one level. Byte-identical to the old inline
@@ -148,6 +150,8 @@ class EncoderModule(torch.nn.Module):
         """
         levels = self.domain_pyramid.levels
 
+        self._plot_step += 1
+
         # make the embed engine level-aware, then embed (returns {level: tokens})
         self.embed_engine.stream_level = self.stream_encode_level
         stream_cell_tokens_by_level = checkpoint(
@@ -181,7 +185,7 @@ class EncoderModule(torch.nn.Module):
             )
             tokens_global_by_level[lvl] = tokens_global_l
             # DEBUG: plot latent space
-            if self.training:
+            if self.training and (self._plot_step % 10 == 0):
                 from weathergen.model.plot_latent_check import plot_latent_map
                 plot_latent_map(
                     tokens_global_l,
@@ -189,7 +193,6 @@ class EncoderModule(torch.nn.Module):
                     components=[0, 1, 2, 3],
                     num_extra_tokens=self.num_register_tokens + self.num_class_tokens,
                     num_queries=self.cf.ae_local_num_queries,
-                    every=10,
                     once=False,
                     tag=f"hl{lvl}",
                     out_dir=f"/home/cristianl/weathergenerator/plots/latent_hl{lvl}",
