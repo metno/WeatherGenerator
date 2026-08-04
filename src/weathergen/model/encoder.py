@@ -190,6 +190,7 @@ class EncoderModule(torch.nn.Module):
                     num_extra_tokens=self.num_register_tokens + self.num_class_tokens,
                     num_queries=self.cf.ae_local_num_queries,
                     every=10,
+                    once=False,
                     tag=f"hl{lvl}",
                     out_dir=f"/home/cristianl/weathergenerator/plots/latent_hl{lvl}",
                 )
