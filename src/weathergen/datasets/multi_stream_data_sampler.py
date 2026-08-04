@@ -345,12 +345,14 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 "stream_info": stream_info,
                 "stage": self._stage,
             }
-            # ADD -- only pass `domain` when it actually restricts anything, so that
-            # (a) global runs are byte-for-byte unchanged and (b) any custom reader
-            # from get_extra_reader() that does not accept a `domain` kwarg keeps
-            # working. Readers below all default domain=None.
-            if not self.domain.is_global:
-                kwargs["domain"] = self.domain
+            # Per-stream domain pre-filter: each stream's reader must filter to
+            # ITS OWN encode-level domain, not the finest. Otherwise a coarse
+            # stream (e.g. ERA5@hl5) gets clipped to the fine domain (hl8) box and
+            # only populates the coarse latent over the fine footprint.
+            _lvl = self.stream_encode_level[stream_name]
+            _stream_domain = self.domain_pyramid.domain(_lvl)
+            if not _stream_domain.is_global:
+                kwargs["domain"] = _stream_domain
 
             dataset: type[AnyDataReader] | None = None
             match stream_info["type"]:
@@ -785,17 +787,19 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         return max(1, self.output_offset + num_forecast_steps)
 
     def _preprocess_model_batch(
-        self, batch, source_input_steps, target_input_steps
+        self, batch: ModelBatch, source_input_steps: int, target_input_steps: int
     ):
+        """
+        Perform necessary pre-processing of model batch
+        """
         stream_names = list(self.streams_datasets.keys())
         batch.source_samples.tokens_lens = get_tokens_lens(
-            stream_names, batch.source_samples, source_input_steps,
-            stream_level=self.stream_encode_level,
+            stream_names, batch.source_samples, source_input_steps
         )
         batch.target_samples.tokens_lens = get_tokens_lens(
-            stream_names, batch.target_samples, target_input_steps,
-            stream_level=self.stream_encode_level,
+            stream_names, batch.target_samples, target_input_steps
         )
+
         return batch
 
     def _get_batch(self, idx: int, num_forecast_steps: int):
