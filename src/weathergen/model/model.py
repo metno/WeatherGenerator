@@ -1227,6 +1227,7 @@ class Model(torch.nn.Module):
 
                 parts = [nbors_f]
                 ring_total = ring_f
+                
                 for lvl in dec_levels:
                     if lvl == _finest:
                         continue
@@ -1236,14 +1237,19 @@ class Model(torch.nn.Module):
                     # map each fine cell -> its parent coarse compact index
                     poc = self.domain_pyramid.parent_of_child(lvl, _finest)  # (ncells_f,)
                     poc_t = torch.as_tensor(poc, device=nbors_c.device, dtype=torch.long)
+                    # validity is defined by the map itself: -1 == unpaired fine cell
+                    valid_cell = poc_t >= 0                         # (ncells_f,)
+                    valid = valid_cell.repeat(batch_size)          # (bs*ncells_f,)
                     # per-batch offset into the flattened (bs*ncells_c) coarse rows
                     b_off = (torch.arange(batch_size, device=nbors_c.device)
                              .repeat_interleave(ncells_f) * ncells_c)
-                    parent_rows = poc_t.repeat(batch_size) + b_off
-                    # unpaired (-1) fine cells: clamp to 0 then zero them out
-                    valid = parent_rows >= b_off  # parent index >=0
-                    parent_rows_clamped = torch.clamp(parent_rows, min=0)
-                    coarse_ring = nbors_c[parent_rows_clamped]  # (bs*ncells_f, ring_c, D)
+                    # clamp the PARENT COMPACT INDEX to [0, ncells_c-1] BEFORE adding
+                    # the per-batch offset, so unpaired (-1) cells map to a valid row
+                    # (row is then zeroed out below). This keeps every gather index in
+                    # [0, bs*ncells_c) regardless of batch size.
+                    parent_compact = torch.clamp(poc_t, min=0).repeat(batch_size)
+                    parent_rows = parent_compact + b_off
+                    coarse_ring = nbors_c[parent_rows]             # (bs*ncells_f, ring_c, D)
                     coarse_ring = coarse_ring * valid.view(-1, 1, 1).to(coarse_ring.dtype)
                     parts.append(coarse_ring)
                     ring_total += ring_c
