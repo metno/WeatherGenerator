@@ -26,6 +26,7 @@ from weathergen.model.engines import (
 from weathergen.model.parametrised_prob_dist import LatentInterpolator
 from weathergen.model.positional_encoding import positional_encoding_harmonic
 from weathergen.datasets.domain_pyramid import build_domain_pyramid
+from weathergen.model.latent_cascade import LatentCascade
 
 class EncoderModule(torch.nn.Module):
     name: "EncoderModule"
@@ -112,6 +113,18 @@ class EncoderModule(torch.nn.Module):
 
         self._plot_step = 0
 
+        # Phase 4: latent cascade (coarse<->fine exchange). num_cycles=0 -> inert,
+        # so this is a no-op until enabled via config. operator "none" is the
+        # parameter-free version; "linear"/"attention" are drop-in upgrades.
+        _casc_cfg = cf.get("latent_cascade", {}) if hasattr(cf, "get") else {}
+        self.latent_cascade = LatentCascade(
+            self.domain_pyramid,
+            dim=cf.ae_global_dim_embed,
+            num_queries=cf.ae_local_num_queries,
+            num_aux=(self.num_register_tokens + self.num_class_tokens),
+            num_cycles=_casc_cfg.get("num_cycles", 0),
+            operator=_casc_cfg.get("operator", "none"),
+        )
     def _build_q_cells(self, cf, num_cells: int, healpix_level: int) -> torch.Tensor:
         """
         Learnable query bank for one level. Byte-identical to the old inline
@@ -198,6 +211,9 @@ class EncoderModule(torch.nn.Module):
                     out_dir=f"/home/cristianl/weathergenerator/plots/latent_hl{lvl}",
                 )
             posteriors_by_level[lvl] = posteriors_l
+
+        # Phase 4: exchange information across levels (no-op unless enabled).
+        tokens_global_by_level = self.latent_cascade(tokens_global_by_level)
 
         return tokens_global_by_level, posteriors_by_level
 
