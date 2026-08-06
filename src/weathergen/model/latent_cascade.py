@@ -227,6 +227,7 @@ class LatentCascade(torch.nn.Module):
         aux = {}
         cells = {}
         for lvl, lat in tokens_by_level.items():
+#            print(f"[cascade] val={not self.training} lvl={lvl} latent.shape={tuple(lat.shape)}", flush=True)
             a, c = self._split(lat)
             aux[lvl] = a
             cells[lvl] = c
@@ -238,9 +239,10 @@ class LatentCascade(torch.nn.Module):
                 op = self._ops[key]
                 poc = getattr(self, f"poc_{key}")             # (n_fine,)
                 coarse = cells[lc]                            # (B, n_coarse, q, D)
-                valid = (poc >= 0)
-                idx = poc.clamp(min=0)
-                parent = coarse[:, idx, :, :]                 # (B, n_fine, q, D)
+                valid = (poc >= 0) & (poc < coarse.shape[1])
+                idx = poc.clamp(min=0, max=coarse.shape[1] - 1)
+                parent = coarse[:, idx, :, :]
+                parent = parent * valid.view(1, -1, 1, 1).to(parent.dtype)
                 if op.reduces_source:
                     # none/linear: pass the (validity-zeroed) parent directly.
                     parent = parent * valid.view(1, -1, 1, 1).to(parent.dtype)
@@ -257,12 +259,13 @@ class LatentCascade(torch.nn.Module):
                 key = f"{lc}_{lf}"
                 op = self._ops[key]
                 cop = getattr(self, f"cop_{key}")             # (n_coarse, K)
-                cv = getattr(self, f"cv_{key}")               # (n_coarse, K)
+                cv = getattr(self, f"cv_{key}")               # (n_coarse, K)   <-- must exist first
                 fine = cells[lf]                              # (B, n_fine, q, D)
                 B, _, q, D = fine.shape
                 n_coarse = cop.shape[0]
                 K = cop.shape[1]
-                idx = cop.clamp(min=0)                        # (n_coarse, K)
+                cv = cv & (cop < fine.shape[1])               # now safe: cv already bound
+                idx = cop.clamp(min=0, max=fine.shape[1] - 1)
                 gathered = fine[:, idx.reshape(-1), :, :].reshape(
                     B, n_coarse, K, q, D
                 )                                             # (B, n_coarse, K, q, D)
