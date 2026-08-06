@@ -1189,8 +1189,10 @@ class Model(torch.nn.Module):
             mp_l = model_params.params_for(lvl) if hasattr(model_params, "params_for") else model_params
             toks_l = tokens_lvl[lvl][:, self.num_aux_tokens :] if lvl != self.domain_pyramid.finest else tokens
             ncells_l = len(self.domain_pyramid.domain(lvl))
-            sl = [batch_size, ncells_l, self.cf.ae_local_num_queries, toks_l.shape[-1]]
-            idxs_l = mp_l.hp_nbours.unsqueeze(0).repeat((batch_size, 1, 1)).flatten(0, 1)
+            bs_l = toks_l.numel() // (ncells_l * self.cf.ae_local_num_queries * toks_l.shape[-1])
+            sl = [bs_l, ncells_l, self.cf.ae_local_num_queries, toks_l.shape[-1]]
+            b_off = (torch.arange(bs_l, device=mp_l.hp_nbours.device) * ncells_l).view(bs_l, 1, 1)
+            idxs_l = (mp_l.hp_nbours.unsqueeze(0) + b_off).flatten(0, 1)
             ring = mp_l.hp_nbours.shape[1]  # self + neighbours (=9)
             nbors_l = toks_l.reshape(sl).flatten(0, 1)[idxs_l.flatten()].flatten(0, 1)
             return nbors_l, ncells_l, ring
