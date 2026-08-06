@@ -26,6 +26,7 @@ from weathergen.common.config import Config
 from weathergen.datasets.batch import ModelBatch
 from weathergen.datasets.utils import healpix_verts_rots, r3tos2
 from weathergen.model.encoder import EncoderModule
+from weathergen.model.latent_cascade import LatentCascade
 from weathergen.model.engines import (
     BilinearDecoder,
     EnsPredictionHead,
@@ -531,9 +532,30 @@ class Model(torch.nn.Module):
 
         mode_cfg = cf.training_config
         if cf.fe_num_blocks > 0:
-            self.forecast_engine = ForecastingEngine(cf, mode_cfg, self.num_healpix_cells)
+            # 3c-3c: one forecast engine PER LEVEL (separate weights -- coarse and
+            # fine dynamics differ). self.forecast_engine aliases the finest so
+            # existing single-level code / FSDP / param logging keep working.
+            self._forecast_per_level = torch.nn.ModuleDict()
+            for lvl in self.domain_pyramid.levels:
+                n_cells_l = len(self.domain_pyramid.domain(lvl))
+                self._forecast_per_level[str(lvl)] = ForecastingEngine(cf, mode_cfg, n_cells_l)
+            self.forecast_engine = self._forecast_per_level[str(self.domain_pyramid.finest)]
         else:
+            self._forecast_per_level = None
             self.forecast_engine = IdentityEngine()
+
+        # 3c-3c: SECOND, independent latent cascade applied after each forecast
+        # step (couples levels at every lead time). Own weights, own config.
+        _fc_cfg = cf.get("forecast_cascade", {}) if hasattr(cf, "get") else {}
+        self.forecast_cascade = LatentCascade(
+            self.domain_pyramid,
+            dim=cf.ae_global_dim_embed,
+            num_queries=cf.ae_local_num_queries,
+            num_aux=(cf.num_register_tokens + cf.num_class_tokens),
+            num_cycles=_fc_cfg.get("num_cycles", 0),
+            operator=_fc_cfg.get("operator", "none"),
+            num_heads=_fc_cfg.get("num_heads", 8),
+        )
 
         # embed coordinates yielding one query token for each target token
         dropout_rate = cf.embed_dropout_rate
@@ -1102,15 +1124,34 @@ class Model(torch.nn.Module):
 
         # Allow for pushforward trick
         p_fwd = self.cf.training_config.get("forecast", {}).get("pushforward", False)
+
+        def _forecast_all(tlvl, step):
+            # advance each level's latent through ITS OWN forecast engine, then
+            # couple levels with the forecast cascade. Single level + inert cascade
+            # -> identical to the previous finest-only roll-out.
+            out = {}
+            for lvl, t in tlvl.items():
+                if self._forecast_per_level is not None:
+                    eng = self._forecast_per_level[str(lvl)]
+                    rope = (model_params.params_for(lvl).rope_coords
+                            if hasattr(model_params, "params_for") else model_params.rope_coords)
+                else:
+                    eng = self.forecast_engine
+                    rope = model_params.rope_coords
+                out[lvl] = eng(t, step, rope)
+            return self.forecast_cascade(out)
+
         # roll-out in latent space, iterate and generate output over requested output steps
         for step in batch.get_output_idxs():
             without_grad = p_fwd and self.training and step != max(batch.get_output_idxs())
             if without_grad:
-                # Pushforward mode: advance tokens without grad; no decoding with torch.no_grad():
-                tokens = self.forecast_engine(tokens, step, model_params.rope_coords)
+                # Pushforward mode: advance without grad; no decoding
+                tokens_lvl = _forecast_all(tokens_lvl, step)
+                tokens = tokens_lvl[_finest]
                 continue
 
-            tokens = self.forecast_engine(tokens, step, model_params.rope_coords)
+            tokens_lvl = _forecast_all(tokens_lvl, step)
+            tokens = tokens_lvl[_finest]
             # decoder predictions (fine streams read coarse+fine via tokens_lvl)
             output = self.predict_decoders(
                 model_params, step, tokens, batch, output, tokens_lvl=tokens_lvl
