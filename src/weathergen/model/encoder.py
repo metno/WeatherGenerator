@@ -137,6 +137,17 @@ class EncoderModule(torch.nn.Module):
 
         self._plot_step = 0
 
+        # Activation checkpointing toggle. Default True preserves existing
+        # behaviour. Set `encoder_use_checkpoint: false` in the config to run the
+        # encoder forward WITHOUT torch.utils.checkpoint -- needed as a
+        # diagnostic/workaround because checkpoint(use_reentrant=False) recompute
+        # is incompatible with FSDP2 DTensor params (recompute re-runs a Linear
+        # whose weight is a DTensor against a plain-tensor activation -> "mixed
+        # torch.Tensor and DTensor"). Off = more activation memory, no recompute.
+        self._use_checkpoint = bool(cf.get("encoder_use_checkpoint", True)) if hasattr(
+            cf, "get"
+        ) else getattr(cf, "encoder_use_checkpoint", True)
+
         # Phase 4: latent cascade (coarse<->fine exchange). num_cycles=0 -> inert,
         # so this is a no-op until enabled via config. operator "none" is the
         # parameter-free version; "linear"/"attention" are drop-in upgrades.
@@ -176,6 +187,19 @@ class EncoderModule(torch.nn.Module):
             q_cells = torch.rand(s) / cf.ae_global_dim_embed
         return q_cells
 
+    def _maybe_checkpoint(self, fn, *args, **kwargs):
+        """
+        Wrapper around torch.utils.checkpoint that can be turned off via
+        `encoder_use_checkpoint: false`. When enabled, behaves exactly as before
+        (use_reentrant=False). When disabled, calls fn directly -- no recompute,
+        so the FSDP2 DTensor-on-recompute crash cannot occur. `use_reentrant` is
+        accepted-and-dropped in the disabled path so call sites stay identical.
+        """
+        if self._use_checkpoint:
+            return checkpoint(fn, *args, **kwargs)
+        kwargs.pop("use_reentrant", None)
+        return fn(*args, **kwargs)
+
     def forward(self, model_params, batch):
         """
         Encoder forward (multi-level, 3c-3b).
@@ -191,7 +215,7 @@ class EncoderModule(torch.nn.Module):
 
         # make the embed engine level-aware, then embed (returns {level: tokens})
         self.embed_engine.stream_level = self.stream_encode_level
-        stream_cell_tokens_by_level = checkpoint(
+        stream_cell_tokens_by_level = self._maybe_checkpoint(
             self.embed_engine, batch, model_params.pe_embed, use_reentrant=False
         )
 
@@ -205,7 +229,7 @@ class EncoderModule(torch.nn.Module):
             mp_l = model_params.params_for(lvl) if _has_pyr else model_params
             stream_cell_tokens_l = stream_cell_tokens_by_level[lvl]
 
-            tokens_global_l, posteriors_l = checkpoint(
+            tokens_global_l, posteriors_l = self._maybe_checkpoint(
                 self.assimilate_local,
                 mp_l,
                 stream_cell_tokens_l,
@@ -214,7 +238,7 @@ class EncoderModule(torch.nn.Module):
                 lvl,
                 use_reentrant=False,
             )
-            tokens_global_l = checkpoint(
+            tokens_global_l = self._maybe_checkpoint(
                 ae_global_l,
                 tokens_global_l,
                 coords=mp_l.rope_coords,
