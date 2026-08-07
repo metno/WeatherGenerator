@@ -65,7 +65,16 @@ def init_model_and_shard(
 
     # TODO: this should be handled in the encoder to be close where q_cells is defined
     if "q_cells" in cf.freeze_modules:
-        model.encoder.q_cells.requires_grad = False
+        # q_cells is now a per-level ParameterDict (encoder._q_cells_param_dict);
+        # model.encoder.q_cells is a finest-level alias into it. Freeze every level
+        # so coarse query banks are frozen too. For a single-level config this is
+        # exactly the one (finest) parameter, matching the old single-line freeze.
+        _qdict = getattr(model.encoder, "_q_cells_param_dict", None)
+        if _qdict is not None:
+            for _q in _qdict.values():
+                _q.requires_grad = False
+        else:
+            model.encoder.q_cells.requires_grad = False
 
     if with_ddp and not with_fsdp:
         # create DDP model if running without FSDP
@@ -98,24 +107,61 @@ def init_model_and_shard(
             MultiSelfAttentionHeadVarlen,
         )
 
-        for module in model.encoder.ae_local_engine.ae_local_blocks.modules():
-            if isinstance(module, modules_to_shard):
-                fully_shard(module, **fsdp_kwargs)
+        def _shard_leaf_modules(root, **kwargs):
+            """Shard every leaf in `root` whose type is in modules_to_shard."""
+            for module in root.modules():
+                if isinstance(module, modules_to_shard):
+                    fully_shard(module, **kwargs)
 
-        for module in model.encoder.ae_local_global_engine.ae_adapter.modules():
-            if isinstance(module, modules_to_shard):
-                fully_shard(module, **fsdp_kwargs)
+        # --- local + local->global adapter (SHARED across levels: single set of
+        # weights, unchanged from the single-level baseline). ---------------------
+        # NOTE: when share_local_assimilation=False these become per-level dicts
+        # (encoder._ae_local_per_level / _ae_local_global_per_level). The aliases
+        # below still point at the finest level, so the non-shared branch is not
+        # yet fully sharded -- tracked as a follow-up once the shared gate passes.
+        _shard_leaf_modules(model.encoder.ae_local_engine.ae_local_blocks, **fsdp_kwargs)
+        _shard_leaf_modules(model.encoder.ae_local_global_engine.ae_adapter, **fsdp_kwargs)
 
-        for module in model.encoder.ae_global_engine.ae_global_blocks.modules():
-            if isinstance(module, modules_to_shard):
-                fully_shard(module, **fsdp_kwargs)
+        # --- global assimilation: one GlobalAssimilationEngine PER LEVEL. --------
+        # ae_global_engine is now a finest-level alias into _ae_global_per_level,
+        # so sharding only the alias would leave coarser levels unsharded. Loop the
+        # dict. For a single-level config this dict has exactly one (finest) entry,
+        # so the set of sharded modules is identical to the old alias-only code
+        # -> the single-level FSDP gate is byte-identical.
+        for _lvl, _eng in model.encoder._ae_global_per_level.items():
+            _shard_leaf_modules(_eng.ae_global_blocks, **fsdp_kwargs)
 
-        for module in model.forecast_engine.fe_blocks.modules():
-            if isinstance(module, modules_to_shard):
-                # reshard_after_forward=False keeps FE parameters unsharded
-                # during the multi-step rollout loop.
-                # Needed for pushforward trick.
-                fully_shard(module, reshard_after_forward=False, **fsdp_kwargs)
+        # --- query-aggregation engines are also per-level. Each holds real
+        # attention params (QueryAggregationEngine.ae_aggregation_blocks:
+        # MultiSelfAttentionHeadVarlen / ...Local). In the single-level baseline
+        # these were NOT wrapped here -- the trailing fully_shard(model) sweeps
+        # them into the ROOT group. That still happens, so the gate is unchanged.
+        # Follow-up for multi-level: root-group params don't reshard across the
+        # fwd/bwd boundary, so wrapping each level's ae_aggregation_blocks
+        # explicitly (like ae_global above) would cut peak memory. Left out now to
+        # keep the single-level shard set identical. -------------------------------
+
+        # --- forecast engine: one ForecastingEngine PER LEVEL (or an IdentityEngine
+        # when fe_num_blocks == 0, which has no fe_blocks). Loop the dict when it
+        # exists; fall back to the alias for the identity/no-forecast case. --------
+        # reshard_after_forward=False keeps FE params unsharded during the
+        # multi-step rollout loop (needed for the pushforward trick).
+        _fe_per_level = getattr(model, "_forecast_per_level", None)
+        if _fe_per_level is not None:
+            for _lvl, _fe in _fe_per_level.items():
+                _shard_leaf_modules(_fe.fe_blocks, reshard_after_forward=False, **fsdp_kwargs)
+        elif hasattr(model.forecast_engine, "fe_blocks"):
+            _shard_leaf_modules(
+                model.forecast_engine.fe_blocks, reshard_after_forward=False, **fsdp_kwargs
+            )
+
+        # --- latent cascades (encoder.latent_cascade + model.forecast_cascade).
+        # These use plain nn.Linear / a custom _CrossAttn, none of which are in
+        # modules_to_shard, so the leaf-shard loop is a no-op on them today. With
+        # operator="none" (the single-level default) they are parameter-inert
+        # anyway. Left unsharded on purpose to keep the gate identical; when the
+        # linear/attention operators are enabled at scale, shard each cascade as
+        # its own FSDP unit here. --------------------------------------------------
 
         for module in model.latent_heads.modules():
             if isinstance(module, modules_to_shard):
@@ -190,6 +236,33 @@ def init_model_and_shard(
 #
 #    for _m in model.modules():
 #        _m.register_forward_hook(_nan_hook)
+
+    # Repair LatentCascade geometry buffers after meta-device init (FSDP path).
+    # The cascade registers its parent/child index maps (poc_/cop_/cv_) as
+    # NON-persistent buffers, so they are (a) created on `meta` when the model is
+    # built on meta, and (b) skipped by load_state_dict -- neither to_empty nor
+    # reset_parameters (which only touches Linear/LayerNorm) repopulates them.
+    # For a single-level config the cascade has no pairs and no buffers, so this
+    # loop is a no-op and the gate is unaffected. With >=2 levels enabled it
+    # rebuilds the maps on-device from the pyramid so the geometry is correct.
+    if with_ddp and with_fsdp:
+        for _casc in (
+            getattr(model.encoder, "latent_cascade", None),
+            getattr(model, "forecast_cascade", None),
+        ):
+            if _casc is None or getattr(_casc, "is_inert", lambda: True)():
+                continue
+            _pyr = _casc.pyramid
+            _dev = torch.device(f"cuda:{cf.local_rank}")
+            for lc, lf in _casc.pairs:
+                key = f"{lc}_{lf}"
+                poc = torch.as_tensor(_pyr.parent_of_child(lc, lf), dtype=torch.long, device=_dev)
+                cop = torch.as_tensor(_pyr.child_of_parent(lc, lf), dtype=torch.long, device=_dev)
+                cv = torch.as_tensor(_pyr.child_valid(lc, lf), dtype=torch.bool, device=_dev)
+                # overwrite in place (buffers already exist as attributes)
+                setattr(_casc, f"poc_{key}", poc)
+                setattr(_casc, f"cop_{key}", cop)
+                setattr(_casc, f"cv_{key}", cv)
 
     return model, model_params
 
