@@ -222,18 +222,18 @@ class EncoderModule(torch.nn.Module):
             )
             tokens_global_by_level[lvl] = tokens_global_l
             # DEBUG: plot latent space
-            if self.training and (self._plot_step % 10 == 0):
-                from weathergen.model.plot_latent_check import plot_latent_map
-                plot_latent_map(
-                    tokens_global_l,
-                    self.domain_pyramid.domain(lvl),
-                    components=[0, 1, 2, 3],
-                    num_extra_tokens=self.num_register_tokens + self.num_class_tokens,
-                    num_queries=self.cf.ae_local_num_queries,
-                    once=False,
-                    tag=f"hl{lvl}_c{self._plot_step:06d}",
-                    out_dir=f"/home/cristianl/weathergenerator/plots/latent_hl{lvl}",
-                )
+#            if self.training and (self._plot_step % 10 == 0):
+#                from weathergen.model.plot_latent_check import plot_latent_map
+#                plot_latent_map(
+#                    tokens_global_l,
+#                    self.domain_pyramid.domain(lvl),
+#                    components=[0, 1, 2, 3],
+#                    num_extra_tokens=self.num_register_tokens + self.num_class_tokens,
+#                    num_queries=self.cf.ae_local_num_queries,
+#                    once=False,
+#                    tag=f"hl{lvl}_c{self._plot_step:06d}",
+#                    out_dir=f"/home/cristianl/weathergenerator/plots/latent_hl{lvl}",
+#                )
             posteriors_by_level[lvl] = posteriors_l
 
         # Phase 4: exchange information across levels (no-op unless enabled).
