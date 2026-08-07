@@ -140,11 +140,26 @@ class _CrossAttn(torch.nn.Module):
         # attention over the S neighbour axis, per (cell, query, head)
         # Q: (B,N,q,h,dh) ; K,V: (B,N,S,q,h,dh)
         scores = torch.einsum("bnqhd,bnsqhd->bnqhs", Q, K) / (self.dh ** 0.5)
+        row_all_masked = None
         if mask is not None:
             # mask: (B,N,S) -> (B,N,1,1,S)
             neg = torch.finfo(scores.dtype).min
-            scores = scores.masked_fill(~mask[:, :, None, None, :], neg)
+            m = mask[:, :, None, None, :]
+            scores = scores.masked_fill(~m, neg)
+            # A cell whose neighbour set is ENTIRELY invalid (e.g. a coarse cell
+            # with no active children -- here 354 of 467 coarse cells) has an
+            # all-masked score row. softmax over all -inf yields NaN, which then
+            # poisons gradients and (under FSDP) can stall the collective reduce
+            # into a watchdog hang rather than a clean error. Detect those rows so
+            # we can zero their attention output below instead of producing NaN.
+            # row_all_masked: (B,N,q,h) True where every neighbour was masked out.
+            row_all_masked = (~mask).all(dim=2)[:, :, None, None].expand(
+                scores.shape[0], scores.shape[1], scores.shape[2], scores.shape[3]
+            )
         attn = torch.softmax(scores, dim=-1)
+        if row_all_masked is not None:
+            # replace NaN softmax rows with 0 attention (cell receives no update).
+            attn = torch.where(row_all_masked.unsqueeze(-1), torch.zeros_like(attn), attn)
         out = torch.einsum("bnqhs,bnsqhd->bnqhd", attn, V).reshape(B, N, q, D)
         return self.o_proj(out)
 
