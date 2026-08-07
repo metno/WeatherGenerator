@@ -78,9 +78,21 @@ class NetcdfParser(CfParser):
                 result = result.as_xarray().squeeze()
             if "channel" not in result.indexes:
                 result = result.expand_dims("channel")
-            result = result.sel(channel=self.channels)
-            result = self.reshape(result)
-            da_fs.append(result)
+
+            # Get unique valid times
+            unique_times = np.sort(np.unique(result.valid_time.values))
+
+            for vt in unique_times:
+                sub = result.sel(channel=self.channels, valid_time=vt)
+
+                if len(unique_times) > 1:
+                    # Reassign ipoint so that the same spatial point indices are used
+                    # for each unique valid_time
+                    new_ipoint = sub.ipoint.copy(data=np.arange(sub.sizes["ipoint"]))
+                    sub = sub.assign_coords(ipoint=new_ipoint)
+
+                sub = self.reshape(sub)
+                da_fs.append(sub)
 
         _logger.info(f"Retrieved {len(da_fs)} forecast steps for type {self.data_type}.")
         _logger.info(f"Saved sample data to {self.output_format} in {self.output_dir}.")
@@ -164,6 +176,7 @@ class NetcdfParser(CfParser):
         reshaped_dataset = reshaped_dataset.assign_coords(
             ipoint=data.coords["ipoint"],
         )
+
         # order using pressure_level coord
         if "pressure_level" in reshaped_dataset.coords:
             reshaped_dataset = reshaped_dataset.sortby("pressure_level")
@@ -343,7 +356,12 @@ class NetcdfParser(CfParser):
         dims_cfg = self.config.get("dimensions", {})
         ds, ds_attrs = self._assign_dim_attrs(ds, dims_cfg)
         for var_name, da in ds.data_vars.items():
-            mapped_info = self.mapping.get(var_name, {})
+            try:
+                mapped_info = self.mapping[var_name]
+            except KeyError as e:
+                raise KeyError(
+                    f"Variable '{var_name}' not found in mapping. Update relevant config."
+                ) from e
             mapped_name = mapped_info.get("var", var_name)
 
             coords = self._build_coordinate_mapping(ds, mapped_info, ds_attrs)
@@ -381,7 +399,12 @@ class NetcdfParser(CfParser):
         ds, ds_attrs = self._assign_dim_attrs(ds, dims_cfg)
         dims_list = ["pressure", "valid_time", "latitude", "longitude"]
         for var_name, da in ds.data_vars.items():
-            mapped_info = self.mapping.get(var_name, {})
+            try:
+                mapped_info = self.mapping[var_name]
+            except KeyError as e:
+                raise KeyError(
+                    f"Variable '{var_name}' not found in mapping. Update relevant config."
+                ) from e
             mapped_name = mapped_info.get("var", var_name)
             dims = dims_list.copy()
             if mapped_info.get("level_type") == "sfc":
