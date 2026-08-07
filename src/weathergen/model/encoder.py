@@ -70,8 +70,31 @@ class EncoderModule(torch.nn.Module):
         self.num_register_tokens = cf.num_register_tokens
         self.num_class_tokens = cf.num_class_tokens
 
-        # local assimilation engine
-        self.ae_local_engine = LocalAssimilationEngine(cf)
+        # local assimilation engine(s)
+        # By default local assimilation weights are SHARED across levels (one
+        # per-cell operator). Set share_local_assimilation: false to give each
+        # level its own weights -- coarse cells summarise coarser-scale obs than
+        # fine cells, so the optimal local-assimilation map may differ by scale.
+        self.share_local_assimilation = cf.get("share_local_assimilation", True)
+        ae_adapter_type = cf.get("ae_adapter_type", "cross_attention")
+
+        def _make_local():
+            return LocalAssimilationEngine(cf)
+
+        def _make_adapter():
+            if ae_adapter_type == "sum":
+                return Local2GlobalSumEngine(cf)
+            return Local2GlobalAssimilationEngine(cf)
+
+        if self.share_local_assimilation:
+            self.ae_local_engine = _make_local()
+        else:
+            self._ae_local_per_level = torch.nn.ModuleDict()
+            self._ae_local_global_per_level = torch.nn.ModuleDict()
+            for lvl in self.domain_pyramid.levels:
+                self._ae_local_per_level[str(lvl)] = _make_local()
+                self._ae_local_global_per_level[str(lvl)] = _make_adapter()
+            self.ae_local_engine = self._ae_local_per_level[str(self.domain_pyramid.finest)]
 
         if cf.latent_noise_kl_weight > 0.0:
             self.interpolator_latents = LatentInterpolator(
@@ -82,11 +105,12 @@ class EncoderModule(torch.nn.Module):
             )
 
         # local -> global assimilation engine adapter
-        ae_adapter_type = cf.get("ae_adapter_type", "cross_attention")
-        if ae_adapter_type == "sum":
-            self.ae_local_global_engine = Local2GlobalSumEngine(cf)
+        if self.share_local_assimilation:
+            self.ae_local_global_engine = _make_adapter()
         else:
-            self.ae_local_global_engine = Local2GlobalAssimilationEngine(cf)
+            self.ae_local_global_engine = self._ae_local_global_per_level[
+                str(self.domain_pyramid.finest)
+            ]
 
         # learnable queries + global/aggregation engines, built PER LEVEL (3c-1).
         # Shared engines (embed, local, local-global) are unchanged (built above).
@@ -231,7 +255,7 @@ class EncoderModule(torch.nn.Module):
 
         return tokens, posteriors
 
-    def assimilate_local_project_chunked(self, tokens, tokens_global, cell_lens, q_cells_lens, num_cells=None):
+    def assimilate_local_project_chunked(self, tokens, tokens_global, cell_lens, q_cells_lens, num_cells=None, level=None):
         """
         Apply the local assimilation engine and then the
         local-to-global adapter using a chunking in the number of tokens
@@ -239,6 +263,13 @@ class EncoderModule(torch.nn.Module):
         """
 
         # combined cell lens for all tokens in batch across all input steps
+        if self.share_local_assimilation or level is None:
+            ae_local = self.ae_local_engine
+            ae_local_global = self.ae_local_global_engine
+        else:
+            ae_local = self._ae_local_per_level[str(level)]
+            ae_local_global = self._ae_local_global_per_level[str(level)]
+
         zero_pad = torch.zeros(1, device=tokens.device, dtype=torch.int32)
 
         # subdivision factor for required splitting
@@ -275,7 +306,7 @@ class EncoderModule(torch.nn.Module):
 #                  f"toks={toks.shape[0]} maxlen={cell_lens_cur.max().item()}", flush=True)
 
             # local assimilation model
-            toks = self.ae_local_engine(toks, cell_lens_cur, use_reentrant=False)
+            toks = ae_local(toks, cell_lens_cur, use_reentrant=False)
 
             toks, posteriors_c = self.interpolate_latents(toks)
             posteriors += [posteriors_c]
@@ -287,7 +318,7 @@ class EncoderModule(torch.nn.Module):
             cell_lens_unmasked = torch.cat([zero_pad, cell_lens_cur[1:][mask]])
 
             # local to global adapter engine
-            toks_global_unmasked = self.ae_local_global_engine(
+            toks_global_unmasked = ae_local_global(
                 toks,
                 toks_global_unmasked,
                 q_cells_lens_unmasked,
@@ -407,7 +438,7 @@ class EncoderModule(torch.nn.Module):
 
         # apply local assimilation engine and project onto global latent vectors
         tokens_global_unmasked, posteriors = self.assimilate_local_project_chunked(
-            tokens, tokens_global, cell_lens, model_params.q_cells_lens, num_cells_l
+            tokens, tokens_global, cell_lens, model_params.q_cells_lens, num_cells_l, level
         )
 
         # apply aggregation engine on unmasked tokens (per-level engine)
