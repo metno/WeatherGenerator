@@ -292,9 +292,23 @@ def lp_loss(
     mask_nan = ~torch.isnan(target)
     pred = pred[0] if pred.shape[0] == 0 else pred.mean(0)
 
-    diff_p = torch.pow(
-        torch.abs(torch.where(mask_nan, target, 0) - torch.where(mask_nan, pred, 0)), p_norm
-    )
+    diff = torch.where(mask_nan, target, 0) - torch.where(mask_nan, pred, 0)
+    # NaN-safe p-power. torch.pow(|x|, p) has a singular / ill-defined gradient at
+    # x == 0 (PowBackward0 returns NaN when an element is an EXACT match, e.g. on
+    # the first step when a zero-initialised head makes pred == target). An exact
+    # match must contribute ZERO gradient, not NaN. For even integer p we can use
+    # plain multiplication, whose gradient is finite everywhere; for odd p we keep
+    # the sign via |x|. This avoids torch.pow entirely for the common p_norm in {1,2}.
+    if p_norm == 1:
+        diff_p = torch.abs(diff)
+    elif p_norm == 2:
+        diff_p = diff * diff
+    else:
+        # general integer p: repeated multiplication of |x|, finite gradient at 0.
+        a = torch.abs(diff)
+        diff_p = a
+        for _ in range(p_norm - 1):
+            diff_p = diff_p * a
     if weights_points is not None:
         diff_p = (diff_p.transpose(1, 0) * weights_points).transpose(1, 0)
     loss_chs = diff_p.mean(0) if with_mean else diff_p.sum(0)
