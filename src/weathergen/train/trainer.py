@@ -22,6 +22,13 @@ from omegaconf import OmegaConf
 # FSDP2
 from torch.distributed.tensor import DTensor
 
+from weathergen.model.nan_debug import (
+    scan_params_for_nan,
+    register_grad_nan_hooks,
+    check_params_after_step,
+    enable_anomaly,
+)
+
 import weathergen.common.config as config
 from weathergen.common.config import Config
 from weathergen.datasets.multi_stream_data_sampler import MultiStreamDataSampler
@@ -232,6 +239,12 @@ class Trainer(TrainerBase):
             cf.with_ddp,
             cf.with_fsdp,
         )
+        # --- TEMP NaN diagnostics ---
+        scan_params_for_nan(self.model, "init")   # is anything NaN already at init?
+        register_grad_nan_hooks(self.model)       # name first NaN GRADIENT in backward
+        enable_anomaly()  # uncomment for a definitive backward stack trace (SLOW)
+        # --- end TEMP ---
+
 
         # get target_aux calculators for different loss terms
         self.target_and_aux_calculators_val = self.get_target_aux_calculators(self.test_cfg)
@@ -291,6 +304,11 @@ class Trainer(TrainerBase):
             cf.with_ddp,
             cf.with_fsdp,
         )
+        # --- TEMP NaN diagnostics ---
+        scan_params_for_nan(self.model, "init")   # is anything NaN already at init?
+        register_grad_nan_hooks(self.model)       # name first NaN GRADIENT in backward
+        enable_anomaly()  # uncomment for a definitive backward stack trace (SLOW)
+        # --- end TEMP ---
 
         validate_with_ema_cfg = self.validation_cfg.get("validate_with_ema")
         if validate_with_ema_cfg is not None:
@@ -549,6 +567,10 @@ class Trainer(TrainerBase):
                 # optimizer step
                 self.grad_scaler.step(self.optimizer)
                 self.grad_scaler.update()
+                # --- TEMP NaN diagnostics ---
+                if check_params_after_step(self.model, self.cf.general.istep):
+                    raise SystemExit(1)   # stop at the first corrupted weight
+                # --- end TEMP ---
 
                 # update learning rate
                 self.lr_scheduler.step()
