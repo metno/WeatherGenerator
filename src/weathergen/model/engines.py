@@ -470,6 +470,7 @@ class GlobalAssimilationEngine(torch.nn.Module):
                     MultiSelfAttentionHead(
                         self.cf.ae_global_dim_embed,
                         num_heads=self.cf.ae_global_num_heads,
+                        softcap=50.0,
                         dropout_rate=self.cf.ae_global_dropout_rate,
                         with_qk_lnorm=self.cf.ae_global_with_qk_lnorm,
                         with_flash=self.cf.with_flash_attention,
@@ -486,6 +487,7 @@ class GlobalAssimilationEngine(torch.nn.Module):
                         self.cf.ae_global_dim_embed,
                         num_heads=self.cf.ae_global_num_heads,
                         qkv_len=self.num_healpix_cells * self.cf.ae_local_num_queries,
+                        softcap=50.0,
                         block_factor=self.cf.ae_global_block_factor,
                         dropout_rate=self.cf.ae_global_dropout_rate,
                         with_qk_lnorm=self.cf.ae_global_with_qk_lnorm,
@@ -514,10 +516,15 @@ class GlobalAssimilationEngine(torch.nn.Module):
                 torch.nn.LayerNorm(self.cf.ae_global_dim_embed, elementwise_affine=False)
             )
 
+#    def forward(self, tokens, coords=None):
+#        aux_info = None
+#        for block in self.ae_global_blocks:
+#            tokens = checkpoint(block, tokens, coords, aux_info, use_reentrant=False)
+#        return tokens
     def forward(self, tokens, coords=None):
         aux_info = None
         for block in self.ae_global_blocks:
-            tokens = checkpoint(block, tokens, coords, aux_info, use_reentrant=False)
+            tokens = block(tokens, coords, aux_info)   # checkpoint disabled (test)
         return tokens
 
 
@@ -556,6 +563,7 @@ class ForecastingEngine(torch.nn.Module):
                         MultiSelfAttentionHead(
                             self.cf.ae_global_dim_embed,
                             num_heads=self.cf.fe_num_heads,
+                            softcap=50.0,
                             dropout_rate=self.cf.fe_dropout_rate,
                             with_qk_lnorm=self.cf.fe_with_qk_lnorm,
                             with_flash=self.cf.with_flash_attention,
@@ -573,6 +581,7 @@ class ForecastingEngine(torch.nn.Module):
                             self.cf.ae_global_dim_embed,
                             num_heads=self.cf.fe_num_heads,
                             qkv_len=self.num_healpix_cells * self.cf.ae_local_num_queries,
+                            softcap=50.0,
                             block_factor=self.cf.ae_global_block_factor,
                             dropout_rate=self.cf.fe_dropout_rate,
                             with_qk_lnorm=self.cf.fe_with_qk_lnorm,

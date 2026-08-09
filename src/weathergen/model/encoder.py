@@ -285,6 +285,7 @@ class EncoderModule(torch.nn.Module):
         local-to-global adapter using a chunking in the number of tokens
         to work around to bug in flash attention, the computations is performed in chunks
         """
+        print(f"NANDBG entered chunked: level={level} share={self.share_local_assimilation}", flush=True)
 
         # combined cell lens for all tokens in batch across all input steps
         if self.share_local_assimilation or level is None:
@@ -324,11 +325,6 @@ class EncoderModule(torch.nn.Module):
             cell_lens_cur = torch.cat([zero_pad, cell_lens[i * clen : i_end]])
             q_cells_lens_cur = q_cells_lens[: cell_lens_cur.shape[0]]
 
-            # TEMP diagnostic
-#            _z = (cell_lens_cur[1:] == 0).sum().item()
-#            print(f"chunk {i}: cells={cell_lens_cur.shape[0]-1} zero_len={_z} "
-#                  f"toks={toks.shape[0]} maxlen={cell_lens_cur.max().item()}", flush=True)
-
             # local assimilation model
             toks = ae_local(toks, cell_lens_cur, use_reentrant=False)
 
@@ -340,6 +336,19 @@ class EncoderModule(torch.nn.Module):
             toks_global_unmasked = toks_global[mask]
             q_cells_lens_unmasked = torch.cat([zero_pad, q_cells_lens_cur[1:][mask]])
             cell_lens_unmasked = torch.cat([zero_pad, cell_lens_cur[1:][mask]])
+
+            # TEMP diagnostic
+            _zc = (cell_lens_unmasked[1:] == 0).sum().item()
+            _zq = (q_cells_lens_unmasked[1:] == 0).sum().item()
+            if _zq > 0 or _zc > 0:
+                print(f"NANDBG chunk {i} lvl={level}: cell_zero={_zc} QUERY_zero={_zq} "
+                      f"n_cells={cell_lens_unmasked.shape[0]-1}", flush=True)
+            _w = ae_local_global.ae_adapter[0].proj_heads_q[0].weight
+            _wf = _w.full_tensor() if hasattr(_w, "full_tensor") else _w
+            print(f"NANDBG adapter weight before call: level={level} nan={torch.isnan(_wf).any().item()}", flush=True)
+            for _n, _p in ae_local_global.named_parameters():
+                if "proj_heads_q" in _n and torch.isnan(_p).any():
+                    print(f"NANDBG adapter weight NaN: level={level} name={_n}", flush=True)
 
             # local to global adapter engine
             toks_global_unmasked = ae_local_global(

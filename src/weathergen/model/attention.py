@@ -673,6 +673,12 @@ class MultiCrossAttentionHeadVarlenSlicedQ(torch.nn.Module):
         # set dropout rate according to training/eval mode as required by flash_attn
         dropout_rate = self.dropout_rate if self.training else 0.0
 
+        # DEBUG
+        _zq = (x_q_lens == 0).sum().item()
+        _zkv = (x_kv_lens == 0).sum().item()
+        if _zq > 0 or _zkv > 0:
+            print(f"NANDBG flash lens: q_zero={_zq} kv_zero={_zkv}", flush=True)
+
         cum_x_q_lens = torch.cumsum(x_q_lens, 0, dtype=torch.int32)
         cum_x_kv_lens = torch.cumsum(x_kv_lens, 0, dtype=torch.int32)
         outs = []

@@ -508,6 +508,33 @@ class Trainer(TrainerBase):
 #                                    print(f"SRC sample={_i} {_sname} step={_step}: "
 #                                          f"shape={tuple(_t.shape)} nan={_n}/{_t.numel()} "
 #                                          f"absmax={_t.abs().max().item():.3e}")
+                    # TEMP data check
+                    _src = batch.get_source_samples()
+                    if self.cf.general.istep < 5:
+                        def _fmt(x):
+                            try:
+                                return x.detach().cpu().tolist() if torch.is_tensor(x) else x
+                            except Exception:
+                                return str(type(x))
+                        try:
+                            _tl = {k: _fmt(v) for k, v in _src.tokens_lens.items()}
+                        except Exception as _e:
+                            _tl = f"<err {_e}>"
+                        def _call(m):
+                            try:
+                                r = m()
+                                return r.detach().cpu().tolist() if torch.is_tensor(r) else r
+                            except Exception as _e:
+                                return f"<err {_e}>"
+                        print(
+                            f"NANDBG istep={self.cf.general.istep} "
+                            f"sources_nan={_call(_src.sources_nan)} "
+                            f"sources_empty={_call(_src.sources_empty)} "
+                            f"targets_nan={_call(_src.targets_nan)} "
+                            f"targets_empty={_call(_src.targets_empty)} "
+                            f"tokens_lens={_tl}",
+                            flush=True,
+                        )
 
                     preds = self.model(
                         model_params=self.model_params,
