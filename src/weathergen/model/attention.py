@@ -347,6 +347,7 @@ class MultiSelfAttentionHeadLocal(torch.nn.Module):
         self.flex_attention = torch.compile(flex_attention, dynamic=False)
 
     def forward(self, x, coords=None, ada_ln_aux=None):
+        print(f"NANDBG local-attn seq={x.shape[1]} mask_qlen={self.block_mask.shape[-2]}", flush=True)
         if self.with_residual:
             x_in = x
         x = self.lnorm(x) if ada_ln_aux is None else self.lnorm(x, ada_ln_aux)

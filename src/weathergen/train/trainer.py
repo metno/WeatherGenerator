@@ -536,6 +536,14 @@ class Trainer(TrainerBase):
                             flush=True,
                         )
 
+                    if self.cf.general.istep == 0:
+                        for _n, _p in self.model.named_parameters():
+                            if "8.ae_global_blocks.4.proj_heads_q" in _n:
+                                _l = _p.to_local() if hasattr(_p, "to_local") else _p
+                                print(f"ADDR-2 PRE-FWD: addr={_l.data_ptr():#x} "
+                                      f"nan={torch.isnan(_l).any().item()} "
+                                      f"absmax={_l.abs().max().item():.3e}", flush=True)
+
                     preds = self.model(
                         model_params=self.model_params,
                         batch=batch.get_source_samples(),
@@ -596,7 +604,16 @@ class Trainer(TrainerBase):
                 self.grad_scaler.update()
                 # --- TEMP NaN diagnostics ---
                 if check_params_after_step(self.model, self.cf.general.istep):
-                    raise SystemExit(1)   # stop at the first corrupted weight
+                    raise SystemExit(1)
+                for _n, _p in self.model.named_parameters():
+                    if "8.ae_global_blocks.4.proj_heads_q" in _n:
+                        _l = _p.to_local() if hasattr(_p, "to_local") else _p
+                        _f = _p.full_tensor() if hasattr(_p, "full_tensor") else _p
+                        print(f"POSTSTEP istep={self.cf.general.istep} "
+                              f"shard_nan={torch.isnan(_l).any().item()} "
+                              f"shard_absmax={_l.abs().max().item():.3e} "
+                              f"FULL_nan={torch.isnan(_f).any().item()} "
+                              f"FULL_absmax={_f.abs().max().item():.3e}", flush=True)
                 # --- end TEMP ---
 
                 # update learning rate

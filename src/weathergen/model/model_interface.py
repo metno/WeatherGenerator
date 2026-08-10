@@ -229,7 +229,25 @@ def init_model_and_shard(
                 v = _t.float().var(dim=-1).min().item() if _t.numel() else float("nan")
                 print(f"   input[{_i}] shape={tuple(_t.shape)} "
                       f"min_row_var={v:.3e} absmax={_t.abs().max().item():.3e}", flush=True)
+            w = getattr(mod, "weight", None)                                          # ADD
+            if w is not None:                                                         # ADD
+                wl = w.to_local() if hasattr(w, "to_local") else w                    # ADD
+                print(f"   weight: shard_nan={torch.isnan(wl).any().item()} "         # ADD
+                      f"shard_absmax={wl.abs().max().item():.3e}", flush=True)        # ADD
+                print(f"   ADDR-3 CRASH: addr={wl.data_ptr():#x} shape={tuple(wl.shape)}", flush=True)
             raise SystemExit(1)
+#    def _nan_hook_named(name, mod, inp, out):
+#        def _bad(x):
+#            return isinstance(x, torch.Tensor) and x.is_floating_point() and torch.isnan(x).any()
+#        outs = out if isinstance(out, tuple) else (out,)
+#        ins = [i for i in inp if isinstance(i, torch.Tensor)]
+#        if any(_bad(o) for o in outs) and not any(_bad(i) for i in ins):
+#            print(f"FIRST NaN CREATED IN: {name} ({mod.__class__.__name__})", flush=True)
+#            for _i, _t in enumerate(ins):
+#                v = _t.float().var(dim=-1).min().item() if _t.numel() else float("nan")
+#                print(f"   input[{_i}] shape={tuple(_t.shape)} "
+#                      f"min_row_var={v:.3e} absmax={_t.abs().max().item():.3e}", flush=True)
+#            raise SystemExit(1)
 
     for _mn, _m in model.named_modules():
         _m.register_forward_hook(
@@ -296,6 +314,10 @@ def init_model_and_shard(
         for _n, _p in _eng.named_parameters():
             _full = _p.full_tensor() if hasattr(_p, "full_tensor") else _p
             _checked += 1
+            if "4.proj_heads_q" in _n:
+                _l = _p.to_local() if hasattr(_p, "to_local") else _p
+                print(f"ADDR-1 INIT: {_n} addr={_l.data_ptr():#x} "
+                      f"nan={torch.isnan(_l).any().item()} absmax={_l.abs().max().item():.3e}", flush=True)
             if torch.isnan(_full).any():
                 _nan += 1
                 if is_root():
