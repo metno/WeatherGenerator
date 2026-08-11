@@ -2446,13 +2446,21 @@ def global_haar_wavelet_reshape_varweighted(
             )
 
         try:
-            import xarray as _xr_vw
-
-            template  = _xr_vw.open_dataset(template_path)
-            olat      = template.latitude.values.flatten()
-            olon      = template.longitude.values.flatten()
-            ny        = len(template.y.values)
-            nx        = len(template.x.values)
+            if template_path.endswith(".npz"):
+                import numpy as _np_npz
+                _z = _np_npz.load(template_path)
+                olat = _z["lat"]
+                olon = _z["lon"]
+                ny = int(_z["ny"])
+                nx = int(_z["nx"])
+            else:
+                import xarray as _xr_vw
+                template = _xr_vw.open_dataset(template_path)
+                olat = template.latitude.values.flatten()
+                olon = template.longitude.values.flatten()
+                ny = len(template.y.values)
+                nx = len(template.x.values)
+                template.close()
 
             template_grid = _np_vw.stack([olat, olon], axis=1)
             setattr(global_haar_wavelet_reshape_varweighted, _grid_key,  template_grid)
@@ -2924,13 +2932,21 @@ def global_haar_ll_reshape_varweighted(
             )
 
         try:
-            import xarray as _xr_ll
-
-            template  = _xr_ll.open_dataset(template_path)
-            olat      = template.latitude.values.flatten()
-            olon      = template.longitude.values.flatten()
-            ny        = len(template.y.values)
-            nx        = len(template.x.values)
+            if template_path.endswith(".npz"):
+                import numpy as _np_npz
+                _z = _np_npz.load(template_path)
+                olat = _z["lat"]
+                olon = _z["lon"]
+                ny = int(_z["ny"])
+                nx = int(_z["nx"])
+            else:
+                import xarray as _xr_vw
+                template = _xr_vw.open_dataset(template_path)
+                olat = template.latitude.values.flatten()
+                olon = template.longitude.values.flatten()
+                ny = len(template.y.values)
+                nx = len(template.x.values)
+                template.close()
 
             template_grid = _np_ll.stack([olat, olon], axis=1)
             setattr(global_haar_ll_reshape_varweighted, _grid_key,  template_grid)
