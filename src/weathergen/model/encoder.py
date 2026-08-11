@@ -285,7 +285,7 @@ class EncoderModule(torch.nn.Module):
         local-to-global adapter using a chunking in the number of tokens
         to work around to bug in flash attention, the computations is performed in chunks
         """
-        print(f"NANDBG entered chunked: level={level} share={self.share_local_assimilation}", flush=True)
+#        print(f"NANDBG entered chunked: level={level} share={self.share_local_assimilation}", flush=True)
 
         # combined cell lens for all tokens in batch across all input steps
         if self.share_local_assimilation or level is None:
@@ -303,33 +303,56 @@ class EncoderModule(torch.nn.Module):
         # A small regional domain can make clen 0 (or 0-length chunks), which would
         # make the loop below iterate zero times and silently return nothing.
         clen = max(1, clen)                                             # <-- ADD
+        _n_iters = cell_lens.shape[0] // clen
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            _t = torch.tensor([_n_iters], device=tokens.device, dtype=torch.int64)
+            torch.distributed.all_reduce(_t, op=torch.distributed.ReduceOp.MAX)
+            _n_iters = int(_t.item())
         tokens_global_unmasked = []
         posteriors = []
+        _nchunks = 0
+        _dummy_sink = None
 
-        for i in range(cell_lens.shape[0] // clen):
+#        for i in range(cell_lens.shape[0] // clen):
+        for i in range(_n_iters):
             # make sure we properly catch all elements in last chunk
-            i_end = (i + 1) * clen if i < (cell_lens.shape[0] // clen) - 1 else cell_lens.shape[0]
-            l0, l1 = (
-                (0 if i == 0 else cell_lens[: i * clen].cumsum(0)[-1]),
-                cell_lens[:i_end].cumsum(0)[-1],
-            )
+            if i >= (cell_lens.shape[0] // clen):
+                # this rank has fewer real chunks than the global max; run a dummy
+                # so collective counts stay aligned
+                i_end = cell_lens.shape[0]
+                l0 = l1 = cell_lens.cumsum(0)[-1] if cell_lens.numel() else 0
+            else:
+                i_end = (i + 1) * clen if i < (cell_lens.shape[0] // clen) - 1 else cell_lens.shape[0]
+                l0, l1 = (
+                    (0 if i == 0 else cell_lens[: i * clen].cumsum(0)[-1]),
+                    cell_lens[:i_end].cumsum(0)[-1],
+                )
 
             toks = tokens[l0:l1]
-            # if we have a very sparse input, we may have no tokens in the chunk, toks
-            # skip processing of the empty chunk in this case
-            # Check if this chunk is empty
-            if l0 == l1 or toks.shape[0] == 0:
-                continue
-
-            toks_global = tokens_global[i * clen : i_end]
-            cell_lens_cur = torch.cat([zero_pad, cell_lens[i * clen : i_end]])
-            q_cells_lens_cur = q_cells_lens[: cell_lens_cur.shape[0]]
+            _nchunks += 1
+            # An empty chunk must NOT be skipped: the modules below run collectives
+            # (FSDP all-gather), so skipping makes collective counts diverge across
+            # ranks and deadlocks. Instead, run a 1-token dummy chunk and discard
+            # its output afterwards.
+            _is_empty = bool(l0 == l1 or toks.shape[0] == 0)
+            if _is_empty:
+                toks = tokens.new_zeros((1,) + tuple(tokens.shape[1:]))
+                toks_global = tokens_global[0:1]
+                cell_lens_cur = torch.cat(
+                    [zero_pad, torch.ones(1, device=tokens.device, dtype=cell_lens.dtype)]
+                )
+                q_cells_lens_cur = q_cells_lens[: cell_lens_cur.shape[0]]
+            else:
+                toks_global = tokens_global[i * clen : i_end]
+                cell_lens_cur = torch.cat([zero_pad, cell_lens[i * clen : i_end]])
+                q_cells_lens_cur = q_cells_lens[: cell_lens_cur.shape[0]]
 
             # local assimilation model
             toks = ae_local(toks, cell_lens_cur, use_reentrant=False)
 
             toks, posteriors_c = self.interpolate_latents(toks)
-            posteriors += [posteriors_c]
+            if not _is_empty:
+                posteriors += [posteriors_c]
 
             # create mask for global tokens, without first element (used for padding)
             mask = cell_lens_cur[1:].to(torch.bool)
@@ -340,12 +363,14 @@ class EncoderModule(torch.nn.Module):
             # TEMP diagnostic
             _zc = (cell_lens_unmasked[1:] == 0).sum().item()
             _zq = (q_cells_lens_unmasked[1:] == 0).sum().item()
-            if _zq > 0 or _zc > 0:
-                print(f"NANDBG chunk {i} lvl={level}: cell_zero={_zc} QUERY_zero={_zq} "
-                      f"n_cells={cell_lens_unmasked.shape[0]-1}", flush=True)
+#            if _zq > 0 or _zc > 0:
+#                print(f"NANDBG chunk {i} lvl={level}: cell_zero={_zc} QUERY_zero={_zq} "
+#                      f"n_cells={cell_lens_unmasked.shape[0]-1}", flush=True)
             _w = ae_local_global.ae_adapter[0].proj_heads_q[0].weight
+            # DO NOT REMOVE: this all-gather acts as a per-chunk collective barrier.
+            # Removing it causes a multi-GPU hang at step 1 (ordering-dependent).
             _wf = _w.full_tensor() if hasattr(_w, "full_tensor") else _w
-            print(f"NANDBG adapter weight before call: level={level} nan={torch.isnan(_wf).any().item()}", flush=True)
+#            print(f"NANDBG adapter weight before call: level={level} nan={torch.isnan(_wf).any().item()}", flush=True)
             for _n, _p in ae_local_global.named_parameters():
                 if "proj_heads_q" in _n and torch.isnan(_p).any():
                     print(f"NANDBG adapter weight NaN: level={level} name={_n}", flush=True)
@@ -358,11 +383,23 @@ class EncoderModule(torch.nn.Module):
                 cell_lens_unmasked,
             )
 
-            tokens_global_unmasked += [toks_global_unmasked]
+            if _is_empty:
+                # Keep the dummy chunk connected to the graph (scaled to zero) so
+                # BACKWARD runs the same collectives on every rank. Dropping it
+                # aligns forward but not backward -> NCCL deadlock.
+                _s = toks_global_unmasked.sum() * 0.0
+                _dummy_sink = _s if _dummy_sink is None else _dummy_sink + _s
+            else:
+                tokens_global_unmasked += [toks_global_unmasked]
+
+        print(f"CHUNKS lvl={level} n={_nchunks} total_iters={_n_iters}", flush=True)
 
         if len(tokens_global_unmasked) == 0:
             assert False, "Not yet implemented"
         tokens_global_unmasked = torch.cat(tokens_global_unmasked)
+        if _dummy_sink is not None:
+            # add a zero that carries the dummy chunks' autograd graph
+            tokens_global_unmasked = tokens_global_unmasked + _dummy_sink
 
         return tokens_global_unmasked, posteriors
 

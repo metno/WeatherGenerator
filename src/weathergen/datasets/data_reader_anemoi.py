@@ -117,6 +117,8 @@ class DataReaderAnemoi(DataReaderTimestep):
         else:
             self.ds = ds
             self.len = len(ds)
+            # anemoi exposes the missing indices of the (already time-sliced) dataset
+            self.missing_idxs = set(getattr(ds, "missing", set()))
 
         # caches lats and lons
         self.latitudes = _clip_lat(ds.latitudes)
@@ -200,10 +202,23 @@ class DataReaderAnemoi(DataReaderTimestep):
         super().init_empty()
         self.ds = None
         self.len = 0
+        self.missing_idxs = set()
 
     @override
     def length(self) -> int:
         return self.len
+
+    def window_has_missing(self, idx) -> bool:
+        """True if the time window at `idx` overlaps a missing date."""
+        if getattr(self, "ds", None) is None:
+            return False
+        try:
+            (t_idxs, _) = self._get_dataset_idxs(idx)
+        except Exception:
+            return True
+        if len(t_idxs) == 0:
+            return True
+        return any(int(t) in self.missing_idxs for t in t_idxs)
 
     @override
     def _get(self, idx: TIndex, channels_idx: list[int]) -> ReaderData:

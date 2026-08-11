@@ -235,6 +235,7 @@ def init_model_and_shard(
                 print(f"   weight: shard_nan={torch.isnan(wl).any().item()} "         # ADD
                       f"shard_absmax={wl.abs().max().item():.3e}", flush=True)        # ADD
                 print(f"   ADDR-3 CRASH: addr={wl.data_ptr():#x} shape={tuple(wl.shape)}", flush=True)
+                print(f"   dtype={wl.dtype} is_dtensor={hasattr(w, 'to_local')}", flush=True)
             raise SystemExit(1)
 #    def _nan_hook_named(name, mod, inp, out):
 #        def _bad(x):

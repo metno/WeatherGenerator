@@ -331,7 +331,29 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         perms_len = int(self.index_range.end - self.index_range.start)
         perms_len -= (fsm + self.output_offset) * (self.time_step // self.step_timedelta)
 
-        return np.arange(self.max_input_steps, perms_len)
+        perms = np.arange(self.max_input_steps, perms_len)
+
+        # exclude windows overlapping missing dates: deterministic and identical on
+        # every rank, so ranks stay aligned without any collective
+        n_out = self.output_offset + fsm + 1
+
+        def _bad(i):
+            for j in range(i - self.max_input_steps + 1, i + n_out + 1):
+                for sd in self.streams_datasets.values():
+                    for r in sd.readers:
+                        f = getattr(r, "window_has_missing", None)
+                        if f is not None and f(j):
+                            return True
+            return False
+
+        keep = np.array([i for i in perms if not _bad(i)], dtype=perms.dtype)
+        if len(keep) < len(perms):
+            logger.warning(
+                "Dropping %d of %d windows containing missing dates",
+                len(perms) - len(keep), len(perms),
+            )
+        assert len(keep) > 0, "All windows contain missing dates; check date range vs coverage."
+        return keep
 
     def _init_stream_datasets(self, cf) -> dict[StreamName, _Stream]:
         """Load dataset readers for all streams from config."""
