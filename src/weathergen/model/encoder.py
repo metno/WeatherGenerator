@@ -361,19 +361,19 @@ class EncoderModule(torch.nn.Module):
             cell_lens_unmasked = torch.cat([zero_pad, cell_lens_cur[1:][mask]])
 
             # TEMP diagnostic
-            _zc = (cell_lens_unmasked[1:] == 0).sum().item()
-            _zq = (q_cells_lens_unmasked[1:] == 0).sum().item()
+#            _zc = (cell_lens_unmasked[1:] == 0).sum().item()
+#            _zq = (q_cells_lens_unmasked[1:] == 0).sum().item()
 #            if _zq > 0 or _zc > 0:
 #                print(f"NANDBG chunk {i} lvl={level}: cell_zero={_zc} QUERY_zero={_zq} "
 #                      f"n_cells={cell_lens_unmasked.shape[0]-1}", flush=True)
-            _w = ae_local_global.ae_adapter[0].proj_heads_q[0].weight
-            # DO NOT REMOVE: this all-gather acts as a per-chunk collective barrier.
-            # Removing it causes a multi-GPU hang at step 1 (ordering-dependent).
-            _wf = _w.full_tensor() if hasattr(_w, "full_tensor") else _w
+#            _w = ae_local_global.ae_adapter[0].proj_heads_q[0].weight
+            # (was: a full_tensor() all-gather here acted as an accidental per-chunk
+            #  barrier; no longer needed since the chunk count is all-reduced above)
+#            _wf = _w.full_tensor() if hasattr(_w, "full_tensor") else _w
 #            print(f"NANDBG adapter weight before call: level={level} nan={torch.isnan(_wf).any().item()}", flush=True)
-            for _n, _p in ae_local_global.named_parameters():
-                if "proj_heads_q" in _n and torch.isnan(_p).any():
-                    print(f"NANDBG adapter weight NaN: level={level} name={_n}", flush=True)
+#            for _n, _p in ae_local_global.named_parameters():
+#                if "proj_heads_q" in _n and torch.isnan(_p).any():
+#                    print(f"NANDBG adapter weight NaN: level={level} name={_n}", flush=True)
 
             # local to global adapter engine
             toks_global_unmasked = ae_local_global(
@@ -392,7 +392,7 @@ class EncoderModule(torch.nn.Module):
             else:
                 tokens_global_unmasked += [toks_global_unmasked]
 
-        print(f"CHUNKS lvl={level} n={_nchunks} total_iters={_n_iters}", flush=True)
+#        print(f"CHUNKS lvl={level} n={_nchunks} total_iters={_n_iters}", flush=True)
 
         if len(tokens_global_unmasked) == 0:
             assert False, "Not yet implemented"

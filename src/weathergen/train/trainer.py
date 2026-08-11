@@ -22,12 +22,12 @@ from omegaconf import OmegaConf
 # FSDP2
 from torch.distributed.tensor import DTensor
 
-from weathergen.model.nan_debug import (
-    scan_params_for_nan,
-    register_grad_nan_hooks,
-    check_params_after_step,
-#    enable_anomaly,
-)
+#from weathergen.model.nan_debug import (
+#    scan_params_for_nan,
+#    register_grad_nan_hooks,
+#    check_params_after_step,
+##    enable_anomaly,
+#)
 
 import weathergen.common.config as config
 from weathergen.common.config import Config
@@ -240,9 +240,9 @@ class Trainer(TrainerBase):
             cf.with_fsdp,
         )
         # --- TEMP NaN diagnostics ---
-        scan_params_for_nan(self.model, "init")   # is anything NaN already at init?
-        register_grad_nan_hooks(self.model)       # name first NaN GRADIENT in backward
-#        enable_anomaly()  # uncomment for a definitive backward stack trace (SLOW)
+#        scan_params_for_nan(self.model, "init")   # is anything NaN already at init?
+#        register_grad_nan_hooks(self.model)       # name first NaN GRADIENT in backward
+##        enable_anomaly()  # uncomment for a definitive backward stack trace (SLOW)
         # --- end TEMP ---
 
 
@@ -305,9 +305,9 @@ class Trainer(TrainerBase):
             cf.with_fsdp,
         )
         # --- TEMP NaN diagnostics ---
-        scan_params_for_nan(self.model, "init")   # is anything NaN already at init?
-        register_grad_nan_hooks(self.model)       # name first NaN GRADIENT in backward
-#        enable_anomaly()  # uncomment for a definitive backward stack trace (SLOW)
+#        scan_params_for_nan(self.model, "init")   # is anything NaN already at init?
+#        register_grad_nan_hooks(self.model)       # name first NaN GRADIENT in backward
+##        enable_anomaly()  # uncomment for a definitive backward stack trace (SLOW)
         # --- end TEMP ---
 
         validate_with_ema_cfg = self.validation_cfg.get("validate_with_ema")
@@ -495,60 +495,19 @@ class Trainer(TrainerBase):
                     dtype=self.mixed_precision_dtype,
                     enabled=cf.with_mixed_precision,
                 ):
-                    # TEMP diagnostic -- remove after
-#                    if bidx < 2:
-#                        _ss = batch.get_source_samples()
-#                        for _i, _sample in enumerate(_ss.get_samples()):
-#                            for _sname, _sd in _sample.streams_data.items():
-#                                for _step, _t in enumerate(_sd.source_tokens_cells):
-#                                    if _t is None:
-#                                        print(f"SRC sample={_i} {_sname} step={_step}: None")
-#                                        continue
-#                                    _n = torch.isnan(_t).sum().item()
-#                                    print(f"SRC sample={_i} {_sname} step={_step}: "
-#                                          f"shape={tuple(_t.shape)} nan={_n}/{_t.numel()} "
-#                                          f"absmax={_t.abs().max().item():.3e}")
-                    # TEMP data check
-                    _src = batch.get_source_samples()
-                    if self.cf.general.istep < 5:
-                        def _fmt(x):
-                            try:
-                                return x.detach().cpu().tolist() if torch.is_tensor(x) else x
-                            except Exception:
-                                return str(type(x))
-                        try:
-                            _tl = {k: _fmt(v) for k, v in _src.tokens_lens.items()}
-                        except Exception as _e:
-                            _tl = f"<err {_e}>"
-                        def _call(m):
-                            try:
-                                r = m()
-                                return r.detach().cpu().tolist() if torch.is_tensor(r) else r
-                            except Exception as _e:
-                                return f"<err {_e}>"
-#                        print(
-#                            f"NANDBG istep={self.cf.general.istep} "
-#                            f"sources_nan={_call(_src.sources_nan)} "
-#                            f"sources_empty={_call(_src.sources_empty)} "
-#                            f"targets_nan={_call(_src.targets_nan)} "
-#                            f"targets_empty={_call(_src.targets_empty)} "
-#                            f"tokens_lens={_tl}",
-#                            flush=True,
-#                        )
-
-                    if self.cf.general.istep == 0:
-                        for _n, _p in self.model.named_parameters():
-                            if "8.ae_global_blocks.4.proj_heads_q" in _n:
-                                _l = _p.to_local() if hasattr(_p, "to_local") else _p
-                                print(f"ADDR-2 PRE-FWD: addr={_l.data_ptr():#x} "
-                                      f"nan={torch.isnan(_l).any().item()} "
-                                      f"absmax={_l.abs().max().item():.3e}", flush=True)
+#                    if self.cf.general.istep == 0:
+#                        for _n, _p in self.model.named_parameters():
+#                            if "8.ae_global_blocks.4.proj_heads_q" in _n:
+#                                _l = _p.to_local() if hasattr(_p, "to_local") else _p
+#                                print(f"ADDR-2 PRE-FWD: addr={_l.data_ptr():#x} "
+#                                      f"nan={torch.isnan(_l).any().item()} "
+#                                      f"absmax={_l.abs().max().item():.3e}", flush=True)
 
                     preds = self.model(
                         model_params=self.model_params,
                         batch=batch.get_source_samples(),
                     )
-                    print(f"HEARTBEAT istep={self.cf.general.istep} forward done", flush=True)
+#                    print(f"HEARTBEAT istep={self.cf.general.istep} forward done", flush=True)
 
                     targets_and_auxs = {}
                     for loss_name, target_aux in self.target_and_aux_calculators.items():
@@ -604,21 +563,21 @@ class Trainer(TrainerBase):
                 self.grad_scaler.step(self.optimizer)
                 self.grad_scaler.update()
                 # --- TEMP NaN diagnostics ---
-                if check_params_after_step(self.model, self.cf.general.istep):
-                    raise SystemExit(1)
-                for _n, _p in self.model.named_parameters():
-                    if "8.ae_global_blocks.4.proj_heads_q" in _n:
-                        _l = _p.to_local() if hasattr(_p, "to_local") else _p
-                        _g = _p.grad
-                        if _g is None:
-                            _gs = "none"
-                        else:
-                            _gl = _g.to_local() if hasattr(_g, "to_local") else _g
-                            _gs = (f"nan={torch.isnan(_gl).any().item()} "
-                                   f"norm={_gl.float().norm().item():.6e}")
-                        _sc = self.grad_scaler.get_scale() if hasattr(self.grad_scaler, "get_scale") else "n/a"
-                        print(f"POSTSTEP istep={self.cf.general.istep} dtype={_p.dtype} "
-                              f"sum={_l.double().sum().item():.12e} scale={_sc} grad[{_gs}]", flush=True)
+#                if check_params_after_step(self.model, self.cf.general.istep):
+#                    raise SystemExit(1)
+#                for _n, _p in self.model.named_parameters():
+#                    if "8.ae_global_blocks.4.proj_heads_q" in _n:
+#                        _l = _p.to_local() if hasattr(_p, "to_local") else _p
+#                        _g = _p.grad
+#                        if _g is None:
+#                            _gs = "none"
+#                        else:
+#                            _gl = _g.to_local() if hasattr(_g, "to_local") else _g
+#                            _gs = (f"nan={torch.isnan(_gl).any().item()} "
+#                                   f"norm={_gl.float().norm().item():.6e}")
+#                        _sc = self.grad_scaler.get_scale() if hasattr(self.grad_scaler, "get_scale") else "n/a"
+#                        print(f"POSTSTEP istep={self.cf.general.istep} dtype={_p.dtype} "
+#                              f"sum={_l.double().sum().item():.12e} scale={_sc} grad[{_gs}]", flush=True)
                 # --- end TEMP ---
 
                 # update learning rate

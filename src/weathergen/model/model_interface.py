@@ -218,25 +218,6 @@ def init_model_and_shard(
     model_params = model_params.to(f"cuda:{cf.local_rank}")
 
     # TEMP diagnostic -- remove after
-    def _nan_hook_named(name, mod, inp, out):
-        def _bad(x):
-            return isinstance(x, torch.Tensor) and x.is_floating_point() and torch.isnan(x).any()
-        outs = out if isinstance(out, tuple) else (out,)
-        ins = [i for i in inp if isinstance(i, torch.Tensor)]
-        if any(_bad(o) for o in outs) and not any(_bad(i) for i in ins):
-            print(f"FIRST NaN CREATED IN: {name} ({mod.__class__.__name__})", flush=True)
-            for _i, _t in enumerate(ins):
-                v = _t.float().var(dim=-1).min().item() if _t.numel() else float("nan")
-                print(f"   input[{_i}] shape={tuple(_t.shape)} "
-                      f"min_row_var={v:.3e} absmax={_t.abs().max().item():.3e}", flush=True)
-            w = getattr(mod, "weight", None)                                          # ADD
-            if w is not None:                                                         # ADD
-                wl = w.to_local() if hasattr(w, "to_local") else w                    # ADD
-                print(f"   weight: shard_nan={torch.isnan(wl).any().item()} "         # ADD
-                      f"shard_absmax={wl.abs().max().item():.3e}", flush=True)        # ADD
-                print(f"   ADDR-3 CRASH: addr={wl.data_ptr():#x} shape={tuple(wl.shape)}", flush=True)
-                print(f"   dtype={wl.dtype} is_dtensor={hasattr(w, 'to_local')}", flush=True)
-            raise SystemExit(1)
 #    def _nan_hook_named(name, mod, inp, out):
 #        def _bad(x):
 #            return isinstance(x, torch.Tensor) and x.is_floating_point() and torch.isnan(x).any()
@@ -248,12 +229,18 @@ def init_model_and_shard(
 #                v = _t.float().var(dim=-1).min().item() if _t.numel() else float("nan")
 #                print(f"   input[{_i}] shape={tuple(_t.shape)} "
 #                      f"min_row_var={v:.3e} absmax={_t.abs().max().item():.3e}", flush=True)
-#            raise SystemExit(1)
+#            w = getattr(mod, "weight", None)                                          # ADD
+#            if w is not None:                                                         # ADD
+#                wl = w.to_local() if hasattr(w, "to_local") else w                    # ADD
+#                print(f"   weight: shard_nan={torch.isnan(wl).any().item()} "         # ADD
+#                      f"shard_absmax={wl.abs().max().item():.3e}", flush=True)        # ADD
+#                print(f"   ADDR-3 CRASH: addr={wl.data_ptr():#x} shape={tuple(wl.shape)}", flush=True)
+#                print(f"   dtype={wl.dtype} is_dtensor={hasattr(w, 'to_local')}", flush=True)
 
-    for _mn, _m in model.named_modules():
-        _m.register_forward_hook(
-            lambda mod, inp, out, _nm=_mn: _nan_hook_named(_nm, mod, inp, out)
-        )
+#    for _mn, _m in model.named_modules():
+#        _m.register_forward_hook(
+#            lambda mod, inp, out, _nm=_mn: _nan_hook_named(_nm, mod, inp, out)
+#        )
 
     # Repair LatentCascade geometry buffers after meta-device init (FSDP path).
     # The cascade registers its parent/child index maps (poc_/cop_/cv_) as
@@ -282,49 +269,52 @@ def init_model_and_shard(
                 setattr(_casc, f"cop_{key}", cop)
                 setattr(_casc, f"cv_{key}", cv)
 
-    for _n, _p in model.named_parameters():
-        if _p is not None and torch.isnan(_p).any():
-            print(f"UNINIT PARAM: {_n} shape={tuple(_p.shape)}", flush=True)
+#    for _n, _p in model.named_parameters():
+#        if _p is not None and torch.isnan(_p).any():
+#            print(f"UNINIT PARAM: {_n} shape={tuple(_p.shape)}", flush=True)
 
-    if with_ddp and with_fsdp:
-        _adapter = model.encoder.ae_local_global_engine.ae_adapter
-        _checked = 0
-        _nan_found = 0
-        for _n, _p in _adapter.named_parameters():
-            try:
-                _full = _p.full_tensor() if hasattr(_p, "full_tensor") else _p
-            except Exception as _e:
-                if is_root():
-                    print(f"SHARD CHECK ERROR on {_n}: {_e}", flush=True)
-                continue
-            _checked += 1
-            if torch.isnan(_full).any():
-                _nan_found += 1
-                if is_root():
-                    print(f"UNINIT SHARD (gathered NaN): ae_adapter.{_n} shape={tuple(_full.shape)}", flush=True)
-        if is_root():
-            print(f"SHARD CHECK DONE: checked={_checked} nan={_nan_found}", flush=True)
-    if with_ddp and with_fsdp:
-        _gpl = model.encoder._ae_global_per_level
-        if is_root():
-            print(f"GLOBAL8 KEYS: {list(_gpl.keys())}", flush=True)
-        _key = "8" if "8" in _gpl else (8 if 8 in _gpl else list(_gpl.keys())[-1])
-        _eng = _gpl[_key].ae_global_blocks
-#        _eng = model.encoder._ae_global_per_level["8"].ae_global_blocks
-        _checked = _nan = 0
-        for _n, _p in _eng.named_parameters():
-            _full = _p.full_tensor() if hasattr(_p, "full_tensor") else _p
-            _checked += 1
-            if "4.proj_heads_q" in _n:
-                _l = _p.to_local() if hasattr(_p, "to_local") else _p
-                print(f"ADDR-1 INIT: {_n} addr={_l.data_ptr():#x} "
-                      f"nan={torch.isnan(_l).any().item()} absmax={_l.abs().max().item():.3e}", flush=True)
-            if torch.isnan(_full).any():
-                _nan += 1
-                if is_root():
-                    print(f"GLOBAL8 NaN SHARD: {_n} shape={tuple(_full.shape)}", flush=True)
-        if is_root():
-            print(f"GLOBAL8 CHECK: checked={_checked} nan={_nan}", flush=True)
+#    if with_ddp and with_fsdp:
+#        _adapter = model.encoder.ae_local_global_engine.ae_adapter
+#        _checked = 0
+#        _nan_found = 0
+#        for _n, _p in _adapter.named_parameters():
+#            try:
+#                _full = _p.full_tensor() if hasattr(_p, "full_tensor") else _p
+#            except Exception as _e:
+#                if is_root():
+#                    print(f"SHARD CHECK ERROR on {_n}: {_e}", flush=True)
+#                continue
+#            _checked += 1
+#            if torch.isnan(_full).any():
+#                _nan_found += 1
+#                if is_root():
+#                    print(f"UNINIT SHARD (gathered NaN): ae_adapter.{_n} shape={tuple(_full.shape)}", flush=True)
+#        if is_root():
+#            print(f"SHARD CHECK DONE: checked={_checked} nan={_nan_found}", flush=True)
+#    if with_ddp and with_fsdp:
+#        _gpl = model.encoder._ae_global_per_level
+#        if is_root():
+#            print(f"GLOBAL8 KEYS: {list(_gpl.keys())}", flush=True)
+#        _key = "8" if "8" in _gpl else (8 if 8 in _gpl else list(_gpl.keys())[-1])
+#        _eng = _gpl[_key].ae_global_blocks
+##        _eng = model.encoder._ae_global_per_level["8"].ae_global_blocks
+#        _checked = _nan = 0
+#        for _n, _p in _eng.named_parameters():
+#            _full = _p.full_tensor() if hasattr(_p, "full_tensor") else _p
+#            _checked += 1
+#            if "4.proj_heads_q" in _n:
+#                _l = _p.to_local() if hasattr(_p, "to_local") else _p
+#                print(f"ADDR-1 INIT: {_n} addr={_l.data_ptr():#x} "
+#                      f"nan={torch.isnan(_l).any().item()} absmax={_l.abs().max().item():.3e}", flush=True)
+#            if torch.isnan(_full).any():
+#                _nan += 1
+#                if is_root():
+#                    print(f"GLOBAL8 NaN SHARD: {_n} shape={tuple(_full.shape)}", flush=True)
+#        if is_root():
+#            print(f"GLOBAL8 CHECK: checked={_checked} nan={_nan}", flush=True)
+
+    _bad = [n for n, p in model.named_parameters() if p is not None and torch.isnan(p).any()]
+    assert not _bad, f"Uninitialized/NaN parameters after init: {_bad[:5]}"
 
     return model, model_params
 

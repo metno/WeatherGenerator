@@ -293,13 +293,13 @@ def lp_loss(
     pred = pred[0] if pred.shape[0] == 0 else pred.mean(0)
 
     diff = torch.where(mask_nan, target, 0) - torch.where(mask_nan, pred, 0)
-    if not torch.isfinite(diff).all() or diff.abs().max() > 1e4:
-            import torch.distributed as _d
-            _r = _d.get_rank() if _d.is_initialized() else 0
-            print(f"NANDBG[{_r}] LOSS diff: max|diff|={diff.abs().max().item():.3e} "
-                  f"finite={torch.isfinite(diff).all().item()} "
-                  f"max|pred|={pred.abs().max().item():.3e} "
-                  f"max|tgt|={target[mask_nan].abs().max().item() if mask_nan.any() else 0:.3e}", flush=True)
+#    if not torch.isfinite(diff).all() or diff.abs().max() > 1e4:
+#            import torch.distributed as _d
+#            _r = _d.get_rank() if _d.is_initialized() else 0
+#            print(f"NANDBG[{_r}] LOSS diff: max|diff|={diff.abs().max().item():.3e} "
+#                  f"finite={torch.isfinite(diff).all().item()} "
+#                  f"max|pred|={pred.abs().max().item():.3e} "
+#                  f"max|tgt|={target[mask_nan].abs().max().item() if mask_nan.any() else 0:.3e}", flush=True)
     # NaN-safe p-power. torch.pow(|x|, p) has a singular / ill-defined gradient at
     # x == 0 (PowBackward0 returns NaN when an element is an EXACT match, e.g. on
     # the first step when a zero-initialised head makes pred == target). An exact
@@ -321,11 +321,6 @@ def lp_loss(
     loss_chs = diff_p.mean(0) if with_mean else diff_p.sum(0)
     loss_chs = torch.pow(loss_chs, 1.0 / p_norm) if with_p_root else loss_chs
     loss = torch.mean(loss_chs * weights_channels if weights_channels is not None else loss_chs)
-    # TEMP diagnostic
-#    print(f"target={tuple(target.shape)} pred={tuple(pred.shape)} "
-#          f"nan_t={torch.isnan(target).sum().item()} loss_chs={loss_chs}")
-#    print(f"nan_p={torch.isnan(pred).sum().item()} "
-#          f"pmin={pred.min().item():.3e} pmax={pred.max().item():.3e}")
     return loss, loss_chs
 
 

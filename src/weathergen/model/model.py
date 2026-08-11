@@ -1312,7 +1312,7 @@ class Model(torch.nn.Module):
             t_coords_lens = [len(t) for t in t_coords]
             t_coords = torch.cat(t_coords)
 
-            print(f"READOUT skip check: stream={stream_name} step={step} n_coords={len(t_coords)}", flush=True)
+#            print(f"READOUT skip check: stream={stream_name} step={step} n_coords={len(t_coords)}", flush=True)
             if len(t_coords) == 0:
                 continue
 
