@@ -115,14 +115,9 @@ class LossPhysical(LossModuleBase):
         # branches in compute_loss and have no direct function object in
         # loss_functions.py that matches the standard signature
         _custom_losses = (
-            "haar_wavelet_cell",
-            "global_haar_wavelet",
-            "global_haar_wavelet_reshape",
-            "global_haar_wavelet_reshape_geoweighted",
             "global_haar_wavelet_reshape_varweighted",
             "global_haar_wavelet_reshape_varweighted_crps",
             "global_haar_ll_reshape_varweighted",
-            "healpix_cell_mse",
             "global_fft_mse",
         )
         self.loss_fcts = []
@@ -262,158 +257,6 @@ class LossPhysical(LossModuleBase):
         return loss_lfct, losses_chs
 
     @staticmethod
-    def _loss_wavelet_per_cell(
-        target: torch.Tensor,
-        pred: torch.Tensor,
-        target_coords: torch.Tensor,
-        target_coords_lens: torch.Tensor,
-        hp_nbours: torch.Tensor,
-        weights_channels: torch.Tensor | None,
-        geoinfo_offset: int,
-        grid_size: int = 32,
-        detail_weight: float = 2.0,
-        num_levels: int = 2,
-        min_points: int = 50,
-        stream_name: str = "",
-    ):
-        num_cells    = target_coords_lens.shape[0]
-        num_channels = target.shape[-1]
-        dev          = target.device
-
-        cumlen = torch.cat([
-            torch.zeros(1, dtype=torch.long, device=dev),
-            target_coords_lens.long().to(dev).cumsum(0),
-        ])
-
-        loss_total = torch.tensor(0.0, device=dev, requires_grad=True)
-        loss_chs   = torch.zeros(num_channels, device=dev)
-        n_active   = 0
-
-        for cell_id in range(num_cells):
-            i0 = int(cumlen[cell_id].item())
-            i1 = int(cumlen[cell_id + 1].item())
-            if i1 - i0 == 0:
-                continue
-
-            nbour_ids = hp_nbours[cell_id, 1:9].cpu().tolist()
-            nbour_ids = [int(n) for n in nbour_ids if int(n) != cell_id]
-
-            patch_target_parts = [target[i0:i1]]
-            patch_pred_parts   = [pred[:, i0:i1]]
-            patch_xy_parts     = [
-                target_coords[i0:i1, geoinfo_offset + 1 : geoinfo_offset + 3]
-            ]
-
-            for nbr in nbour_ids:
-                if nbr >= num_cells:
-                    continue
-                j0 = int(cumlen[nbr].item())
-                j1 = int(cumlen[nbr + 1].item())
-                if j1 <= j0:
-                    continue
-                patch_target_parts.append(target[j0:j1])
-                patch_pred_parts.append(pred[:, j0:j1])
-                patch_xy_parts.append(
-                    target_coords[j0:j1, geoinfo_offset + 1 : geoinfo_offset + 3]
-                )
-
-            patch_target = torch.cat(patch_target_parts, dim=0)
-            patch_pred   = torch.cat(patch_pred_parts,   dim=1)
-            patch_xy     = torch.cat(patch_xy_parts,     dim=0)
-
-            if patch_target.shape[0] < min_points:
-                continue
-
-            cell_loss, cell_loss_chs = loss_fns.haar_wavelet_mse_local_patch(
-                patch_target,
-                patch_pred,
-                patch_xy,
-                grid_size=grid_size,
-                detail_weight=detail_weight,
-                num_levels=num_levels,
-                min_points=min_points,
-                stream_name=stream_name,
-            )
-
-            if cell_loss > 0.0:
-                loss_total = loss_total + cell_loss
-                loss_chs   = loss_chs + cell_loss_chs
-                n_active  += 1
-
-        if n_active > 0:
-            loss_total = loss_total / n_active
-            loss_chs   = loss_chs   / n_active
-
-        if weights_channels is not None:
-            loss_total = torch.mean(loss_chs * weights_channels.to(dev))
-
-        return loss_total, loss_chs
-
-    @staticmethod
-    def _loss_global_haar(
-        target, pred, target_coords_raw, weights_channels,
-        stream_name="", grid_resolution_deg=0.03,
-        detail_weight=2.0, num_levels=3,
-    ):
-        if target.shape[0] == 0:
-            return (
-                torch.tensor(0.0, device=target.device, requires_grad=True),
-                torch.zeros(target.shape[-1], device=target.device),
-            )
-        target_coords_raw = target_coords_raw.to(target.device)
-        return loss_fns.global_haar_wavelet_mse(
-            target, pred, target_coords_raw,
-            weights_channels=weights_channels, weights_points=None,
-            grid_resolution_deg=grid_resolution_deg,
-            detail_weight=detail_weight, num_levels=num_levels,
-            stream_name=stream_name,
-        )
-
-    @staticmethod
-    def _loss_global_haar_reshape(
-        target, pred, target_coords_raw, weights_channels,
-        stream_name="", template_path="",
-        detail_weight=2.0, num_levels=3,
-    ):
-        if target.shape[0] == 0:
-            return (
-                torch.tensor(0.0, device=target.device, requires_grad=True),
-                torch.zeros(target.shape[-1], device=target.device),
-            )
-        target_coords_raw = target_coords_raw.to(target.device)
-        return loss_fns.global_haar_wavelet_reshape(
-            target, pred, target_coords_raw,
-            weights_channels=weights_channels, weights_points=None,
-            template_path=template_path,
-            detail_weight=detail_weight, num_levels=num_levels,
-            stream_name=stream_name,
-        )
-
-    @staticmethod
-    def _loss_global_haar_geoweighted(
-        target, pred, target_coords_raw, target_coords_local, weights_channels,
-        stream_name="", template_path="",
-        detail_weight=2.0, num_levels=3,
-        geoinfo_channel_idx=0, geoinfo_invert=False,
-    ):
-        if target.shape[0] == 0:
-            return (
-                torch.tensor(0.0, device=target.device, requires_grad=True),
-                torch.zeros(target.shape[-1], device=target.device),
-            )
-        target_coords_raw   = target_coords_raw.to(target.device)
-        target_coords_local = target_coords_local.to(target.device)
-        return loss_fns.global_haar_wavelet_reshape_geoweighted(
-            target, pred, target_coords_raw, target_coords_local,
-            weights_channels=weights_channels, weights_points=None,
-            template_path=template_path,
-            detail_weight=detail_weight, num_levels=num_levels,
-            geoinfo_channel_idx=geoinfo_channel_idx,
-            geoinfo_invert=geoinfo_invert,
-            stream_name=stream_name,
-        )
-
-    @staticmethod
     def _loss_global_haar_varweighted(
         target, pred, target_coords_raw, weights_channels,
         stream_name="", template_path="",
@@ -485,20 +328,6 @@ class LossPhysical(LossModuleBase):
             regrid_method=regrid_method,
             var_weight_rel=var_weight_rel,
             level_start=level_start,
-        )
-
-    @staticmethod
-    def _loss_healpix_cell_mse(
-        target, pred, target_coords_lens, weights_channels, stream_name="",
-    ):
-        if target.shape[0] == 0 or target_coords_lens.sum() == 0:
-            return (
-                torch.tensor(0.0, device=target.device, requires_grad=True),
-                torch.zeros(target.shape[-1], device=target.device),
-            )
-        return loss_fns.healpix_cell_mse(
-            target, pred, target_coords_lens.to(target.device),
-            weights_channels, weights_points=None, stream_name=stream_name,
         )
 
     @staticmethod
@@ -691,86 +520,8 @@ class LossPhysical(LossModuleBase):
                         )
 
                         # ---- dispatch: custom losses vs standard path ----
-                        if loss_fct_name == "haar_wavelet_cell":
-                            tc_lens = (
-                                targets_coords_lens_batch[target_idx]
-                                if targets_coords_lens_batch is not None else None
-                            )
-                            tc_local = (
-                                targets_coords_local_batch[target_idx]
-                                if targets_coords_local_batch is not None else None
-                            )
-                            n_geoinfo = len(stream_info.get("geoinfo_channels", []))
-                            geoinfo_offset = 1 + 6 + n_geoinfo
 
-                            if tc_lens is not None and tc_local is not None \
-                                    and self._hp_nbours is not None:
-                                loss_lfct, loss_lfct_chs = self._loss_wavelet_per_cell(
-                                    target, pred, tc_local,
-                                    tc_lens.to(self.device),
-                                    self._hp_nbours.to(self.device),
-                                    weights_channels,
-                                    geoinfo_offset=geoinfo_offset,
-                                    stream_name=stream_name,
-                                    **loss_fct_params,
-                                )
-                            else:
-                                _logger.warning(
-                                    "[haar_wavelet_cell] missing target_coords_lens/"
-                                    "target_coords_local/_hp_nbours; loss set to zero."
-                                )
-                                loss_lfct = torch.tensor(
-                                    0.0, device=self.device, requires_grad=True
-                                )
-                                loss_lfct_chs = torch.zeros(
-                                    target.shape[-1], device=self.device
-                                )
-
-                        elif loss_fct_name == "global_haar_wavelet":
-                            stream_grid_res = stream_info.get(
-                                "grid_resolution_deg",
-                                loss_fct_params.get("grid_resolution_deg", 0.03),
-                            )
-                            loss_lfct, loss_lfct_chs = self._loss_global_haar(
-                                target, pred, targets_coords_batch[target_idx],
-                                weights_channels, stream_name=stream_name,
-                                grid_resolution_deg=stream_grid_res,
-                                **{k: v for k, v in loss_fct_params.items()
-                                   if k != "grid_resolution_deg"},
-                            )
-
-                        elif loss_fct_name == "global_haar_wavelet_reshape":
-                            loss_lfct, loss_lfct_chs = self._loss_global_haar_reshape(
-                                target, pred, targets_coords_batch[target_idx],
-                                weights_channels, stream_name=stream_name,
-                                template_path=stream_info.get("template_path", ""),
-                                **{k: v for k, v in loss_fct_params.items()
-                                   if k != "template_path"},
-                            )
-
-                        elif loss_fct_name == "global_haar_wavelet_reshape_geoweighted":
-                            tc_local = (
-                                targets_coords_local_batch[target_idx]
-                                if targets_coords_local_batch is not None else None
-                            )
-                            if tc_local is not None:
-                                loss_lfct, loss_lfct_chs = self._loss_global_haar_geoweighted(
-                                    target, pred, targets_coords_batch[target_idx],
-                                    tc_local, weights_channels,
-                                    stream_name=stream_name,
-                                    template_path=stream_info.get("template_path", ""),
-                                    **{k: v for k, v in loss_fct_params.items()
-                                       if k != "template_path"},
-                                )
-                            else:
-                                loss_lfct = torch.tensor(
-                                    0.0, device=self.device, requires_grad=True
-                                )
-                                loss_lfct_chs = torch.zeros(
-                                    target.shape[-1], device=self.device
-                                )
-
-                        elif loss_fct_name == "global_haar_wavelet_reshape_varweighted":
+                        if loss_fct_name == "global_haar_wavelet_reshape_varweighted":
                             # Per-stream overrides: any key in the stream config's
                             # `haar_overrides` block wins over the global loss config
                             # (loss_fct_params). regrid_method may also be given at the
@@ -817,24 +568,6 @@ class LossPhysical(LossModuleBase):
                                 regrid_method=_regrid,
                                 **_ov,
                             )
-
-                        elif loss_fct_name == "healpix_cell_mse":
-                            tc_lens = (
-                                targets_coords_lens_batch[target_idx]
-                                if targets_coords_lens_batch is not None else None
-                            )
-                            if tc_lens is not None:
-                                loss_lfct, loss_lfct_chs = self._loss_healpix_cell_mse(
-                                    target, pred, tc_lens, weights_channels,
-                                    stream_name=stream_name,
-                                )
-                            else:
-                                loss_lfct = torch.tensor(
-                                    0.0, device=self.device, requires_grad=True
-                                )
-                                loss_lfct_chs = torch.zeros(
-                                    target.shape[-1], device=self.device
-                                )
 
                         elif loss_fct_name == "global_fft_mse":
                             loss_lfct, loss_lfct_chs = self._loss_global_fft(
