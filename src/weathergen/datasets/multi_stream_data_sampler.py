@@ -158,9 +158,13 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         """Check if samples_per_mini_epoch is suitable
         Repeated both to initialise the MultiStreamDataSampler and for each mini epoch"""
 
+        # Inference-only mode needs valid source windows only. Forecast target
+        # locations are derived from the source window when the future data is
+        # unavailable, so they must not reduce the available sample range.
+        forecast_steps_required = 0 if self.inference_only else fsm + self.output_offset
         max_index = self.index_range.end - (
-            (  # max time units needed to make a forecast
-                self.time_step * (fsm + self.output_offset)  # translation due to forecasting
+            (  # max time units needed for a source or target window
+                self.time_step * forecast_steps_required
                 + self.len_timedelta  # length of forecasting window
             )
             // self.step_timedelta  # as number of indexs
@@ -214,7 +218,8 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         """This calculates the base permutation array and
         depends on fsm so must be repeated for __init__ and reset"""
         perms_len = int(self.index_range.end - self.index_range.start)
-        perms_len -= (fsm + self.output_offset) * (self.time_step // self.step_timedelta)
+        forecast_steps_required = 0 if self.inference_only else fsm + self.output_offset
+        perms_len -= forecast_steps_required * (self.time_step // self.step_timedelta)
 
         return np.arange(self.max_input_steps, perms_len)
 
