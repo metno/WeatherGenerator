@@ -577,6 +577,7 @@ class Trainer(TrainerBase):
 
         cf = self.cf
         self.model.eval()
+        inference_only = mode_cfg.get("inference_only", False)
 
         dataset_val_iter = iter(self.data_loader_validation)
 
@@ -612,16 +613,21 @@ class Trainer(TrainerBase):
                             target_idxs = get_target_idxs_from_cfg(mode_cfg, loss_name)
                             targets_and_auxs[loss_name] = target_aux.compute(
                                 self.cf.general.istep,
-                                batch.get_target_samples(target_idxs),
+                                (
+                                    batch.get_source_samples()
+                                    if inference_only
+                                    else batch.get_target_samples(target_idxs)
+                                ),
                                 self.model_params,
                                 self.model,
                             )
 
-                    _ = self.loss_calculator_val.compute_loss(
-                        preds=preds,
-                        targets_and_aux=targets_and_auxs,
-                        metadata=extract_batch_metadata(batch),
-                    )
+                    if not inference_only:
+                        _ = self.loss_calculator_val.compute_loss(
+                            preds=preds,
+                            targets_and_aux=targets_and_auxs,
+                            metadata=extract_batch_metadata(batch),
+                        )
 
                     # log output
                     if bidx < num_samples_write:
@@ -649,8 +655,11 @@ class Trainer(TrainerBase):
                     if (bidx * batch_size) > mode_cfg.samples_per_mini_epoch:
                         break
 
-                self._log_terminal(0, mini_epoch, VAL)
-                self._log(VAL)
+                if not inference_only:
+                    self._log_terminal(0, mini_epoch, VAL)
+                    self._log(VAL)
+                else:
+                    logger.info("inference_only=True: skipping loss and metric logging.")
 
         # avoid that there is a systematic bias in the validation subset
         self.dataset_val.advance()
