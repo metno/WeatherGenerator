@@ -26,7 +26,6 @@ from weathergen.datasets.data_reader_base import (
     TIndex,
 )
 from weathergen.datasets.data_reader_obs import DataReaderObs
-from weathergen.datasets.data_reader_synop import DataReaderSynop
 from weathergen.datasets.masking import Masker
 from weathergen.datasets.stream_data import StreamData, spoof
 from weathergen.datasets.tokenizer_masking import TokenizerMasking
@@ -248,8 +247,6 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                     dataset = DataReaderObs
                 case "anemoi":
                     dataset = DataReaderAnemoi
-                case "station":
-                    dataset = DataReaderSynop
                 case type_name:
                     dataset = get_extra_reader(type_name)
                     if dataset is None:

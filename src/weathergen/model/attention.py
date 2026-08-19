@@ -34,7 +34,21 @@ def _apply_xsa(attn_out: torch.Tensor, self_values: torch.Tensor) -> torch.Tenso
         .clamp_min(torch.finfo(self_values_float.dtype).eps)
     )
     proj = (attn_out_float * self_values_float).sum(dim=-1, keepdim=True) / denom
+    import os
+    if os.environ.get("WG_DEBUG_XSA"):
+        _n = attn_out_float.numel()
+        _b = _n * attn_out_float.element_size()
+        print(
+            f"[xsa] rank={os.environ.get('SLURM_PROCID')} "
+            f"attn_out={tuple(attn_out_float.shape)} dtype={attn_out_float.dtype} "
+            f"proj={tuple(proj.shape)} vals={tuple(self_values_float.shape)} "
+            f"tmp={_b/2**30:.3f} GiB "
+            f"alloc={torch.cuda.memory_allocated()/2**30:.1f} "
+            f"resv={torch.cuda.memory_reserved()/2**30:.1f}",
+            flush=True,
+        )
     return (attn_out_float - (proj * self_values_float)).to(attn_out.dtype)
+#    return (attn_out_float - (proj * self_values_float)).to(attn_out.dtype)
 
 
 class MultiSelfAttentionHeadVarlen(torch.nn.Module):

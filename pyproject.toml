@@ -33,6 +33,9 @@ dependencies = [
  # This seems necessary for build isolation?
  'wheel',
  'setuptools',
+ # netCDF4's filters() segfaults on aarch64 here; read station NetCDF via h5netcdf instead
+ "h5netcdf",
+ "h5py",
 ]
 
 
