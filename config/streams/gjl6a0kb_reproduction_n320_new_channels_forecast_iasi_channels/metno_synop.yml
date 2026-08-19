@@ -1,6 +1,6 @@
 MET_Norway_aws :
   type : station
-  filenames : ['metno_observations_v5.nc']
+  filenames : ['metno_observations_v5_6h.nc']
   stream_id : 300
 #  source : []
   source : ['2t', 'tp', '2r', 'sp', '10si']
