@@ -173,8 +173,9 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         available_samples = max_index * self.batch_size  # as number of samples
 
         assert available_samples > 0, (
-            "There is an insufficient date range to \
-accomodate any number of samples or forecast steps"
+            "There is an insufficient date range to accommodate any number of samples or "
+            "forecast steps. For inference from a short source-only dataset, set "
+            "test_config.inference_only: true."
         )
 
         # choose correct num samples
@@ -572,7 +573,9 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
         return stream_data
 
-    def _get_data_windows(self, base_idx, num_forecast_steps, num_steps_input_max, stream_ds):
+    def _get_data_windows(
+        self, base_idx, num_forecast_steps, num_steps_input_max, stream_info, stream_ds
+    ):
         """
         Collect all data needed for current stream to potentially amortize costs by
         generating multiple samples
@@ -607,6 +610,25 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             step_forecast_dt = base_idx + (self.time_step * timestep_idx) // self.step_timedelta
 
             rdata = collect_datasources(stream_ds, step_forecast_dt, "target", self.rng)
+
+            if rdata.is_empty():
+                if self.inference_only and stream_info.get("inference_query_from_source_time", False):
+                    # A future target field is unavailable during inference-only
+                    # forecasting, but dense decoders still need query coordinates.
+                    # Reuse the target grid available at the last source time and
+                    # assign it the forecast window time. Its data values are never
+                    # used because inference-only does not build target values.
+                    query_data = collect_datasources(stream_ds, base_idx, "target", self.rng)
+                    if not query_data.is_empty():
+                        time_win = self.time_window_handler.window(step_forecast_dt)
+                        rdata = dataclasses.replace(
+                            query_data,
+                            datetimes=np.full(
+                                query_data.datetimes.shape,
+                                time_win.start,
+                                dtype=query_data.datetimes.dtype,
+                            ),
+                        )
 
             if rdata.is_empty():
                 # work around for https://github.com/pytorch/pytorch/issues/158719
@@ -713,7 +735,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             # in source and target channels; overlap in one window when self.output_offset=0
             i_max = input_steps.max().item()
             (input_data, output_data) = self._get_data_windows(
-                idx, num_forecast_steps, i_max, stream_ds
+                idx, num_forecast_steps, i_max, stream_info, stream_ds
             )
 
             # tokenize windows
