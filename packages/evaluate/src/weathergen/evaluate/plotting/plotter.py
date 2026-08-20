@@ -628,7 +628,8 @@ class Plotter:
         map_kwargs : dict or None
             Raw keyword arguments from the caller. Known keys (``marker_size``,
             ``scale_marker_size``, ``marker``, ``vmin``, ``vmax``, ``colormap``,``colors``,
-            ``use_datashader``, ``levels``, ``colorbar_scale`` and HEALPix-related keys) are
+            ``use_datashader``, ``levels``, ``colorbar_scale``, ``add_coastlines`` and
+            HEALPix-related keys) are
             extracted; remaining keys are collected under ``"extra"``.
         stream : str or None
             Stream name used to look up the default marker size when
@@ -645,6 +646,7 @@ class Plotter:
                 - cmap (matplotlib.colors.Colormap)
                 - colors (list or None)
                 - use_datashader (bool)
+                - add_coastlines (bool)
                 - norm (matplotlib.colors.Normalize or BoundaryNorm)
                 - add_healpix_grid (bool) and related healpix_* keys
                 - extra (dict) – leftover kwargs for ``ax.scatter``
@@ -662,6 +664,7 @@ class Plotter:
             "cmap": kw.pop("colormap", "coolwarm"),
             "colors": kw.pop("colors", None),
             "use_datashader": kw.pop("use_datashader", False),
+            "add_coastlines": kw.pop("add_coastlines", True),
             "levels": kw.pop("levels", None),
             "colorbar_scale": kw.pop("colorbar_scale", "linear"),
             # HEALPix grid
@@ -1004,10 +1007,11 @@ class Plotter:
                 proj = ccrs.PlateCarree()
         fig = plt.figure(figsize=figsize, dpi=self.dpi_val)
         ax = fig.add_subplot(1, 1, 1, projection=proj)
-        try:
-            ax.coastlines(linewidth=0.3)
-        except Exception:
-            _logger.warning("Could not add coastlines to plot; continuing without them.")
+        if opts["add_coastlines"]:
+            try:
+                ax.coastlines(linewidth=0.3)
+            except Exception:
+                _logger.warning("Could not add coastlines to plot; continuing without them.")
 
         for spine in ax.spines.values():
             spine.set_linewidth(0.3)
