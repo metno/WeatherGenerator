@@ -307,10 +307,12 @@ def get_source_info(fname_zarr, stream, samples) -> tuple[list[np.datetime64], l
     source_starts = []
     source_ends = []
     with zarrio_reader(fname_zarr) as zio:
+        root = zio.data_root
+        _, avail_fsteps = _find_stream_example(root, stream)
+        fstep0 = avail_fsteps[0]
         for sample in tqdm(samples, desc="Getting source info"):
-            group_path = f"{sample}/{stream}/0/source"
-            source_group = zio.data_root.get(group_path)
-
+            group_path = f"{sample}/{stream}/{fstep0}/source"
+            source_group = root.get(group_path)
             if source_group is None:
                 raise FileNotFoundError(f"Zarr group '{group_path}' not found in {fname_zarr}")
 
@@ -468,7 +470,7 @@ def export_model_outputs(data_type: str, config: OmegaConf, **kwargs) -> None:
                         batch_written += 1
 
                 # Only save here if need to merge samples, otherwise saved in process_sample
-                if processed_samples[0] is not None:
+                if processed_samples and processed_samples[0] is not None:
                     parser.save(processed_samples)
                 pbar.close()
 
