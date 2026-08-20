@@ -96,8 +96,34 @@ def get_data_worker(args: tuple) -> tuple[int, int, xr.DataArray]:
 
     return (sample, fstep, da_result)
 
+def _int_keys(group) -> list[int]:
+    """Integer-named subgroups of `group`, sorted numerically."""
+    keys = []
+    for k in group.group_keys():
+        try:
+            keys.append(int(k))
+        except ValueError:
+            continue
+    return sorted(keys)
 
-def get_fsteps(fsteps, fname_zarr: str):
+
+def _find_stream_example(root, stream: str) -> tuple[int, list[int]]:
+    """
+    First sample that actually holds `stream` on disk, plus its forecast steps.
+
+    Replaces the store-level `example_key` probe, which picks sample/stream
+    itself and fails when that combination was never written.
+    """
+    for sample in _int_keys(root):
+        sgrp = root.get(f"{sample}/{stream}")
+        if sgrp is None:
+            continue
+        fsteps = _int_keys(sgrp)
+        if fsteps:
+            return sample, fsteps
+    raise FileNotFoundError(f"Stream '{stream}' has no groups in the zarr store.")
+
+def get_fsteps(fsteps, fname_zarr: str, stream: str):
     """
     Retrieve available forecast steps from the Zarr store and filter
     based on requested forecast steps.
@@ -115,7 +141,7 @@ def get_fsteps(fsteps, fname_zarr: str):
             List of forecast steps to be used for data retrieval.
     """
     with zarrio_reader(fname_zarr) as zio:
-        zio_forecast_steps = sorted([int(step) for step in zio.forecast_steps])
+        _, zio_forecast_steps = _find_stream_example(zio.data_root, stream)
 
     if fsteps is None:
         return zio_forecast_steps
@@ -140,7 +166,7 @@ def get_fsteps(fsteps, fname_zarr: str):
     return valid
 
 
-def get_samples(samples, fname_zarr: str):
+def get_samples(samples, fname_zarr: str, stream: str):
     """
     Retrieve available samples from the Zarr store
     and filter based on requested samples.
@@ -156,7 +182,8 @@ def get_samples(samples, fname_zarr: str):
             List of samples to be used for data retrieval.
     """
     with zarrio_reader(fname_zarr) as zio:
-        zio_samples = sorted([int(sample) for sample in zio.samples])
+        root = zio.data_root
+        zio_samples = [s for s in _int_keys(root) if root.get(f"{s}/{stream}") is not None]
 
     if samples is None:
         return zio_samples
@@ -181,7 +208,7 @@ def get_samples(samples, fname_zarr: str):
     return valid
 
 
-def get_channels(channels, stream: str, fname_zarr: str) -> list[str]:
+def get_channels(channels, stream: str, fname_zarr: str, data_type: str = "target") -> list[str]:
     """
     Retrieve available channels from the Zarr store and filter based on requested channels.
     Parameters
@@ -198,20 +225,22 @@ def get_channels(channels, stream: str, fname_zarr: str) -> list[str]:
             List of channels to be used for data retrieval.
     """
     with zarrio_reader(fname_zarr) as zio:
-        zio_forecast_steps = sorted([int(step) for step in zio.forecast_steps])
-        dummy_out = zio.get_data(0, stream, zio_forecast_steps[0])
-        all_channels = dummy_out.target.channels
+        root = zio.data_root
+        sample, fsteps = _find_stream_example(root, stream)
+        grp = root.get(f"{sample}/{stream}/{fsteps[0]}/{data_type}")
+        if grp is None:
+            raise FileNotFoundError(
+                f"Zarr group '{sample}/{stream}/{fsteps[0]}/{data_type}' not found."
+            )
+        all_channels = list(grp.attrs["channels"])
 
-        if channels is not None:
-            existing_channels = set(all_channels) & set(channels)
-            if existing_channels != set(channels):
-                missing_channels = set(channels) - set(existing_channels)
-                _logger.warning(
-                    "The following requested channels are"
-                    f"not available in the data and will be skipped: {missing_channels}"
-                )
-        return all_channels if channels is None else list(existing_channels)
+    if channels is None:
+        return all_channels
 
+    missing = [c for c in channels if c not in all_channels]
+    if missing:
+        _logger.warning(f"Requested channels not available, will be skipped: {missing}")
+    return [c for c in channels if c in all_channels]
 
 def get_grid_type(data_type, stream: str, fname_zarr: str) -> str:
     """
@@ -230,10 +259,20 @@ def get_grid_type(data_type, stream: str, fname_zarr: str) -> str:
             Grid type ('regular' or 'gaussian').
     """
     with zarrio_reader(fname_zarr) as zio:
-        zio_forecast_steps = sorted([int(step) for step in zio.forecast_steps])
-        dummy_out = zio.get_data(0, stream, zio_forecast_steps[0])
-        data = dummy_out.target if data_type == "target" else dummy_out.prediction
-        return detect_grid_type(data.as_xarray().squeeze())
+        root = zio.data_root
+        sample, fsteps = _find_stream_example(root, stream)
+        grp = root.get(f"{sample}/{stream}/{fsteps[0]}/{data_type}")
+        coords_arr = np.asarray(grp["coords"])
+
+    probe = xr.DataArray(
+        np.zeros(coords_arr.shape[0], dtype="float32"),
+        dims=["ipoint"],
+        coords={
+            "lat": ("ipoint", coords_arr[:, 0]),
+            "lon": ("ipoint", coords_arr[:, 1]),
+        },
+    )
+    return detect_grid_type(probe)
 
 
 # TODO: this will change after restructuring the lead time.
@@ -288,10 +327,18 @@ def get_source_info(fname_zarr, stream, samples) -> tuple[list[np.datetime64], l
 
 def get_streams(stream, fname_zarr):
     with zarrio_reader(fname_zarr) as zio:
-        zio_streams = zio.streams
-    streams = zio_streams if stream is None else [stream]
-    return streams
+        root = zio.data_root
+        on_disk: list[str] = []
+        for s in _int_keys(root):
+            for st in root[str(s)].group_keys():
+                if st not in on_disk:
+                    on_disk.append(st)
 
+    if stream is None:
+        return on_disk
+    if stream not in on_disk:
+        raise ValueError(f"Stream '{stream}' not in store. Available: {on_disk}")
+    return [stream]
 
 def export_model_outputs(data_type: str, config: OmegaConf, **kwargs) -> None:
     """
@@ -313,10 +360,10 @@ def export_model_outputs(data_type: str, config: OmegaConf, **kwargs) -> None:
     kwargs = OmegaConf.create(kwargs)
 
     run_id = kwargs.run_id
-    samples = kwargs.samples
-    fsteps = kwargs.fsteps
+    req_samples = kwargs.samples
+    req_fsteps = kwargs.fsteps
     stream = kwargs.stream
-    channels = kwargs.channels
+    req_channels = kwargs.channels
     n_processes = kwargs.n_processes
     epoch = kwargs.epoch
     rank = kwargs.rank
@@ -325,13 +372,14 @@ def export_model_outputs(data_type: str, config: OmegaConf, **kwargs) -> None:
         raise ValueError(f"Invalid type: {data_type}. Must be 'target' or 'prediction'.")
 
     fname_zarr = get_model_results(run_id, epoch, rank)
-    fsteps = get_fsteps(fsteps, fname_zarr)
-    samples = get_samples(samples, fname_zarr)
     streams = get_streams(stream, fname_zarr)
     for stream in streams:
+        fsteps = get_fsteps(req_fsteps, fname_zarr, stream)
+        samples = get_samples(req_samples, fname_zarr, stream)
+        channels = get_channels(req_channels, stream, fname_zarr, data_type)
         grid_type = get_grid_type(data_type, stream, fname_zarr)
-        channels = get_channels(channels, stream, fname_zarr)
         source_starts, source_ends = get_source_info(fname_zarr, stream, samples)
+
         kwargs["grid_type"] = grid_type
         kwargs["channels"] = channels
         kwargs["data_type"] = data_type
