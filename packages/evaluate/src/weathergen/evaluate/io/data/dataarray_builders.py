@@ -259,10 +259,11 @@ def build_scatter_dataarrays(
                     "inference_only using data that includes target times, or do not request "
                     "verification metrics for this output."
                 )
-            raise ValueError(
-                "Cannot evaluate output with mismatched target and prediction point counts: "
-                f"target has {n_ip} points but prediction has {pred_data.shape[0]}."
-            )
+            else:
+                raise ValueError(
+                    "Cannot evaluate output with mismatched target and prediction point counts: "
+                    f"target has {n_ip} points but prediction has {pred_data.shape[0]}."
+                )
 
         # Use per-sample coords if available, otherwise fall back to reference
         sc = per_sample_coords[si] if si < len(per_sample_coords) else None
