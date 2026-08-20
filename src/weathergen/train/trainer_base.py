@@ -47,7 +47,9 @@ class TrainerBase:
 
         use_cuda = torch.cuda.is_available()
         if not use_cuda:
-            return torch.device("cpu")
+            # Callers consistently select the primary device with ``devices[0]``.
+            # Keep CPU mode compatible with the CUDA return shape.
+            return ["cpu"]
 
         # if local_id_node == "-1":
         local_id_node = dist.get_node_local_rank(fallback_rank=-1)
