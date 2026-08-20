@@ -138,23 +138,25 @@ def _streams_with_source(root, sample: int) -> list[str]:
     return out
 
 
-def _resolve_source_stream(root, samples, stream: str, preferred: str | None = None) -> str:
+def _resolve_source_stream(
+    root, samples, stream: str, preferred: str | None = None
+) -> str | None:
     """
     Pick the stream to read the conditioning window from.
 
     Diagnostic streams hold only `target`/`prediction`, so the reference time
-    must come from a stream that was actually conditioned on.
+    must come from a stream that was actually conditioned on. Returns None when
+    the store has no `source` groups at all, in which case the caller derives
+    the reference time from `valid_time`.
     """
     candidates = _streams_with_source(root, samples[0])
     if not candidates:
-        raise FileNotFoundError(
-            f"No stream has a 'source' group for sample {samples[0]}; "
-            "cannot determine the forecast reference time."
-        )
+        return None
     if preferred is not None:
         if preferred not in candidates:
             raise ValueError(
-                f"--source-stream '{preferred}' has no source group. Available: {candidates}"
+                f"--source-stream '{preferred}' has no source group. "
+                f"Available: {candidates}"
             )
         return preferred
     if stream in candidates:
@@ -167,6 +169,49 @@ def _resolve_source_stream(root, samples, stream: str, preferred: str | None = N
         "Override with --source-stream if this is not the conditioning stream."
     )
     return chosen
+
+
+def _first_time(root, sample: int, stream: str, fstep: int) -> np.datetime64:
+    """Earliest `valid_time` in the target/prediction group of one forecast step."""
+    for dtype in ("prediction", "target"):
+        grp = root.get(f"{sample}/{stream}/{fstep}/{dtype}")
+        if grp is not None:
+            return np.asarray(grp["times"]).astype("datetime64[ns]").min()
+    raise FileNotFoundError(
+        f"No target/prediction group at '{sample}/{stream}/{fstep}'."
+    )
+
+
+def _derive_source_interval(
+    root, sample: int, stream: str, fstep_hours: int
+) -> tuple[np.datetime64, np.datetime64]:
+    """
+    Derive (start, end) of the conditioning window from `valid_time`.
+
+    Used when the store holds no `source` group. The step length is measured
+    from the data where two forecast steps exist, and only falls back to
+    `fstep_hours` for a single-step store. The reference time is then
+    `valid_time(f0) - f0 * dt`; the window is one step wide, so the
+    `zarr_dt` derived downstream equals the step length.
+    """
+    sgrp = root.get(f"{sample}/{stream}")
+    fsteps = _int_keys(sgrp) if sgrp is not None else []
+    if not fsteps:
+        raise FileNotFoundError(
+            f"Stream '{stream}' has no forecast steps for sample {sample}."
+        )
+
+    f0 = fsteps[0]
+    vt0 = _first_time(root, sample, stream, f0)
+
+    if len(fsteps) >= 2:
+        f1 = fsteps[1]
+        dt = (_first_time(root, sample, stream, f1) - vt0) / (f1 - f0)
+    else:
+        dt = np.timedelta64(fstep_hours, "h").astype("timedelta64[ns]")
+
+    ref_time = vt0 - f0 * dt
+    return ref_time - dt, ref_time
 
 
 def get_fsteps(fsteps, fname_zarr: str, stream: str):
@@ -323,7 +368,7 @@ def get_grid_type(data_type, stream: str, fname_zarr: str) -> str:
 
 # TODO: this will change after restructuring the lead time.
 def get_source_info(
-    fname_zarr, stream, samples, source_stream: str | None = None
+    fname_zarr, stream, samples, source_stream: str | None = None, fstep_hours: int = 6
 ) -> tuple[list[np.datetime64], list[np.datetime64]]:
     """
     Retrieve source interval boundaries from the source group at forecast step 0.
@@ -358,27 +403,45 @@ def get_source_info(
         root = zio.data_root
         src_stream = _resolve_source_stream(root, samples, stream, source_stream)
 
-        for sample in tqdm(samples, desc="Getting source info"):
-            sgrp = root.get(f"{sample}/{src_stream}")
-            group_path = None
-            if sgrp is not None:
-                for f in _int_keys(sgrp):
-                    if root.get(f"{sample}/{src_stream}/{f}/source") is not None:
-                        group_path = f"{sample}/{src_stream}/{f}/source"
-                        break
-            if group_path is None:
-                raise FileNotFoundError(
-                    f"No 'source' group for sample {sample} under stream '{src_stream}'."
-                )
+        if src_stream is None:
+            _logger.warning(
+                "No 'source' group anywhere in this store: deriving the forecast reference "
+                "time from valid_time instead. The conditioning window is assumed to be one "
+                "forecast step wide, which sets the accumulation period used for 'tp'."
+            )
 
-            source_group = root.get(group_path)
-            times_arr = np.asarray(source_group["times"]).astype("datetime64[ns]")
-            source_start = np.min(times_arr)
-            source_end = np.max(times_arr)
+        for sample in tqdm(samples, desc="Getting source info"):
+            if src_stream is None:
+                source_start, source_end = _derive_source_interval(
+                    root, sample, stream, fstep_hours
+                )
+            else:
+                sgrp = root.get(f"{sample}/{src_stream}")
+                group_path = None
+                if sgrp is not None:
+                    for f in _int_keys(sgrp):
+                        if root.get(f"{sample}/{src_stream}/{f}/source") is not None:
+                            group_path = f"{sample}/{src_stream}/{f}/source"
+                            break
+                if group_path is None:
+                    raise FileNotFoundError(
+                        f"No 'source' group for sample {sample} under stream '{src_stream}'."
+                    )
+
+                source_group = root.get(group_path)
+                times_arr = np.asarray(source_group["times"]).astype("datetime64[ns]")
+                source_start = np.min(times_arr)
+                source_end = np.max(times_arr)
 
             _logger.debug(f"Sample {sample}: source_interval=[{source_start} .. {source_end}]")
             source_starts.append(source_start)
             source_ends.append(source_end)
+
+    if source_ends:
+        _logger.info(
+            f"Reference times span {source_ends[0]} .. {source_ends[-1]} "
+            f"(window {(source_ends[0] - source_starts[0]).astype('timedelta64[h]')})."
+        )
 
     return source_starts, source_ends
 
@@ -437,7 +500,11 @@ def export_model_outputs(data_type: str, config: OmegaConf, **kwargs) -> None:
         channels = get_channels(req_channels, stream, fname_zarr, data_type)
         grid_type = get_grid_type(data_type, stream, fname_zarr)
         source_starts, source_ends = get_source_info(
-            fname_zarr, stream, samples, kwargs.get("source_stream")
+            fname_zarr,
+            stream,
+            samples,
+            kwargs.get("source_stream"),
+            kwargs.get("fstep_hours", 6),
         )
 
         kwargs["grid_type"] = grid_type
