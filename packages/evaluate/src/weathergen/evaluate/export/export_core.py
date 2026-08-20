@@ -123,6 +123,52 @@ def _find_stream_example(root, stream: str) -> tuple[int, list[int]]:
             return sample, fsteps
     raise FileNotFoundError(f"Stream '{stream}' has no groups in the zarr store.")
 
+
+def _streams_with_source(root, sample: int) -> list[str]:
+    """Streams that have a `source` group at some forecast step for `sample`."""
+    out = []
+    for st in sorted(root[str(sample)].group_keys()):
+        sgrp = root.get(f"{sample}/{st}")
+        if sgrp is None:
+            continue
+        for f in _int_keys(sgrp):
+            if root.get(f"{sample}/{st}/{f}/source") is not None:
+                out.append(st)
+                break
+    return out
+
+
+def _resolve_source_stream(root, samples, stream: str, preferred: str | None = None) -> str:
+    """
+    Pick the stream to read the conditioning window from.
+
+    Diagnostic streams hold only `target`/`prediction`, so the reference time
+    must come from a stream that was actually conditioned on.
+    """
+    candidates = _streams_with_source(root, samples[0])
+    if not candidates:
+        raise FileNotFoundError(
+            f"No stream has a 'source' group for sample {samples[0]}; "
+            "cannot determine the forecast reference time."
+        )
+    if preferred is not None:
+        if preferred not in candidates:
+            raise ValueError(
+                f"--source-stream '{preferred}' has no source group. Available: {candidates}"
+            )
+        return preferred
+    if stream in candidates:
+        return stream
+
+    chosen = candidates[0]
+    _logger.warning(
+        f"Stream '{stream}' is diagnostic (no 'source' group). Taking the reference "
+        f"time from '{chosen}' instead. Candidates: {candidates}. "
+        "Override with --source-stream if this is not the conditioning stream."
+    )
+    return chosen
+
+
 def get_fsteps(fsteps, fname_zarr: str, stream: str):
     """
     Retrieve available forecast steps from the Zarr store and filter
@@ -276,7 +322,9 @@ def get_grid_type(data_type, stream: str, fname_zarr: str) -> str:
 
 
 # TODO: this will change after restructuring the lead time.
-def get_source_info(fname_zarr, stream, samples) -> tuple[list[np.datetime64], list[np.datetime64]]:
+def get_source_info(
+    fname_zarr, stream, samples, source_stream: str | None = None
+) -> tuple[list[np.datetime64], list[np.datetime64]]:
     """
     Retrieve source interval boundaries from the source group at forecast step 0.
 
@@ -308,14 +356,22 @@ def get_source_info(fname_zarr, stream, samples) -> tuple[list[np.datetime64], l
     source_ends = []
     with zarrio_reader(fname_zarr) as zio:
         root = zio.data_root
-        _, avail_fsteps = _find_stream_example(root, stream)
-        fstep0 = avail_fsteps[0]
-        for sample in tqdm(samples, desc="Getting source info"):
-            group_path = f"{sample}/{stream}/{fstep0}/source"
-            source_group = root.get(group_path)
-            if source_group is None:
-                raise FileNotFoundError(f"Zarr group '{group_path}' not found in {fname_zarr}")
+        src_stream = _resolve_source_stream(root, samples, stream, source_stream)
 
+        for sample in tqdm(samples, desc="Getting source info"):
+            sgrp = root.get(f"{sample}/{src_stream}")
+            group_path = None
+            if sgrp is not None:
+                for f in _int_keys(sgrp):
+                    if root.get(f"{sample}/{src_stream}/{f}/source") is not None:
+                        group_path = f"{sample}/{src_stream}/{f}/source"
+                        break
+            if group_path is None:
+                raise FileNotFoundError(
+                    f"No 'source' group for sample {sample} under stream '{src_stream}'."
+                )
+
+            source_group = root.get(group_path)
             times_arr = np.asarray(source_group["times"]).astype("datetime64[ns]")
             source_start = np.min(times_arr)
             source_end = np.max(times_arr)
@@ -380,7 +436,9 @@ def export_model_outputs(data_type: str, config: OmegaConf, **kwargs) -> None:
         samples = get_samples(req_samples, fname_zarr, stream)
         channels = get_channels(req_channels, stream, fname_zarr, data_type)
         grid_type = get_grid_type(data_type, stream, fname_zarr)
-        source_starts, source_ends = get_source_info(fname_zarr, stream, samples)
+        source_starts, source_ends = get_source_info(
+            fname_zarr, stream, samples, kwargs.get("source_stream")
+        )
 
         kwargs["grid_type"] = grid_type
         kwargs["channels"] = channels
