@@ -104,13 +104,17 @@ def common_ranges(
         # if vmax still missing, compute bound from data
         if not isinstance(maps_config[var].get("vmax"), (int | float)):
             list_max = calc_bounds(data_tars, data_preds, var, "max")
-            list_max = np.concatenate([arr.flatten() for arr in list_max]).tolist()
-            maps_config[var].update({"vmax": float(max(list_max))})
+            values_max = np.concatenate([arr.flatten() for arr in list_max])
+            finite_max = values_max[np.isfinite(values_max)]
+            if finite_max.size:
+                maps_config[var].update({"vmax": float(np.max(finite_max))})
         # if vmin still missing, compute bound from data
         if not isinstance(maps_config[var].get("vmin"), (int | float)):
             list_min = calc_bounds(data_tars, data_preds, var, "min")
-            list_min = np.concatenate([arr.flatten() for arr in list_min]).tolist()
-            maps_config[var].update({"vmin": float(min(list_min))})
+            values_min = np.concatenate([arr.flatten() for arr in list_min])
+            finite_min = values_min[np.isfinite(values_min)]
+            if finite_min.size:
+                maps_config[var].update({"vmin": float(np.min(finite_min))})
     return maps_config
 
 
