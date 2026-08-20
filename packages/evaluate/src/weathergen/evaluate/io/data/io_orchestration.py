@@ -465,6 +465,7 @@ def _assemble_substep(
             per_sample_coords,
             state.coords,
             per_sample_obs_times=per_sample_obs_times,
+            allow_prediction_only=state.stream_cfg.get("allow_prediction_only", False),
         )
 
     da_tar, da_pred = select_channels(

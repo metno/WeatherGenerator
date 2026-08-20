@@ -194,6 +194,7 @@ def build_scatter_dataarrays(
     per_sample_coords: list[NDArray | None],
     coords_fallback: NDArray,
     per_sample_obs_times: list[NDArray] | None = None,
+    allow_prediction_only: bool = False,
 ) -> tuple[xr.DataArray, xr.DataArray]:
     """Build DataArrays for non-gridded (scatter) data.
 
@@ -229,6 +230,10 @@ def build_scatter_dataarrays(
         Per-sample arrays of observation times, shape (n_ip,) each.
         When provided, each observation gets its actual timestamp;
         otherwise the single per_sample_valid_times value is broadcast.
+    allow_prediction_only : bool
+        Permit outputs with predictions but no targets. Placeholder NaN targets
+        are created solely so prediction maps can be built; verification metrics
+        remain invalid for those points.
 
     Returns
     -------
@@ -243,7 +248,10 @@ def build_scatter_dataarrays(
         pred_data = preds_list[si]  # (n_ip, n_channels[, n_ens])
 
         if pred_data.shape[0] != n_ip:
-            if n_ip == 0:
+            if n_ip == 0 and allow_prediction_only:
+                n_ip = pred_data.shape[0]
+                tar_data = np.full((n_ip, pred_data.shape[1]), np.nan, dtype=pred_data.dtype)
+            elif n_ip == 0:
                 raise ValueError(
                     "Cannot evaluate prediction-only output: the requested stream/forecast "
                     "step contains predictions but no target points. Verification metrics "
