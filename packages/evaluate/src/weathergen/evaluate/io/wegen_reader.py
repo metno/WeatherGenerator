@@ -77,7 +77,9 @@ class WeatherGenReader(Reader):
     def get_inference_config(self):
         """
         Load the config associated to the inference run (different from the
-        eval_cfg which contains plot and evaluation options.)
+        eval_cfg which contains plot and evaluation options). An explicit
+        ``inference_config_path`` allows evaluating an ad-hoc inference run
+        whose output directory does not have its own saved model config.
 
         Returns
         -------
@@ -86,7 +88,23 @@ class WeatherGenReader(Reader):
         """
         config = {}
 
-        if self.private_paths:
+        inference_config_path = self.eval_cfg.get("inference_config_path")
+        if inference_config_path:
+            config_path = Path(inference_config_path).expanduser()
+            if not config_path.is_file():
+                raise FileNotFoundError(
+                    f"The configured inference_config_path does not exist or is not a file: "
+                    f"{config_path}"
+                )
+            _logger.info(f"Loading explicit inference configuration: {config_path}")
+            config = load_run_config(str(config_path), self.mini_epoch, None)
+            # The saved configuration supplies model metadata, while ``run_id``
+            # identifies the independently produced output to evaluate.
+            if config.get("general"):
+                config.general.run_id = self.run_id
+            else:
+                config.run_id = self.run_id
+        elif self.private_paths:
             _logger.info(
                 f"Loading config for run {self.run_id} from private paths: {self.private_paths}"
             )
