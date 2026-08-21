@@ -11,9 +11,11 @@ variables:
                MEPS:    K,
                NORA3:   K,
                ERA5:    K,
+               MET_Norway_aws:    K,
                DEFAULT: K}
     verif_unit: K
-    obs_name: air_temperature
+#    obs_name: air_temperature
+    obs_name: 2t
     obs_units: K
     level_type: sfc
 
@@ -24,9 +26,11 @@ variables:
                MEPS:    Pa,
                NORA3:   Pa,
                ERA5:    Pa,
+               MET_Norway_aws:    Pa,
                DEFAULT: Pa}
     verif_unit: Pa
-    obs_name: surface_air_pressure
+#    obs_name: surface_air_pressure
+    obs_name: sp
     obs_units: Pa
     level_type: sfc
 
@@ -37,9 +41,11 @@ variables:
                MEPS:    kg/m^2,
                NORA3:   kg/m^2,
                ERA5:    m,
+               MET_Norway_aws:    kg/m^2,
                DEFAULT: kg/m^2}
     verif_unit: kg/m^2
-    obs_name: precipitation_amount_1h
+#    obs_name: precipitation_amount_1h
+    obs_name: tp
     obs_units: kg/m^2
     level_type: sfc
 
@@ -51,9 +57,11 @@ variables:
                MEPS:    Pa,
                NORA3:   Pa,
                ERA5:    Pa,
+               MET_Norway_aws:    Pa,
                DEFAULT: Pa}
     verif_unit: Pa
-    obs_name: surface_air_pressure #check with Rolf
+#    obs_name: surface_air_pressure #check with Rolf
+    obs_name: msl
     obs_units: kg/m^2
     level_type: sfc
 
@@ -65,10 +73,27 @@ variables:
                MEPS:    m/s,
                NORA3:   m/s,
                ERA5:    m/s,
+               MET_Norway_aws :    m/s,
                DEFAULT: m/s}
     verif_unit: m/s
-    obs_name: wind_speed
+#    obs_name: wind_speed
+    obs_name: 10si
     obs_units: m/s
+    level_type: sfc
+
+  2r:
+    var: 2r
+    long: relative humidity
+    wg_unit:  {CERRA:   "1",
+               MEPS:    "1",
+               NORA3:   "1",
+               ERA5:    "1",
+               MET_Norway_aws :    "1",
+               DEFAULT: "1"}
+    verif_unit: "1"
+#    obs_name: wind_speed
+    obs_name: 2r
+    obs_units: "1" 
     level_type: sfc
 
 

@@ -23,6 +23,10 @@ from omegaconf import OmegaConf
 
 from weathergen.common.paths import _REPO_ROOT
 from weathergen.evaluate.export.export_core import export_model_outputs
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 
 _logger = logging.getLogger(__name__)
 _logger.setLevel(logging.INFO)

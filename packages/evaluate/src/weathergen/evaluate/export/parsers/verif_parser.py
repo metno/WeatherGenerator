@@ -68,7 +68,7 @@ class VerifParser(CfParser):
         lat, lon, _ = get_obs_coordinates(self.obs)
         self.obs_coords = np.column_stack((lat.values, lon.values))
         self.zarr_coords = None
-        obs_data_channels = ["10u", "10v", "sp", "2t", "msl", "tp"]
+        obs_data_channels = ["10u", "10v", "10si", "sp", "2t", "msl", "tp", "2r"]
         self.channels = list(set(self.channels) & set(obs_data_channels))
         self.zarr_dt: np.timedelta64 | None = None
 
@@ -137,9 +137,14 @@ class VerifParser(CfParser):
                         s1 = g1[np.lexsort((g1[:,1], g1[:,0]))]
                         print(f"same set after re-sort: {np.array_equal(s0, s1)}",flush=True)
                 assert np.array_equal(g1, g0), (...)
+            _logger.info(f"channels={self.channels} mapping={list(self.mapping)}")
+            _logger.info(f"after reshape:    {list(da_fs[0].data_vars)}")
             da_fs = self.concatenate(da_fs)
+            _logger.info(f"after concat:     {list(da_fs.data_vars)}")
             da_fs = self.assign_frt(da_fs, ref_time)
+            _logger.info(f"after assign_frt: {list(da_fs.data_vars)}")
             da_fs = self.add_attrs(da_fs)
+            _logger.info(f"after add_attrs:  {list(da_fs.data_vars)}")
             vars_to_merge = {verif_var: None for verif_var in self.mapping.keys()}
 
             for verif_var in self.mapping.keys():
