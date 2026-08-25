@@ -594,7 +594,7 @@ class OutputBatchData:
 
     # latent outputs: outer list over forecast steps, inner list over samples.
     # each entry is a dict mapping latent_name -> ndarray
-    latents: list[list[dict]]
+    latents: list[list[dict]] | None = None
 
     @functools.cached_property
     def samples(self):
