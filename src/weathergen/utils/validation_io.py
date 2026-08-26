@@ -461,7 +461,6 @@ def _build_latent_metadata(cf, batch, sample_idx_in_batch, npoints):
         num_class_tokens,
     )
 
-
 def get_latent_output(batch, model_output):
     """
     Interface for getting latent states
@@ -470,7 +469,9 @@ def get_latent_output(batch, model_output):
     # collect latent outputs per forecast step and per sample
     fp32 = torch.float32
 
-    timestep_idxs = [0] if len(batch.get_output_idxs()) == 0 else batch.get_output_idxs()
+    # Filter to steps actually computed by this chunk (not padding)
+    chunk_forecast_offset = model_output.forecast_offset
+    timestep_idxs = [s for s in model_output.forecast_steps if s >= chunk_forecast_offset]
 
     sample_idxs = [
         list(sample.streams_data.values())[0].sample_idx
@@ -480,7 +481,8 @@ def get_latent_output(batch, model_output):
     latents_all: list[list[dict]] = []
     for t_idx in timestep_idxs:
         latents_all.append([])
-        latent_pred = model_output.get_latent_prediction(t_idx)
+        chunk_idx = model_output.chunk_idx(t_idx)  # Convert global to local index
+        latent_pred = model_output.get_latent_prediction(chunk_idx)
         n_samples = len(sample_idxs)
         for i_sample in range(n_samples):
             per_sample: dict = {}
