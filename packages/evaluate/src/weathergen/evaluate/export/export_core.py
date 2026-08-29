@@ -535,6 +535,10 @@ def export_model_outputs(data_type: str, config: OmegaConf, **kwargs) -> None:
             initargs=(fname_zarr,),
         ) as pool:
             samples_written = 0
+            # Parsers that merge samples into one file (verif) must be given every
+            # sample at once: save() writes a fixed path per variable, so calling it
+            # per batch would overwrite earlier batches.
+            all_processed = []
 
             for batch_idx in range(n_batches):
                 batch_start = batch_idx * batch_size
@@ -594,9 +598,10 @@ def export_model_outputs(data_type: str, config: OmegaConf, **kwargs) -> None:
                         del sample_results[sample]
                         batch_written += 1
 
-                # Only save here if need to merge samples, otherwise saved in process_sample
+                # Only accumulate here if samples need merging, otherwise saved
+                # in process_sample.
                 if processed_samples and processed_samples[0] is not None:
-                    parser.save(processed_samples)
+                    all_processed.extend(processed_samples)
                 pbar.close()
 
                 samples_written += batch_written
@@ -609,5 +614,9 @@ def export_model_outputs(data_type: str, config: OmegaConf, **kwargs) -> None:
 
                 # Free any remaining refs before next batch.
                 del sample_results
+
+            if all_processed:
+                _logger.info(f"Saving {len(all_processed)} merged samples.")
+                parser.save(all_processed)
 
         _logger.info(f"Export complete. Wrote {samples_written}/{len(samples)} samples.")
