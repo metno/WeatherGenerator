@@ -107,9 +107,15 @@ def _int_keys(group) -> list[int]:
     return sorted(keys)
 
 
-def _find_stream_example(root, stream: str) -> tuple[int, list[int]]:
+def _find_stream_example(
+    root, stream: str, require: str | None = None
+) -> tuple[int, list[int]]:
     """
     First sample that actually holds `stream` on disk, plus its forecast steps.
+
+    When `require` is given (e.g. "target"), only forecast steps containing that
+    subgroup are considered: stores may hold a step 0 with just `source`, or
+    write `prediction` for steps that have no `target`.
 
     Replaces the store-level `example_key` probe, which picks sample/stream
     itself and fails when that combination was never written.
@@ -119,9 +125,18 @@ def _find_stream_example(root, stream: str) -> tuple[int, list[int]]:
         if sgrp is None:
             continue
         fsteps = _int_keys(sgrp)
+        if require is not None:
+            fsteps = [
+                f
+                for f in fsteps
+                if root.get(f"{sample}/{stream}/{f}/{require}") is not None
+            ]
         if fsteps:
             return sample, fsteps
-    raise FileNotFoundError(f"Stream '{stream}' has no groups in the zarr store.")
+    suffix = f" with a '{require}' group" if require else ""
+    raise FileNotFoundError(
+        f"Stream '{stream}' has no forecast steps{suffix} in the zarr store."
+    )
 
 
 def _streams_with_source(root, sample: int) -> list[str]:
@@ -196,6 +211,15 @@ def _derive_source_interval(
     """
     sgrp = root.get(f"{sample}/{stream}")
     fsteps = _int_keys(sgrp) if sgrp is not None else []
+    # A step 0 holding only `source` carries no valid_time to derive from.
+    fsteps = [
+        f
+        for f in fsteps
+        if any(
+            root.get(f"{sample}/{stream}/{f}/{d}") is not None
+            for d in ("prediction", "target")
+        )
+    ]
     if not fsteps:
         raise FileNotFoundError(
             f"Stream '{stream}' has no forecast steps for sample {sample}."
@@ -214,7 +238,7 @@ def _derive_source_interval(
     return ref_time - dt, ref_time
 
 
-def get_fsteps(fsteps, fname_zarr: str, stream: str):
+def get_fsteps(fsteps, fname_zarr: str, stream: str, data_type: str | None = None):
     """
     Retrieve available forecast steps from the Zarr store and filter
     based on requested forecast steps.
@@ -232,7 +256,7 @@ def get_fsteps(fsteps, fname_zarr: str, stream: str):
             List of forecast steps to be used for data retrieval.
     """
     with zarrio_reader(fname_zarr) as zio:
-        _, zio_forecast_steps = _find_stream_example(zio.data_root, stream)
+        _, zio_forecast_steps = _find_stream_example(zio.data_root, stream, require=data_type)
 
     if fsteps is None:
         return zio_forecast_steps
@@ -257,7 +281,7 @@ def get_fsteps(fsteps, fname_zarr: str, stream: str):
     return valid
 
 
-def get_samples(samples, fname_zarr: str, stream: str):
+def get_samples(samples, fname_zarr: str, stream: str, data_type: str | None = None):
     """
     Retrieve available samples from the Zarr store
     and filter based on requested samples.
@@ -274,7 +298,18 @@ def get_samples(samples, fname_zarr: str, stream: str):
     """
     with zarrio_reader(fname_zarr) as zio:
         root = zio.data_root
-        zio_samples = [s for s in _int_keys(root) if root.get(f"{s}/{stream}") is not None]
+        zio_samples = []
+        for s_idx in _int_keys(root):
+            sgrp = root.get(f"{s_idx}/{stream}")
+            if sgrp is None:
+                continue
+            if data_type is None:
+                zio_samples.append(s_idx)
+                continue
+            if any(
+                root.get(f"{s_idx}/{stream}/{f}/{data_type}") is not None for f in _int_keys(sgrp)
+            ):
+                zio_samples.append(s_idx)
 
     if samples is None:
         return zio_samples
@@ -317,7 +352,7 @@ def get_channels(channels, stream: str, fname_zarr: str, data_type: str = "targe
     """
     with zarrio_reader(fname_zarr) as zio:
         root = zio.data_root
-        sample, fsteps = _find_stream_example(root, stream)
+        sample, fsteps = _find_stream_example(root, stream, require=data_type)
         grp = root.get(f"{sample}/{stream}/{fsteps[0]}/{data_type}")
         if grp is None:
             raise FileNotFoundError(
@@ -351,7 +386,7 @@ def get_grid_type(data_type, stream: str, fname_zarr: str) -> str:
     """
     with zarrio_reader(fname_zarr) as zio:
         root = zio.data_root
-        sample, fsteps = _find_stream_example(root, stream)
+        sample, fsteps = _find_stream_example(root, stream, require=data_type)
         grp = root.get(f"{sample}/{stream}/{fsteps[0]}/{data_type}")
         coords_arr = np.asarray(grp["coords"])
 
@@ -495,8 +530,8 @@ def export_model_outputs(data_type: str, config: OmegaConf, **kwargs) -> None:
     fname_zarr = get_model_results(run_id, epoch, rank)
     streams = get_streams(stream, fname_zarr)
     for stream in streams:
-        fsteps = get_fsteps(req_fsteps, fname_zarr, stream)
-        samples = get_samples(req_samples, fname_zarr, stream)
+        fsteps = get_fsteps(req_fsteps, fname_zarr, stream, data_type)
+        samples = get_samples(req_samples, fname_zarr, stream, data_type)
         channels = get_channels(req_channels, stream, fname_zarr, data_type)
         grid_type = get_grid_type(data_type, stream, fname_zarr)
         source_starts, source_ends = get_source_info(
