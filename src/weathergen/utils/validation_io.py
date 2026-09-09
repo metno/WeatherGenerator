@@ -224,8 +224,7 @@ def _write_latent_data_to_zarr(zio, data, cf, batch, batch_idx, batch_size):
             # Calculate global sample index
             global_sample_idx = sample_start + sample_idx_in_batch
 
-            # Reserve latent step 0 for the initial encoded state.
-            group_path = f"{global_sample_idx}/{io.LATENT_STREAM}/{t_idx + 1}"
+            group_path = f"{global_sample_idx}/{io.LATENT_STREAM}/{t_idx}"
 
             npoints = _infer_latent_points_for_metadata(latents_in_sample)
             (
@@ -433,6 +432,8 @@ def get_latent_output(batch, model_output):
     fp32 = torch.float32
 
     timestep_idxs = [0] if len(batch.get_output_idxs()) == 0 else batch.get_output_idxs()
+    latent_preds = [{"latent_state": model_output.initial_latent}]
+    latent_preds.extend(model_output.get_latent_prediction(t_idx) for t_idx in timestep_idxs)
 
     sample_idxs = [
         list(sample.streams_data.values())[0].sample_idx
@@ -440,13 +441,14 @@ def get_latent_output(batch, model_output):
     ]
 
     latents_all: list[list[dict]] = []
-    for t_idx in timestep_idxs:
+    for latent_pred in latent_preds:
         latents_all.append([])
-        latent_pred = model_output.get_latent_prediction(t_idx)
         n_samples = len(sample_idxs)
         for i_sample in range(n_samples):
             per_sample: dict = {}
             for lname, lval in latent_pred.items():
+                if lval is None or lname == "posteriors":
+                    continue
                 if isinstance(lval, LatentState):
                     fields = {
                         "tokens": lval.z_pre_norm,
