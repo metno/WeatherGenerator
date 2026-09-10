@@ -96,7 +96,7 @@ class ColoredRelPathFormatter(logging.Formatter):
 
 
 @cache
-def init_loggers(run_id=None, logging_config=None):
+def init_loggers(run_id=None, logging_config=None, log_path=None):
     """
     Initialize the logger for the package and set output streams/files.
 
@@ -123,7 +123,7 @@ def init_loggers(run_id=None, logging_config=None):
     # output_dir = f"./output/{timestamp}-{run_id}"
     output_dir = ""
     if run_id is not None:
-        output_dir = f"./logs/{run_id}"
+        output_dir = str(log_path) if log_path is not None else f"./logs/{run_id}"
 
     # load the structure for logging config
     if logging_config is None:
@@ -142,7 +142,7 @@ def init_loggers(run_id=None, logging_config=None):
                 filename = f"{output_dir}/{v}"
                 ofile = pathlib.Path(filename)
                 # make sure the path is independent of path where job is launched
-                if not ofile.is_absolute():
+                if not ofile.is_absolute() and log_path is None:
                     work_dir = pathlib.Path(_load_private_conf().get("path_shared_working_dir"))
                     ofile = work_dir / ofile
                 pathlib.Path(ofile.parent).mkdir(parents=True, exist_ok=True)
