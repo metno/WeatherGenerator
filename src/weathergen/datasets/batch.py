@@ -298,6 +298,11 @@ class ModelBatch:
     # device of the tensors in the batch
     device: str | torch.device
 
+    # Optional persistent state supplied by a previous operational job.
+    # It intentionally remains a tensor side channel rather than a data stream:
+    # accumulated state is already model-space data and must not be tokenized.
+    accumulated_state: torch.Tensor | None
+
     def __init__(
         self,
         stream_names: list[str],
@@ -322,6 +327,7 @@ class ModelBatch:
 
         self.source2target_matching_idxs = np.full(num_source_samples, -1, dtype=np.int32)
         self.target2source_matching_idxs = [[] for _ in range(num_target_samples)]
+        self.accumulated_state = None
 
     def pin_memory(self):
         """Pin all tensors in this batch to CPU pinned memory"""
@@ -332,6 +338,9 @@ class ModelBatch:
         # pin target samples
         self.target_samples.pin_memory()
 
+        if self.accumulated_state is not None:
+            self.accumulated_state = self.accumulated_state.pin_memory()
+
         return self
 
     def to_device(self, device):  # -> ModelBatch
@@ -341,6 +350,9 @@ class ModelBatch:
 
         self.source_samples.to_device(device)
         self.target_samples.to_device(device)
+
+        if self.accumulated_state is not None:
+            self.accumulated_state = self.accumulated_state.to(device, non_blocking=True)
 
         self.device = device
 

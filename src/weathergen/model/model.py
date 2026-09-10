@@ -28,6 +28,8 @@ from weathergen.model.encoder import EncoderModule
 from weathergen.model.engines import (
     BilinearDecoder,
     EnsPredictionHead,
+    AccumulatedState,
+    AccumulationEngine,
     ForecastingEngine,
     IdentityEngine,
     LatentPredictionHeadIdentity,
@@ -54,10 +56,12 @@ class ModelOutput:
 
     physical: list[dict[StreamName, torch.Tensor]]
     latent: list[dict[str, torch.Tensor | LatentState]]
+    accumulated: list[AccumulatedState | None]
 
     def __init__(self, len_output: int) -> None:
         self.physical = [{} for _ in range(len_output)]
         self.latent = [{} for _ in range(len_output)]
+        self.accumulated = [None for _ in range(len_output)]
 
     def add_physical_prediction(
         self, fstep: int, stream_name: StreamName, pred: torch.Tensor
@@ -80,6 +84,12 @@ class ModelOutput:
 
     def get_latent_prediction(self, fstep: int):
         return self.latent[fstep]
+
+    def add_accumulated_state(self, fstep: int, state: AccumulatedState) -> None:
+        self.accumulated[fstep] = state
+
+    def get_accumulated_state(self, fstep: int) -> AccumulatedState | None:
+        return self.accumulated[fstep]
 
 
 class ModelParams(torch.nn.Module):
@@ -329,6 +339,8 @@ class Model(torch.nn.Module):
         self.q_cells: torch.Tensor | None = None
         self.streams: dict[str, typing.Any] = cf.streams
         self.target_token_engines = None
+        self.accumulation_engine: AccumulationEngine | None = None
+        self.accumulated_state_projectors: nn.ModuleDict | None = None
 
         assert cf.get("forecast", {}).get("att_dense_rate", 1.0) == 1.0, (
             "Local attention not adapted for register tokens"
@@ -376,6 +388,13 @@ class Model(torch.nn.Module):
         self.encoder = EncoderModule(
             cf, self.sources_size, self.targets_num_channels, self.targets_coords_size
         )
+
+        accumulation_cfg = cf.get("accumulated_state", {})
+        if accumulation_cfg.get("enabled", False):
+            self.accumulation_engine = AccumulationEngine(
+                cf.ae_global_dim_embed, accumulation_cfg.get("dim", 256)
+            )
+            self.accumulated_state_projectors = nn.ModuleDict()
 
         mode_cfg = cf.training_config
         if cf.fe_num_blocks > 0:
@@ -488,6 +507,13 @@ class Model(torch.nn.Module):
                         final_activation=final_activation,
                         stream_name=stream_name,
                     )
+                    if (
+                        self.accumulation_engine is not None
+                        and si.get("target_readout", {}).get("accumulated_state", {}).get("enabled", False)
+                    ):
+                        self.accumulated_state_projectors[stream_name] = nn.Linear(
+                            self.accumulation_engine.state_dim, cf.ae_global_dim_embed
+                        )
 
             # iterate again to setup shared spatial pred heads if specified in config
             for i_stream, (stream_name, si) in enumerate(self.streams.items()):
@@ -687,8 +713,18 @@ class Model(torch.nn.Module):
 
         # recover batch dimension and separate input_steps
         shape = (len(batch), batch.get_num_source_steps(), *tokens.shape[1:])
+        tokens_by_step = tokens.reshape(shape)
+        accumulated_state = None
+        if self.accumulation_engine is not None:
+            previous_state = getattr(batch, "accumulated_state", None)
+            if previous_state is not None:
+                accumulated_state = AccumulatedState(values=previous_state)
+            for source_tokens in tokens_by_step.unbind(dim=1):
+                accumulated_state = self.accumulation_engine(
+                    accumulated_state, source_tokens[:, self.num_aux_tokens :]
+                )
         # collapse along input step dimension
-        tokens = tokens.reshape(shape).sum(axis=1)
+        tokens = tokens_by_step.sum(axis=1)
 
         # Allow for pushforward trick
         p_fwd = self.cf.training_config.get("forecast", {}).get("pushforward", False)
@@ -698,13 +734,25 @@ class Model(torch.nn.Module):
             if without_grad:
                 # Pushforward mode: advance tokens without grad; no decoding with torch.no_grad():
                 tokens = self.forecast_engine(tokens, step, model_params.rope_coords)
+                if self.accumulation_engine is not None:
+                    accumulated_state = self.accumulation_engine(
+                        accumulated_state, tokens[:, self.num_aux_tokens :]
+                    )
                 continue
 
             tokens = self.forecast_engine(tokens, step, model_params.rope_coords)
+            if self.accumulation_engine is not None:
+                accumulated_state = self.accumulation_engine(
+                    accumulated_state, tokens[:, self.num_aux_tokens :]
+                )
             # decoder predictions
-            output = self.predict_decoders(model_params, step, tokens, batch, output)
+            output = self.predict_decoders(
+                model_params, step, tokens, batch, output, accumulated_state
+            )
             # latent predictions (raw and with SSL heads)
             output = self.predict_latent(model_params, step, tokens, batch, output)
+            if accumulated_state is not None:
+                output.add_accumulated_state(step, accumulated_state)
 
         return output
 
@@ -738,6 +786,7 @@ class Model(torch.nn.Module):
         tokens: torch.Tensor,
         batch: ModelBatch,
         output: ModelOutput,
+        accumulated_state: AccumulatedState | None = None,
     ) -> ModelOutput:
         """
         Compute decoder-based predictions
@@ -766,15 +815,23 @@ class Model(torch.nn.Module):
         batch_size = len(batch)
         s = [batch_size, self.num_healpix_cells, self.cf.ae_local_num_queries, tokens.shape[-1]]
         idxs = model_params.hp_nbours.unsqueeze(0).repeat((batch_size, 1, 1)).flatten(0, 1)
-        tokens_nbors = tokens.reshape(s).flatten(0, 1)[idxs.flatten()].flatten(0, 1)
         # TODO: precompute in model_params?
         tokens_nbors_lens = torch.full(
-            (s[0] * s[1] + 1,), fill_value=9, dtype=torch.int32, device=tokens_nbors.device
+            (s[0] * s[1] + 1,), fill_value=9, dtype=torch.int32, device=tokens.device
         )
         tokens_nbors_lens[0] = 0
 
         # pair with tokens from assimilation engine to obtain target tokens
         for stream_name in self.streams.keys():
+            tokens_stream = tokens
+            if (
+                accumulated_state is not None
+                and self.accumulated_state_projectors is not None
+                and stream_name in self.accumulated_state_projectors
+            ):
+                tokens_stream = tokens + self.accumulated_state_projectors[stream_name](
+                    accumulated_state.values
+                ).to(tokens.dtype)
             # extract target coords for current stream and fstep and convert to one tensor
             t_coords = [
                 batch.samples[i_b].streams_data[stream_name].target_coords[step]
@@ -817,12 +874,12 @@ class Model(torch.nn.Module):
                 if self.cf.decoder_type == "Linear":
                     pred = self.target_token_engines[stream_name](
                         tc_tokens,
-                        tokens.reshape(-1, s[-1]),  # collapse the batch and token dimensions
+                        tokens_stream.reshape(-1, s[-1]),  # collapse the batch and token dimensions
                         tcs_lens,
                     ).unsqueeze(0)  # add ensemble dim: shape is then [1, preds_per_coord, channels]
                 else:
                     tc_tokens = self.target_token_engines[stream_name](
-                        latent=tokens_nbors,
+                        latent=tokens_stream.reshape(s).flatten(0, 1)[idxs.flatten()].flatten(0, 1),
                         output=tc_tokens,
                         latent_lens=tokens_nbors_lens,
                         output_lens=tcs_lens,

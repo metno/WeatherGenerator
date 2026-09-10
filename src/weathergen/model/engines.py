@@ -636,6 +636,67 @@ class ForecastingEngine(torch.nn.Module):
         return tokens
 
 
+@dataclasses.dataclass
+class AccumulatedState:
+    """Low-dimensional, spatially distributed state retained across timesteps."""
+
+    values: torch.Tensor
+
+
+class AccumulationEngine(nn.Module):
+    """Gated linear recurrent update for persistent information.
+
+    The update follows the stable gated recurrence used by recurrent gated
+    linear units: a learned retention gate preserves long-lived information,
+    while a complementary input term writes new information from the current
+    atmospheric latent.  It operates independently on every HEALPix cell;
+    spatial transport remains represented by the atmospheric latent tokens.
+    """
+
+    def __init__(self, latent_dim: int, state_dim: int) -> None:
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.state_dim = state_dim
+        self.input_projection = nn.Linear(latent_dim, state_dim)
+        self.input_gate = nn.Linear(latent_dim, state_dim)
+        self.retention_gate = nn.Linear(latent_dim, state_dim)
+        # Start with a long retention timescale while allowing training to
+        # shorten it where rapidly responding processes need it.
+        nn.init.constant_(self.retention_gate.bias, 2.0)
+
+    def initial_state(self, tokens: torch.Tensor) -> AccumulatedState:
+        return AccumulatedState(
+            values=torch.zeros(
+                *tokens.shape[:-1], self.state_dim, device=tokens.device, dtype=tokens.dtype
+            )
+        )
+
+    def forward(
+        self, state: AccumulatedState | None, tokens: torch.Tensor
+    ) -> AccumulatedState:
+        """Update state from ``[batch, cells, latent_dim]`` atmospheric tokens."""
+        if state is None:
+            state = self.initial_state(tokens)
+        if state.values.shape[:-1] != tokens.shape[:-1]:
+            raise ValueError(
+                "AccumulatedState batch and spatial dimensions must match latent tokens: "
+                f"got {tuple(state.values.shape[:-1])} and {tuple(tokens.shape[:-1])}."
+            )
+        if state.values.shape[-1] != self.state_dim:
+            raise ValueError(
+                f"AccumulatedState dimension must be {self.state_dim}, got {state.values.shape[-1]}."
+            )
+
+        state_values = state.values.to(dtype=tokens.dtype)
+        retention = torch.sigmoid(self.retention_gate(tokens))
+        input_gate = torch.sigmoid(self.input_gate(tokens))
+        candidate = torch.tanh(self.input_projection(tokens))
+        values = retention * state_values + torch.sqrt(1.0 - retention.square()) * (
+            input_gate * candidate
+        )
+        return AccumulatedState(values=values)
+
+
 class EnsPredictionHead(torch.nn.Module):
     def __init__(
         self,
