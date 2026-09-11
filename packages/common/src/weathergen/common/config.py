@@ -219,7 +219,8 @@ def load_run_config(
         run_id: Run ID of the pretrained WeatherGenerator model
         mini_epoch: Mini_epoch of the checkpoint to load. -1 indicates last checkpoint available.
         model_path: Parent model directory containing run-id subdirectories.
-        config: Active configuration for resolving path_model when model_path is None.
+        config: Active configuration whose full_model_path specifies the exact checkpoint
+            directory (without appending run_id), used when model_path is None.
 
     Returns:
         Configuration object loaded from the specified run and mini_epoch.
@@ -721,14 +722,14 @@ def get_path_run(config: Config) -> Path:
 
 
 def get_path_model(config: Config | None = None, run_id: str | None = None) -> Path:
-    """Get the current runs model_path for storing model checkpoints."""
+    """Get full_model_path if set, otherwise the shared per-run checkpoint directory."""
     if config or run_id:
         run_id = run_id if run_id else get_run_id_from_config(config)
     else:
         msg = f"Missing run_id and cannot infer it from config: {config}"
         raise ValueError(msg)
     config = config if config is not None else _load_private_conf()
-    return _get_output_directory(config, "path_model", "models", run_id)
+    return _get_output_directory(config, "full_model_path", "models", run_id)
 
 
 def get_path_results(config: Config, mini_epoch: int) -> Path:
