@@ -706,7 +706,7 @@ def load_streams(streams_directory: Path) -> Config:
     return OmegaConf.create(streams)
 
 
-def _get_output_directory(config: Config, key: str, folder: str, run_id: str) -> Path:
+def _get_path_output(config: Config, key: str, folder: str, run_id: str) -> Path:
     """Use an exact directory override, or the existing shared per-run location."""
     if config.get(key) is not None:
         return Path(config[key])
@@ -717,12 +717,12 @@ def _get_output_directory(config: Config, key: str, folder: str, run_id: str) ->
 
 def get_path_logs(config: Config) -> Path:
     """Get the application log directory."""
-    return _get_output_directory(config, "path_logs", "logs", get_run_id_from_config(config))
+    return _get_path_output(config, "path_logs", "logs", get_run_id_from_config(config))
 
 
 def get_path_run(config: Config) -> Path:
     """Get the current runs results_path for storing run results and logs."""
-    return _get_output_directory(config, "path_results", "results", get_run_id_from_config(config))
+    return _get_path_output(config, "path_results", "results", get_run_id_from_config(config))
 
 
 def get_path_model(config: Config | None = None, run_id: str | None = None) -> Path:
@@ -733,7 +733,7 @@ def get_path_model(config: Config | None = None, run_id: str | None = None) -> P
         msg = f"Missing run_id and cannot infer it from config: {config}"
         raise ValueError(msg)
     private_config = config if config is not None else _load_private_conf()
-    return _get_output_directory(private_config, "full_model_path", "models", run_id)
+    return _get_path_output(private_config, "full_model_path", "models", run_id)
 
 
 def get_path_results(config: Config, mini_epoch: int) -> Path:
