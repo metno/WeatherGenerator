@@ -209,7 +209,11 @@ def save(config: Config, mini_epoch: int | None):
 
 
 def load_run_config(
-    run_id: str, mini_epoch: int | None, model_path: str | None, *, config: Config | None = None
+    run_id: str,
+    mini_epoch: int | None,
+    model_path: str | None,
+    *,
+    private_config: Config | None = None,
 ) -> Config:
     """
     Load a configuration file from a given run_id and mini_epoch.
@@ -219,7 +223,7 @@ def load_run_config(
         run_id: Run ID of the pretrained WeatherGenerator model
         mini_epoch: Mini_epoch of the checkpoint to load. -1 indicates last checkpoint available.
         model_path: Parent model directory containing run-id subdirectories.
-        config: Active configuration whose full_model_path specifies the exact checkpoint
+        private_config: Configuration whose full_model_path specifies the exact checkpoint
             directory (without appending run_id), used when model_path is None.
 
     Returns:
@@ -232,7 +236,7 @@ def load_run_config(
     else:
         # Load model config here. In case model_path is not provided, get it from private conf
         if model_path is None:
-            path = get_path_model(config, run_id=run_id)
+            path = get_path_model(private_config, run_id=run_id)
         else:
             path = Path(model_path) / run_id
 
@@ -455,7 +459,7 @@ def load_merge_configs(
     if from_run_id is None:
         base_config = _load_base_conf(base)
     else:
-        base_config = load_run_config(from_run_id, mini_epoch, None, config=private_config)
+        base_config = load_run_config(from_run_id, mini_epoch, None, private_config=private_config)
         from_run_id = get_run_id_from_config(base_config)
     with open_dict(base_config):
         base_config.from_run_id = from_run_id
@@ -728,8 +732,8 @@ def get_path_model(config: Config | None = None, run_id: str | None = None) -> P
     else:
         msg = f"Missing run_id and cannot infer it from config: {config}"
         raise ValueError(msg)
-    config = config if config is not None else _load_private_conf()
-    return _get_output_directory(config, "full_model_path", "models", run_id)
+    private_config = config if config is not None else _load_private_conf()
+    return _get_output_directory(private_config, "full_model_path", "models", run_id)
 
 
 def get_path_results(config: Config, mini_epoch: int) -> Path:
