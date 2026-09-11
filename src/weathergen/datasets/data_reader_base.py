@@ -352,7 +352,7 @@ class DataReaderBase(metaclass=ABCMeta):
         self.mean = np.zeros(0)
         self.stdev = np.ones(0)
         self.mean_geoinfo = np.zeros(0)
-        self.stdev_geoinfo = npi.ones(0)
+        self.stdev_geoinfo = np.ones(0)
 
         self.domain_mask = None
 
