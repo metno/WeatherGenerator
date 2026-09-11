@@ -258,9 +258,9 @@ def load_run_config(
     with fname.open() as f:
         json_str = f.read()
 
-    config = OmegaConf.create(json.loads(json_str))
+    loaded_config = OmegaConf.create(json.loads(json_str))
 
-    return _apply_fixes(config)
+    return _apply_fixes(loaded_config)
 
 
 def _get_model_config_file_write_name(run_id: str, mini_epoch: int | None):
