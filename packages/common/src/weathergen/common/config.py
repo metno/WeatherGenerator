@@ -212,7 +212,6 @@ def load_run_config(
     run_id: str,
     mini_epoch: int | None,
     model_path: str | None,
-    *,
     private_config: Config | None = None,
 ) -> Config:
     """
@@ -706,11 +705,11 @@ def load_streams(streams_directory: Path) -> Config:
     return OmegaConf.create(streams)
 
 
-def _get_path_output(config: Config, key: str, folder: str, run_id: str) -> Path:
+def _get_path_output(path_config: Config, key: str, folder: str, run_id: str) -> Path:
     """Use an exact directory override, or the existing shared per-run location."""
-    if config.get(key) is not None:
-        return Path(config[key])
-    working_dir = config.get("path_shared_working_dir")
+    if path_config.get(key) is not None:
+        return Path(path_config[key])
+    working_dir = path_config.get("path_shared_working_dir")
     root = Path(working_dir) if working_dir is not None else _get_shared_wg_path()
     return root / folder / run_id
 
@@ -718,11 +717,6 @@ def _get_path_output(config: Config, key: str, folder: str, run_id: str) -> Path
 def get_path_logs(config: Config) -> Path:
     """Get the application log directory."""
     return _get_path_output(config, "path_logs", "logs", get_run_id_from_config(config))
-
-
-def get_path_run(config: Config) -> Path:
-    """Get the current runs results_path for storing run results and logs."""
-    return _get_path_output(config, "path_results", "results", get_run_id_from_config(config))
 
 
 def get_path_model(config: Config | None = None, run_id: str | None = None) -> Path:
@@ -736,10 +730,17 @@ def get_path_model(config: Config | None = None, run_id: str | None = None) -> P
     return _get_path_output(private_config, "full_model_path", "models", run_id)
 
 
-def get_path_results(config: Config, mini_epoch: int, step: int | None = None) -> Path:
-    """Get the path to validation results for a specific mini_epoch and rank."""
+def get_path_results(
+    config: Config,
+    mini_epoch: int | None = None,
+    step: int | None = None,
+) -> Path:
+    """Get the path for run results. Returns the results directory when mini_epoch is None."""
+    base_path = _get_path_output(config, "path_results", "results", get_run_id_from_config(config))
+    if mini_epoch is None:
+        return base_path
+
     ext = StoreType(config.zarr_store).value  # validate extension
-    base_path = get_path_run(config)
     default_name = f"validation_chkpt{mini_epoch:05d}_rank{config.rank:04d}.{ext}"
     fname_template = config.get("output_name")
     if fname_template is None:
