@@ -719,14 +719,14 @@ def get_path_logs(config: Config) -> Path:
     return _get_path_output(config, "path_logs", "logs", get_run_id_from_config(config))
 
 
-def get_path_model(path_config: Config | None = None, run_id: str | None = None) -> Path:
+def get_path_model(model_config: Config | None = None, run_id: str | None = None) -> Path:
     """Get full_model_path if set, otherwise the shared per-run checkpoint directory."""
-    if path_config or run_id:
-        run_id = run_id if run_id else get_run_id_from_config(path_config)
+    if model_config or run_id:
+        run_id = run_id if run_id else get_run_id_from_config(model_config)
     else:
-        msg = f"Missing run_id and cannot infer it from config: {path_config}"
+        msg = f"Missing run_id and cannot infer it from config: {model_config}"
         raise ValueError(msg)
-    private_config = path_config if path_config is not None else _load_private_conf()
+    private_config = model_config if model_config is not None else _load_private_conf()
     return _get_path_output(private_config, "full_model_path", "models", run_id)
 
 
