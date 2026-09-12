@@ -736,12 +736,23 @@ def get_path_model(config: Config | None = None, run_id: str | None = None) -> P
     return _get_path_output(private_config, "full_model_path", "models", run_id)
 
 
-def get_path_results(config: Config, mini_epoch: int) -> Path:
+def get_path_results(config: Config, mini_epoch: int, step: int | None = None) -> Path:
     """Get the path to validation results for a specific mini_epoch and rank."""
     ext = StoreType(config.zarr_store).value  # validate extension
     base_path = get_path_run(config)
-    fname = f"validation_chkpt{mini_epoch:05d}_rank{config.rank:04d}.{ext}"
-    fname = config.get("output_name") or fname
+    default_name = f"validation_chkpt{mini_epoch:05d}_rank{config.rank:04d}.{ext}"
+    fname_template = config.get("output_name")
+    if fname_template is None:
+        fname = default_name
+    else:
+        try:
+            fname = fname_template.format(
+                epoch=mini_epoch,
+                step=step,
+                rank=config.rank,
+            )
+        except (IndexError, KeyError, ValueError):
+            fname = default_name
 
     return base_path / fname
 
