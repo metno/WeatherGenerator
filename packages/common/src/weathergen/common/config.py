@@ -731,18 +731,20 @@ def get_path_model(path_config: Config | None = None, run_id: str | None = None)
 
 
 def get_path_results(
-    config: Config,
+    run_config: Config,
     mini_epoch: int | None = None,
     step: int | None = None,
 ) -> Path:
     """Get the path for run results. Returns the results directory when mini_epoch is None."""
-    base_path = _get_path_output(config, "path_results", "results", get_run_id_from_config(config))
+    base_path = _get_path_output(
+        run_config, "path_results", "results", get_run_id_from_config(run_config)
+    )
     if mini_epoch is None:
         return base_path
 
-    ext = StoreType(config.zarr_store).value  # validate extension
-    default_name = f"validation_chkpt{mini_epoch:05d}_rank{config.rank:04d}.{ext}"
-    fname_template = config.get("output_name")
+    ext = StoreType(run_config.zarr_store).value  # validate extension
+    default_name = f"validation_chkpt{mini_epoch:05d}_rank{run_config.rank:04d}.{ext}"
+    fname_template = run_config.get("output_name")
     if fname_template is None:
         fname = default_name
     else:
@@ -750,7 +752,7 @@ def get_path_results(
             fname = fname_template.format(
                 epoch=mini_epoch,
                 step=step,
-                rank=config.rank,
+                rank=run_config.rank,
             )
         except (IndexError, KeyError, ValueError):
             fname = default_name
