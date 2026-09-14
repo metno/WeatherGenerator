@@ -309,14 +309,36 @@ class VerifParser(CfParser):
 
         obs_dataarray = np.empty(new_shape, dtype=np.float32)
 
+        obs_times = obs_data.time.values
+
         for i, leadtime in enumerate(ds_var.coords["leadtime"].values):
             valid_time = ds_var.coords["time"] + np.timedelta64(int(leadtime), "h")
+
+            wanted = np.atleast_1d(np.asarray(valid_time.values))
+            missing = [t for t in wanted if t not in obs_times]
+            if missing:
+                _logger.warning(
+                    f"{verif_var}: no observations at {missing} (leadtime {int(leadtime)}h); "
+                    "filling with NaN."
+                )
+                obs_dataarray[:, i, :] = np.nan
+                continue
+
             if verif_var == "mslp":
                 obs_dataarray[:, i, :] = compute_mslp(obs_data, valid_time)
-            if verif_var == "tp":
+            elif verif_var == "tp" and "precipitation_amount_1h" in obs_data.data_vars:
                 obs_dataarray[:, i, :] = compute_precip(obs_data, self.zarr_dt, valid_time)
             else:
                 obs_dataarray[:, i, :] = obs_data.data_vars[obs_name].sel(time=valid_time)
+
+#        for i, leadtime in enumerate(ds_var.coords["leadtime"].values):
+#            valid_time = ds_var.coords["time"] + np.timedelta64(int(leadtime), "h")
+#            if verif_var == "mslp":
+#                obs_dataarray[:, i, :] = compute_mslp(obs_data, valid_time)
+#            if verif_var == "tp":
+#                obs_dataarray[:, i, :] = compute_precip(obs_data, self.zarr_dt, valid_time)
+#            else:
+#                obs_dataarray[:, i, :] = obs_data.data_vars[obs_name].sel(time=valid_time)
 
         obs_dataarray = ds_var.copy(data=obs_dataarray)
         obs_dataarray.name = "obs"

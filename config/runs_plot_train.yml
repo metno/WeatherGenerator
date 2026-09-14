@@ -1,22 +1,14 @@
 train : 
   plot :
+    oo5ycd5w : 
+      slurm_id: 805761
+      description: "e00 hp5 0-297"
+      eval: vgbndhco
     wkt5271g : 
       slurm_id: 800704
-      description: "e01"
+      description: "e01 hp8 0-223"
       eval: vgbndhco
     sqsvm93f : 
       slurm_id: 800708
-      description: "e02"
-      eval: vgbndhco
-    vk6ntaya : 
-      slurm_id: 800722
-      description: "e03"
-      eval: vgbndhco
-    tleilmsh : 
-      slurm_id: 800825
-      description: "e04"
-      eval: vgbndhco
-    cr067tz5 : 
-      slurm_id: 800885 
-      description: "e05"
+      description: "e02 hp5/8 0-243"
       eval: vgbndhco

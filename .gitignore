@@ -234,6 +234,7 @@ config/streams/metno_*/
 # ignore backup for config files
 *.yml.bak
 *.yaml.bak
+config/*.yml
 
 # ignore backup for py files
 *.py.bak
