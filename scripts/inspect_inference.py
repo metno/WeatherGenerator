@@ -139,6 +139,40 @@ def _print_compact_time_count(zio, forecast_step):
     print(f"Largest timestamp: {unique_times[-1]}")
 
 
+def _print_variables(zio):
+    print("Variables by stream and dataset:")
+    for stream in zio.streams:
+        channels_by_dataset = {}
+        for sample in sorted(int(s) for s in zio.samples):
+            stream_group = zio.data_root.get(f"{sample}/{stream}")
+            if stream_group is None:
+                continue
+
+            for forecast_step in sorted(stream_group.group_keys(), key=int):
+                item_group = zio.data_root.get(f"{sample}/{stream}/{forecast_step}")
+                if item_group is None:
+                    continue
+
+                for dataset_name in item_group.group_keys():
+                    dataset_group = zio.data_root.get(
+                        f"{sample}/{stream}/{forecast_step}/{dataset_name}"
+                    )
+                    if dataset_group is None:
+                        continue
+
+                    channels = channels_by_dataset.setdefault(dataset_name, [])
+                    for channel in dataset_group.attrs.get("channels", []):
+                        if channel not in channels:
+                            channels.append(channel)
+
+        print(f"  {stream}:")
+        if not channels_by_dataset:
+            print("    no datasets found")
+            continue
+        for dataset_name, channels in sorted(channels_by_dataset.items()):
+            print(f"    {dataset_name}: {', '.join(channels) if channels else 'none'}")
+
+
 def _parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_id")
@@ -148,6 +182,15 @@ def _parse_args():
         "--compact",
         action="store_true",
         help="Show only the total number of unique timestamps across samples.",
+    )
+    parser.add_argument(
+        "--variables",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "List all channel variables by stream and dataset type, then exit "
+            "(default: enabled; use --no-variables for detailed inspection)."
+        ),
     )
     return parser.parse_args()
 
@@ -170,6 +213,10 @@ try:
         print(f"Samples: {_format_samples_overview(samples_all)}")
         print(f"Streams: {list(zio.streams)}")
         print(f"Forecast steps: {fsteps_all}\n")
+
+        if args.variables:
+            _print_variables(zio)
+            sys.exit(0)
         
         # Get first available data
         sample = samples_all[0]
