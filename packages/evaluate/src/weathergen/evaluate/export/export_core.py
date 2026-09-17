@@ -234,18 +234,104 @@ def get_grid_type(data_type, stream: str, fname_zarr: str) -> str:
         return detect_grid_type(data.as_xarray().squeeze())
 
 
-# TODO: this will change after restructuring the lead time.
-def get_source_info(fname_zarr, stream, samples) -> tuple[list[np.datetime64], list[np.datetime64]]:
+def _int_keys(group) -> list[int]:
+    """Return integer-named subgroups sorted numerically."""
+    keys = []
+    for key in group.group_keys():
+        try:
+            keys.append(int(key))
+        except ValueError:
+            continue
+    return sorted(keys)
+
+
+def _streams_with_source(root, sample: int) -> list[str]:
+    """Return streams containing a source group for the given sample."""
+    streams = []
+    sample_group = root.get(str(sample))
+    if sample_group is None:
+        return streams
+
+    for candidate_stream in sorted(sample_group.group_keys()):
+        stream_group = root.get(f"{sample}/{candidate_stream}")
+        if stream_group is None:
+            continue
+        if any(
+            root.get(f"{sample}/{candidate_stream}/{fstep}/source") is not None
+            for fstep in _int_keys(stream_group)
+        ):
+            streams.append(candidate_stream)
+    return streams
+
+
+def _resolve_source_stream(root, samples: list[int], stream: str) -> str | None:
+    """Choose a stream containing source data, if one exists."""
+    candidates = _streams_with_source(root, samples[0])
+    if not candidates:
+        return None
+    if stream in candidates:
+        return stream
+
+    chosen = candidates[0]
+    _logger.warning(
+        f"Stream '{stream}' has no source group; using source times from '{chosen}'. "
+        f"Available source streams: {candidates}."
+    )
+    return chosen
+
+
+def _first_valid_time(root, sample: int, stream: str, fstep: int) -> np.datetime64:
+    """Return the earliest valid time from a prediction or target group."""
+    for data_type in ("prediction", "target"):
+        group = root.get(f"{sample}/{stream}/{fstep}/{data_type}")
+        if group is not None:
+            return np.asarray(group["times"]).astype("datetime64[ns]").min()
+    raise FileNotFoundError(
+        f"No prediction or target group found at '{sample}/{stream}/{fstep}'."
+    )
+
+
+def _derive_source_interval(
+    root, sample: int, stream: str, fstep_hours: int
+) -> tuple[np.datetime64, np.datetime64]:
+    """Derive a one-step source interval when the store has no source groups."""
+    stream_group = root.get(f"{sample}/{stream}")
+    fsteps = _int_keys(stream_group) if stream_group is not None else []
+    fsteps = [
+        fstep
+        for fstep in fsteps
+        if any(
+            root.get(f"{sample}/{stream}/{fstep}/{candidate_type}") is not None
+            for candidate_type in ("prediction", "target")
+        )
+    ]
+    if not fsteps:
+        raise FileNotFoundError(
+            f"Stream '{stream}' has no prediction or target data for sample {sample}."
+        )
+
+    first_fstep = fsteps[0]
+    first_valid_time = _first_valid_time(root, sample, stream, first_fstep)
+    if len(fsteps) >= 2:
+        second_fstep = fsteps[1]
+        step_duration = (
+            _first_valid_time(root, sample, stream, second_fstep) - first_valid_time
+        ) / (second_fstep - first_fstep)
+    else:
+        step_duration = np.timedelta64(fstep_hours, "h").astype("timedelta64[ns]")
+
+    reference_time = first_valid_time - first_fstep * step_duration
+    return reference_time - step_duration, reference_time
+
+
+def get_source_info(
+    fname_zarr,
+    stream,
+    samples,
+    fstep_hours: int = 6,
+) -> tuple[list[np.datetime64], list[np.datetime64]]:
     """
-    Retrieve source interval boundaries from the source group at forecast step 0.
-
-    Values are derived from the actual ``times`` array of the **source**
-    group at forecast step 0:
-    - ``source_start = min(source_times)``
-    - ``source_end   = max(source_times)``
-
-    The true forecast initialisation (reference) time is either ``source_start``
-    or ``source_end``, selected via the ``init_time_reference`` option.
+    Retrieve source intervals without assuming that forecast step 0 exists.
 
     Parameters
     ----------
@@ -255,6 +341,9 @@ def get_source_info(fname_zarr, stream, samples) -> tuple[list[np.datetime64], l
         Stream name to retrieve data for (e.g., 'ERA5').
     samples : list
         List of samples to process.
+    fstep_hours : int
+        Forecast-step duration used when source times must be derived from a
+        store containing only one prediction or target step.
 
     Returns
     -------
@@ -267,16 +356,40 @@ def get_source_info(fname_zarr, stream, samples) -> tuple[list[np.datetime64], l
     source_starts = []
     source_ends = []
     with zarrio_reader(fname_zarr) as zio:
+        root = zio.data_root
+        resolved_source_stream = _resolve_source_stream(root, samples, stream)
+        if resolved_source_stream is None:
+            _logger.warning(
+                "No source group exists in the store; deriving source intervals "
+                "from prediction or target valid times."
+            )
+
         for sample in tqdm(samples, desc="Getting source info"):
-            group_path = f"{sample}/{stream}/0/source"
-            source_group = zio.data_root.get(group_path)
+            if resolved_source_stream is None:
+                source_start, source_end = _derive_source_interval(
+                    root, sample, stream, fstep_hours
+                )
+            else:
+                stream_group = root.get(f"{sample}/{resolved_source_stream}")
+                source_path = None
+                if stream_group is not None:
+                    for fstep in _int_keys(stream_group):
+                        candidate_path = (
+                            f"{sample}/{resolved_source_stream}/{fstep}/source"
+                        )
+                        if root.get(candidate_path) is not None:
+                            source_path = candidate_path
+                            break
+                if source_path is None:
+                    raise FileNotFoundError(
+                        f"No source group found for sample {sample} under stream "
+                        f"'{resolved_source_stream}'."
+                    )
 
-            if source_group is None:
-                raise FileNotFoundError(f"Zarr group '{group_path}' not found in {fname_zarr}")
-
-            times_arr = np.asarray(source_group["times"]).astype("datetime64[ns]")
-            source_start = np.min(times_arr)
-            source_end = np.max(times_arr)
+                source_group = root.get(source_path)
+                times_arr = np.asarray(source_group["times"]).astype("datetime64[ns]")
+                source_start = np.min(times_arr)
+                source_end = np.max(times_arr)
 
             _logger.debug(f"Sample {sample}: source_interval=[{source_start} .. {source_end}]")
             source_starts.append(source_start)
@@ -356,7 +469,12 @@ def export_model_outputs(data_type: str, config: OmegaConf, **kwargs) -> None:
             _logger.info(f"RUN {run_id}: Processing rank {rank_label} ({rank_file.name})")
 
             samples = get_samples(samples_cfg, rank_file)
-            source_starts, source_ends = get_source_info(rank_file, stream, samples)
+            source_starts, source_ends = get_source_info(
+                rank_file,
+                stream,
+                samples,
+                fstep_hours=kwargs.get("fstep_hours", 6),
+            )
 
             kwargs["rank_label"] = rank_label
             parser = CfParserFactory.get_parser(config=config, **kwargs)
