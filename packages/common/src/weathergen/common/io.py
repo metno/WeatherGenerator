@@ -532,7 +532,6 @@ class ZarrIO:
 
         if self.forecast_offset == 1:
             return all_steps[1:]  # exclude fstep with no targets/preds
-        else:
         return all_steps
 
     def validate_stream(self, sample: str, stream:str, candidate: zarr.Group) -> bool:
