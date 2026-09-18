@@ -201,10 +201,13 @@ def write_output(
                 batch,
                 batch_idx,
                 batch_size,
+                timestep_idxs,
             )
 
 
-def _write_latent_data_to_zarr(zio, data, cf, batch, batch_idx, batch_size):
+def _write_latent_data_to_zarr(
+    zio, data, cf, batch, batch_idx, batch_size, forecast_steps: list[int]
+):
     """Write latent data directly to zarr store.
 
     This bypasses OutputItem validation which incorrectly requires source datasets
@@ -215,8 +218,17 @@ def _write_latent_data_to_zarr(zio, data, cf, batch, batch_idx, batch_size):
     # Calculate sample start index for this batch
     sample_start = batch_idx * batch_size
 
-    # Iterate over latent data
-    for t_idx, latents_in_step in enumerate(data.latents):
+    if len(data.latents) != len(forecast_steps):
+        raise ValueError(
+            "Latent outputs and forecast steps must have matching lengths: "
+            f"{len(data.latents)} != {len(forecast_steps)}."
+        )
+
+    # Keep the global forecast-step identity when writing incremental chunks.
+    # Latent index 0 is reserved for the initial encoded state, so offset-zero
+    # forecasts are shifted by one while offset-one forecasts retain their index.
+    latent_index_offset = 1 - data.forecast_offset
+    for forecast_step, latents_in_step in zip(data.latents, forecast_steps, strict=True):
         for sample_idx_in_batch, latents_in_sample in enumerate(latents_in_step):
             if not latents_in_sample:
                 continue
@@ -224,8 +236,8 @@ def _write_latent_data_to_zarr(zio, data, cf, batch, batch_idx, batch_size):
             # Calculate global sample index
             global_sample_idx = sample_start + sample_idx_in_batch
 
-            # Reserve latent step 0 for the initial encoded state.
-            group_path = f"{global_sample_idx}/{io.LATENT_STREAM}/{t_idx + 1}"
+            latent_index = forecast_step + latent_index_offset
+            group_path = f"{global_sample_idx}/{io.LATENT_STREAM}/{latent_index}"
 
             npoints = _infer_latent_points_for_metadata(latents_in_sample)
             (
