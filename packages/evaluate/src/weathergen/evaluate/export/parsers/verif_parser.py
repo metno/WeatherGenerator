@@ -17,6 +17,7 @@ from weathergen.evaluate.export.reshape import (
 )
 from weathergen.evaluate.export.verif_interpolator import InterpolatorFactory
 from weathergen.evaluate.utils.derived_channels import compute_mslp, compute_precip
+
 _logger = logging.getLogger(__name__)
 _logger.setLevel(logging.INFO)
 
@@ -102,27 +103,14 @@ class VerifParser(CfParser):
         for result in fstep_iterator_results:
             if result is None:
                 continue
-            # result is already a materialized xarray DataArray (built in the worker).
             if not isinstance(result, xr.DataArray):
                 result = result.as_xarray().squeeze()
-            if "channel" not in result.indexes:
+            if "channel" not in result.dims:
                 result = result.expand_dims("channel")
-                
-            # Get unique valid times
-            unique_times = np.sort(np.unique(result.valid_time.values))
-
-            for vt in unique_times:
-                sub = result.sel(channel=self.channels, valid_time=vt)
-
-                if len(unique_times) > 1:
-                    # Reassign ipoint so that the same spatial point indices are used
-                    # for each unique valid_time
-                    new_ipoint = sub.ipoint.copy(data=np.arange(sub.sizes["ipoint"]))
-                    sub = sub.assign_coords(ipoint=new_ipoint)
-                
-                sub = self.preprocess(sub)
-                sub = self.reshape(sub)
-                da_fs.append(sub)
+            result = result.sel(channel=self.channels)
+            result = self.preprocess(result)
+            result = self.reshape(result)
+            da_fs.append(result)
 
         _logger.info(f"Retrieved {len(da_fs)} forecast steps for type {self.data_type}.")
 
@@ -132,7 +120,21 @@ class VerifParser(CfParser):
                 self.zarr_dt = self.get_zarr_dt(source_interval_start, source_interval_end)
             # check consistency of grid points across forecast steps
             if len(da_fs) > 1:
-                assert np.array_equal(get_grid_points(da_fs[1]), get_grid_points(da_fs[0])), (
+                g0 = get_grid_points(da_fs[0])
+                g1 = get_grid_points(da_fs[1])
+                lat2d = da_fs[0].lat.values
+                print(f"lat constant across valid_time now: {np.all(lat2d == lat2d[:, [0]])}", flush=True)
+                print(f"grid shapes: {g0.shape} {g1.shape}", flush=True)
+                print(f"lat dims: {da_fs[0].lat.dims} {da_fs[0].lat.values.shape}", flush=True)
+                print(f"grid equal: {np.array_equal(g0, g1)}", flush=True)
+                if g0.shape == g1.shape:
+                    diff = ~np.all(g0 == g1, axis=1)
+                    print(f"n differing rows: {diff.sum()} of {g0.shape[0]}", flush=True)
+                    if g0.ndim == 2 and g0.shape[1] == 2:
+                        s0 = g0[np.lexsort((g0[:, 1], g0[:, 0]))]
+                        s1 = g1[np.lexsort((g1[:, 1], g1[:, 0]))]
+                        print(f"same set after re-sort: {np.array_equal(s0, s1)}", flush=True)
+                assert np.array_equal(g1, g0), (
                     "Grid points between forecast steps are not consistent."
                     "Check that inference was not performed with masking"
                 )
@@ -212,54 +214,59 @@ class VerifParser(CfParser):
         xr.Dataset
             Reshaped dataset appropriate for the grid type
         """
-        grid_type = self.grid_type
-
-        # Original logic
         var_dict = find_pl(data.channel.values)
+        n_vt = np.unique(data["valid_time"].values).size
+        n_ipoint = data.sizes["ipoint"]
+        assert n_ipoint % n_vt == 0, (
+            f"ipoint ({n_ipoint}) is not divisible by n valid_time ({n_vt})"
+        )
+        n_points = n_ipoint // n_vt
+
+        extra_dims = [dim for dim in data.dims if dim not in ("ipoint", "channel")]
+
+        def _unflatten(values):
+            arr = np.asarray(values)
+            reshaped = arr.reshape((n_vt, n_points) + arr.shape[1:])
+            return reshaped.transpose(1, 0, *range(2, reshaped.ndim))
+
+        lat_2d = _unflatten(data["lat"].values)
+        lon_2d = _unflatten(data["lon"].values)
+        assert np.all(lat_2d == lat_2d[:, [0]]), "lat varies within a point across valid_time"
+        assert np.all(lon_2d == lon_2d[:, [0]]), "lon varies within a point across valid_time"
+        lat_1d = lat_2d[:, 0]
+        lon_1d = lon_2d[:, 0]
+
+        vt_2d = _unflatten(data["valid_time"].values)
+        assert np.all(vt_2d == vt_2d[[0], :]), "valid_time varies across points within a time"
+        valid_times = vt_2d[0, :]
+
         data_vars = {}
-        # order of appending upoints should be ipoint, pressure_level, mem (if mem exists)
         for new_var, pls in var_dict.items():
-            data_dims = ["ipoint"]
             if pls[0] is not None:
-                data_dims.append("pressure_level")
-                if "mem" in data.dims:
-                    data_dims.append("mem")
                 old_vars = [f"{new_var}_{p}" for p in pls]
+                sel = data.sel(channel=old_vars).values
                 data_vars[new_var] = xr.DataArray(
-                    data.sel(channel=old_vars).values,
-                    dims=data_dims,
+                    _unflatten(sel),
+                    dims=["ncells", "valid_time", "pressure_level", *extra_dims],
                     coords={"pressure_level": pls},
                 )
             else:
-                if "mem" in data.dims:
-                    data_dims.append("mem")
+                sel = data.sel(channel=new_var).values
                 data_vars[new_var] = xr.DataArray(
-                    data.sel(channel=new_var).values,
-                    dims=data_dims,
+                    _unflatten(sel),
+                    dims=["ncells", "valid_time", *extra_dims],
                 )
 
         reshaped_dataset = xr.Dataset(data_vars)
         reshaped_dataset = reshaped_dataset.assign_coords(
-            ipoint=data.coords["ipoint"],
+            ncells=np.arange(n_points),
+            valid_time=("valid_time", valid_times),
+            lat=("ncells", lat_1d),
+            lon=("ncells", lon_1d),
         )
-        # order using pressure_level coord
+
         if "pressure_level" in reshaped_dataset.coords:
             reshaped_dataset = reshaped_dataset.sortby("pressure_level")
-
-        if grid_type == "regular":
-            # Use original reshape logic for regular grids
-            # This is safe for regular grids
-            reshaped_dataset = reshaped_dataset.set_index(
-                ipoint=("valid_time", "lat", "lon")
-            ).unstack("ipoint")
-        else:
-            # Use new logic for Gaussian/unstructured grids
-            reshaped_dataset = reshaped_dataset.set_index(ipoint2=("ipoint", "valid_time")).unstack(
-                "ipoint2"
-            )
-            # rename ipoint to ncells
-            reshaped_dataset = reshaped_dataset.rename_dims({"ipoint": "ncells"})
-            reshaped_dataset = reshaped_dataset.rename_vars({"ipoint": "ncells"})
 
         return reshaped_dataset
 

@@ -172,11 +172,12 @@ def parse_args(args: list) -> argparse.Namespace:
         "--init-time-reference",
         type=str,
         choices=["source_start", "source_end"],
-        default="source_start",
+        default="source_end",
         help="Which end of the source (conditioning) window to use as the forecast "
         "initialisation time written to the output metadata (e.g. GRIB 'date'/'time'). "
-        "'source_start' (default) uses the beginning of the window "
-        "(e.g. 00 UTC for a 00-05 UTC window); 'source_end' uses the end of the window.",
+        "'source_start' uses the beginning of the window "
+        "(e.g. 00 UTC for a 00-05 UTC window); 'source_end' (default) uses the end "
+        "of the window.",
     )
 
     parser.add_argument(
