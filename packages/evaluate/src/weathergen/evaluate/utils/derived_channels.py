@@ -254,7 +254,10 @@ def compute_mslp(obs: xr.DataArray, time: np.datetime64) -> np.typing.NDArray:
 
 
 def compute_precip(
-    obs_data: xr.Dataset, zarr_dt: np.timedelta64, frt: np.datetime64
+    obs_data: xr.Dataset,
+    zarr_dt: np.timedelta64,
+    frt: np.datetime64,
+    obs_name: str = "precipitation_amount_1h",
 ) -> np.typing.NDArray:
     """
     Compute accumulated precipitation over the forecast time step.
@@ -274,14 +277,12 @@ def compute_precip(
     obs_dt = obs_dt.astype("timedelta64[h]")
 
     if obs_dt >= zarr_dt:
-        return obs_data["precipitation_amount_1h"].values
+        return obs_data[obs_name].sel(time=frt).squeeze().values
     else:
         accumulate = np.zeros(obs_data.location.shape[0])
         int_factor = int(zarr_dt / obs_dt)
 
         for i in range(int_factor):
             back_time = frt - zarr_dt + (i + 1) * obs_dt
-            accumulate += (
-                obs_data.data_vars["precipitation_amount_1h"].sel(time=back_time).squeeze()
-            )
+            accumulate += obs_data.data_vars[obs_name].sel(time=back_time).squeeze().values
         return accumulate

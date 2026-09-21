@@ -68,7 +68,7 @@ class VerifParser(CfParser):
         lat, lon, _ = get_obs_coordinates(self.obs)
         self.obs_coords = np.column_stack((lat.values, lon.values))
         self.zarr_coords = None
-        obs_data_channels = ["10u", "10v", "sp", "2t", "msl", "tp"]
+        obs_data_channels = ["10u", "10v", "10si", "sp", "2t", "msl", "tp", "2r"]
         self.channels = list(set(self.channels) & set(obs_data_channels))
         self.zarr_dt: np.timedelta64 | None = None
 
@@ -294,7 +294,9 @@ class VerifParser(CfParser):
             if verif_var == "mslp":
                 obs_dataarray[:, i, :] = compute_mslp(obs_data, valid_time)
             elif verif_var == "tp":
-                obs_dataarray[:, i, :] = compute_precip(obs_data, self.zarr_dt, valid_time)
+                obs_dataarray[:, i, :] = compute_precip(
+                    obs_data, self.zarr_dt, valid_time, obs_name
+                )
             else:
                 obs_dataarray[:, i, :] = obs_data.data_vars[obs_name].sel(time=valid_time)
 
