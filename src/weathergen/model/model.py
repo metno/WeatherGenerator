@@ -739,6 +739,12 @@ class Model(torch.nn.Module):
         global_steps = source_samples.get_output_idxs()
         forecast_offset = global_steps[0]
 
+        # recover batch dimension and separate input_steps
+        #shape = (len(batch), batch.get_num_source_steps(), *tokens.shape[1:])
+        # collapse along input step dimension
+        #tokens = tokens.reshape(shape).sum(axis=1)
+        #output.initial_latent = self.tokens_to_latent_state(self.latent_pre_norm(tokens), tokens)
+
         output = ModelOutput(forecast_steps, forecast_offset, source_samples)
 
         # Allow for pushforward trick
