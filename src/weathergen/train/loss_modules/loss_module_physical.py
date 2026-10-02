@@ -132,6 +132,12 @@ class LossPhysical(LossModuleBase):
                     },
                 ]
             )
+        fft_crps_params = loss_fcts.get("global_fft_crps") or {}
+        self.global_fft_crps_params = {
+            key: value
+            for key, value in fft_crps_params.items()
+            if key not in {"weight", "template_path"}
+        }
 
         self.dynamic_loss_ema = DynamicLossEMA(
             self.dynamic_loss_cfg if self.stage == TRAIN else None,
@@ -285,6 +291,46 @@ class LossPhysical(LossModuleBase):
             level_start=level_start,
         )
 
+    @staticmethod
+    def _loss_global_fft_crps(
+        target,
+        pred,
+        target_coords_raw,
+        substep_masks,
+        weights_channels,
+        *,
+        template_path,
+        stream_name,
+        alpha=1.0,
+        cutoff_ratio=1.0,
+    ):
+        target_coords_raw = target_coords_raw.to(target.device)
+        substep_losses = []
+        substep_losses_chs = []
+        for mask in substep_masks:
+            if not mask.any():
+                continue
+            loss, loss_chs = loss_fns.global_fft_crps(
+                target[mask],
+                pred[:, mask],
+                target_coords_raw[mask],
+                weights_channels=weights_channels,
+                weights_points=None,
+                template_path=template_path,
+                alpha=alpha,
+                cutoff_ratio=cutoff_ratio,
+                stream_name=stream_name,
+            )
+            substep_losses.append(loss)
+            substep_losses_chs.append(loss_chs)
+
+        if not substep_losses:
+            return (
+                torch.tensor(0.0, device=target.device, requires_grad=True),
+                torch.zeros(target.shape[-1], device=target.device),
+            )
+        return torch.stack(substep_losses).mean(), torch.stack(substep_losses_chs).mean(0)
+
     def compute_loss(self, preds: dict, targets: dict, metadata) -> LossValues:
         """
         Computes the total loss for a given batch of predictions and corresponding
@@ -430,7 +476,7 @@ class LossPhysical(LossModuleBase):
                         # loss_lfct: loss for given loss function aggregated over all channels
                         # loss_lfct_chs: loss for given loss function per channel
 
-                        # ---- dispatch: custom (Haar wavelet) loss vs standard path ----
+                        # ---- dispatch: custom (Haar wavelet / FFT CRPS) loss vs standard path ----
 
                         if loss_fct_name == "global_haar_wavelet_reshape_varweighted":
                             # Per-stream overrides: any key in the stream config's
@@ -455,6 +501,18 @@ class LossPhysical(LossModuleBase):
                                 template_path=stream_info.get("template_path", ""),
                                 regrid_method=_regrid,
                                 **_ov,
+                            )
+
+                        elif loss_fct_name == "global_fft_crps":
+                            loss_lfct, loss_lfct_chs = self._loss_global_fft_crps(
+                                target,
+                                pred,
+                                targets_coords_batch[target_idx],
+                                substep_masks,
+                                weights_channels,
+                                template_path=stream_info.get("template_path", ""),
+                                stream_name=stream_name,
+                                **self.global_fft_crps_params,
                             )
 
                         else:
