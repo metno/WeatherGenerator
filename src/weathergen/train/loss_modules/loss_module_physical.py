@@ -120,6 +120,12 @@ class LossPhysical(LossModuleBase):
             for name, params in loss_fcts.items()
             if name != "dynamic_loss"
         ]
+        fft_crps_params = loss_fcts.get("global_fft_crps") or {}
+        self.global_fft_crps_params = {
+            key: value
+            for key, value in fft_crps_params.items()
+            if key not in {"weight", "template_path"}
+        }
 
         self.dynamic_loss_ema = DynamicLossEMA(
             self.dynamic_loss_cfg if self.stage == TRAIN else None,
@@ -237,6 +243,46 @@ class LossPhysical(LossModuleBase):
         loss_lfct = loss_lfct / (ctr_substeps if ctr_substeps > 0 else 1.0)
 
         return loss_lfct, losses_chs
+
+    @staticmethod
+    def _loss_global_fft_crps(
+        target,
+        pred,
+        target_coords_raw,
+        substep_masks,
+        weights_channels,
+        *,
+        template_path,
+        stream_name,
+        alpha=1.0,
+        cutoff_ratio=1.0,
+    ):
+        target_coords_raw = target_coords_raw.to(target.device)
+        substep_losses = []
+        substep_losses_chs = []
+        for mask in substep_masks:
+            if not mask.any():
+                continue
+            loss, loss_chs = loss_fns.global_fft_crps(
+                target[mask],
+                pred[:, mask],
+                target_coords_raw[mask],
+                weights_channels=weights_channels,
+                weights_points=None,
+                template_path=template_path,
+                alpha=alpha,
+                cutoff_ratio=cutoff_ratio,
+                stream_name=stream_name,
+            )
+            substep_losses.append(loss)
+            substep_losses_chs.append(loss_chs)
+
+        if not substep_losses:
+            return (
+                torch.tensor(0.0, device=target.device, requires_grad=True),
+                torch.zeros(target.shape[-1], device=target.device),
+            )
+        return torch.stack(substep_losses).mean(), torch.stack(substep_losses_chs).mean(0)
 
     def compute_loss(self, preds: dict, targets: dict, metadata) -> LossValues:
         """
@@ -382,14 +428,26 @@ class LossPhysical(LossModuleBase):
                         )
                         # loss_lfct: loss for given loss function aggregated over all channels
                         # loss_lfct_chs: loss for given loss function per channel
-                        loss_lfct, loss_lfct_chs = self._loss_per_loss_function(
-                            loss_fct,
-                            target,
-                            pred,
-                            substep_masks,
-                            weights_channels,
-                            weights_locations,
-                        )
+                        if loss_fct_name == "global_fft_crps":
+                            loss_lfct, loss_lfct_chs = self._loss_global_fft_crps(
+                                target,
+                                pred,
+                                targets_coords_batch[target_idx],
+                                substep_masks,
+                                weights_channels,
+                                template_path=stream_info.get("template_path", ""),
+                                stream_name=stream_name,
+                                **self.global_fft_crps_params,
+                            )
+                        else:
+                            loss_lfct, loss_lfct_chs = self._loss_per_loss_function(
+                                loss_fct,
+                                target,
+                                pred,
+                                substep_masks,
+                                weights_channels,
+                                weights_locations,
+                            )
 
                         for ch_n, v in zip(target_channels, loss_lfct_chs, strict=True):
                             losses_all[stream_name][str(timestep_idx)][loss_fct_name][ch_n] = (
