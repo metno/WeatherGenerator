@@ -75,6 +75,7 @@ def kernel_crps(
     weights_channels: torch.Tensor | None,
     weights_points: torch.Tensor | None,
     fair=True,
+    alpha: float | None = None,
 ):
     """
     Compute kernel CRPS
@@ -84,6 +85,8 @@ def kernel_crps(
     pred : shape ( ens_dim , num_data_points , num_channels)
     weights_channels : shape = (num_channels,)
     weights_points : shape = (num_data_points)
+    alpha : optional interpolation from classical (0) to fair (1) CRPS.
+        When supplied, this takes precedence over ``fair``.
 
     Returns:
     loss: scalar - overall weighted CRPS
@@ -105,7 +108,13 @@ def kernel_crps(
 
     mae = torch.mean(torch.abs(targets[..., None] - preds), dim=-1)
 
-    ens_n = -1.0 / (ens_size * (ens_size - 1)) if fair else -1.0 / (ens_size**2)
+    if alpha is None:
+        spread_weight = 1.0 / (ens_size * (ens_size - 1)) if fair else 1.0 / (ens_size**2)
+    else:
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError(f"alpha must be in [0, 1], got {alpha}")
+        spread_weight = alpha / (ens_size * (ens_size - 1)) + (1 - alpha) / ens_size**2
+    ens_n = -spread_weight
     abs = torch.abs
     ens_var = torch.zeros(size=preds.shape[:-1], device=preds.device)
     # loop to reduce memory usage
@@ -147,7 +156,14 @@ def crps_kernel_pointwise(
 
 
 @lru_cache(maxsize=8)
-def _load_fft_crps_template(template_path: str) -> tuple[np.ndarray, tuple[int, int]]:
+def _load_fft_crps_template(
+    template_path: str, grid_mode: str = "regular_latlon"
+) -> tuple[np.typing.NDArray, tuple[int, int]]:
+    if grid_mode not in {"regular_latlon", "structured_projected"}:
+        raise ValueError(
+            f"grid_mode must be 'regular_latlon' or 'structured_projected', got {grid_mode!r}."
+        )
+
     if template_path.endswith(".npz"):
         with np.load(template_path) as template:
             lat = template["lat"].flatten()
@@ -167,27 +183,30 @@ def _load_fft_crps_template(template_path: str) -> tuple[np.ndarray, tuple[int, 
     if not np.isfinite(grid).all():
         raise ValueError("Template latitude/longitude coordinates must be finite.")
 
-    lat_grid = lat.reshape(ny, nx)
-    lon_grid = lon.reshape(ny, nx)
-    lat_axis = lat_grid[:, 0]
-    lon_axis = lon_grid[0, :]
-    lat_spacing = np.diff(lat_axis)
-    lon_spacing = np.diff(lon_axis)
-    if (
-        not np.allclose(lat_grid, lat_axis[:, None], rtol=0.0, atol=1e-6)
-        or not np.allclose(lon_grid, lon_axis[None, :], rtol=0.0, atol=1e-6)
-        or not np.allclose(lat_spacing, lat_spacing[0], rtol=1e-5, atol=1e-8)
-        or not np.allclose(lon_spacing, lon_spacing[0], rtol=1e-5, atol=1e-8)
-        or lat_spacing[0] == 0
-        or lon_spacing[0] == 0
-    ):
-        raise ValueError(
-            "FFT CRPS requires a uniformly spaced rectilinear latitude/longitude grid."
-        )
+    if grid_mode == "regular_latlon":
+        lat_grid = lat.reshape(ny, nx)
+        lon_grid = lon.reshape(ny, nx)
+        lat_axis = lat_grid[:, 0]
+        lon_axis = lon_grid[0, :]
+        lat_spacing = np.diff(lat_axis)
+        lon_spacing = np.diff(lon_axis)
+        if (
+            not np.allclose(lat_grid, lat_axis[:, None], rtol=0.0, atol=1e-6)
+            or not np.allclose(lon_grid, lon_axis[None, :], rtol=0.0, atol=1e-6)
+            or not np.allclose(lat_spacing, lat_spacing[0], rtol=1e-5, atol=1e-8)
+            or not np.allclose(lon_spacing, lon_spacing[0], rtol=1e-5, atol=1e-8)
+            or lat_spacing[0] == 0
+            or lon_spacing[0] == 0
+        ):
+            raise ValueError(
+                "FFT CRPS requires a uniformly spaced rectilinear latitude/longitude grid."
+            )
     return grid, (ny, nx)
 
 
-def _template_point_order(template_grid: np.ndarray, source_points: np.ndarray) -> np.ndarray:
+def _template_point_order(
+    template_grid: np.typing.NDArray, source_points: np.typing.NDArray
+) -> np.typing.NDArray:
     """Return source indices in template order, requiring an exact grid match."""
     if source_points.shape != template_grid.shape:
         raise ValueError(
@@ -221,12 +240,16 @@ def global_fft_crps(
     alpha: float = 1.0,
     cutoff_ratio: float = 1.0,
     stream_name: str = "",
+    grid_mode: str = "regular_latlon",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute spectral CRPS on a complete, regular rectangular grid.
+    """Compute spectral CRPS on a complete rectangular grid.
 
     Source points may be flattened or reordered, but must match every template
-    cell exactly once. Irregular point clouds are rejected; no interpolation is
-    performed.
+    cell exactly once. ``regular_latlon`` validates a uniformly spaced
+    rectilinear latitude/longitude grid. ``structured_projected`` uses the
+    template's 2D cell order and assumes uniform spacing in the native projected
+    coordinates; those projected coordinates are not available for validation.
+    No interpolation is performed.
 
     ``weights_points`` is accepted for loss-function API compatibility. Spatial
     point weights are not applied because a Fourier coefficient depends on the
@@ -248,7 +271,7 @@ def global_fft_crps(
         raise ValueError(f"global_fft_crps for stream {stream_name!r} requires template_path.")
 
     try:
-        template_grid, (ny, nx) = _load_fft_crps_template(template_path)
+        template_grid, (ny, nx) = _load_fft_crps_template(template_path, grid_mode)
     except (OSError, KeyError, AttributeError, ValueError) as exc:
         raise ValueError(
             f"Could not load FFT CRPS template {template_path!r} for stream {stream_name!r}: {exc}"
@@ -260,9 +283,7 @@ def global_fft_crps(
     grid_order = _template_point_order(template_grid, coords)
     grid_order = torch.as_tensor(grid_order, device=target.device, dtype=torch.long)
     target_grid_data = target[grid_order].float().reshape(ny, nx, target.shape[-1])
-    pred_grid_data = pred[:, grid_order, :].float().reshape(
-        pred.shape[0], ny, nx, target.shape[-1]
-    )
+    pred_grid_data = pred[:, grid_order, :].float().reshape(pred.shape[0], ny, nx, target.shape[-1])
     valid_grid = torch.isfinite(target_grid_data) & torch.isfinite(pred_grid_data).all(dim=0)
 
     loss_chs = torch.zeros(target.shape[-1], dtype=torch.float32, device=target.device)
@@ -277,9 +298,7 @@ def global_fft_crps(
             continue
 
         target_grid = target_grid_data[..., channel].masked_fill(~channel_valid, 0.0)
-        pred_grid = pred_grid_data[..., channel].masked_fill(
-            ~channel_valid.unsqueeze(0), 0.0
-        )
+        pred_grid = pred_grid_data[..., channel].masked_fill(~channel_valid.unsqueeze(0), 0.0)
 
         target_fft = torch.fft.fft2(target_grid)
         pred_fft = torch.fft.fft2(pred_grid)

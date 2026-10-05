@@ -12,6 +12,7 @@
 
 import logging
 from collections import defaultdict
+from functools import partial
 
 import numpy as np
 import torch
@@ -111,20 +112,23 @@ class LossPhysical(LossModuleBase):
         self.forecast_offset = self.mode_cfg.forecast.offset
 
         # dynamically load loss functions based on configuration and stage
-        self.loss_fcts = [
-            [
-                getattr(loss_fns, name),
-                params.get("weight", 1.0),
-                name,
-            ]
-            for name, params in loss_fcts.items()
-            if name != "dynamic_loss"
-        ]
+        self.loss_fcts = []
+        self.loss_stream_names: dict[str, set[str]] = {}
+        for name, params in loss_fcts.items():
+            if name == "dynamic_loss":
+                continue
+            loss_fct = getattr(loss_fns, name)
+            if name == "kernel_crps" and "alpha" in params:
+                loss_fct = partial(loss_fct, alpha=params["alpha"])
+            self.loss_fcts.append([loss_fct, params.get("weight", 1.0), name])
+            if "stream_names" in params:
+                self.loss_stream_names[name] = set(params.get("stream_names", []))
+
         fft_crps_params = loss_fcts.get("global_fft_crps") or {}
         self.global_fft_crps_params = {
             key: value
             for key, value in fft_crps_params.items()
-            if key not in {"weight", "template_path"}
+            if key not in {"weight", "template_path", "stream_names"}
         }
 
         self.dynamic_loss_ema = DynamicLossEMA(
@@ -168,6 +172,11 @@ class LossPhysical(LossModuleBase):
             )
 
         return stream_info_loss_weight, weights_channels
+
+    def _loss_is_enabled_for_stream(self, loss_fct_name: str, stream_name: str) -> bool:
+        return loss_fct_name not in self.loss_stream_names or (
+            stream_name in self.loss_stream_names[loss_fct_name]
+        )
 
     def _get_output_step_weights(self, len_forecast_steps):
         timestep_weight_config = self.mode_cfg.get("forecast", {}).get("timestep_weight", {})
@@ -256,6 +265,7 @@ class LossPhysical(LossModuleBase):
         stream_name,
         alpha=1.0,
         cutoff_ratio=1.0,
+        grid_mode="regular_latlon",
     ):
         target_coords_raw = target_coords_raw.to(target.device)
         substep_losses = []
@@ -273,6 +283,7 @@ class LossPhysical(LossModuleBase):
                 alpha=alpha,
                 cutoff_ratio=cutoff_ratio,
                 stream_name=stream_name,
+                grid_mode=grid_mode,
             )
             substep_losses.append(loss)
             substep_losses_chs.append(loss_chs)
@@ -406,6 +417,8 @@ class LossPhysical(LossModuleBase):
                     for loss_fct, loss_fct_weight, loss_fct_name in self.loss_fcts:
                         # skip is loss is not computed for this sample
                         if loss_fct_name not in pred_params.global_params["loss"]:
+                            continue
+                        if not self._loss_is_enabled_for_stream(loss_fct_name, stream_name):
                             continue
 
                         # spoofed inputs are masked in the output calculations
