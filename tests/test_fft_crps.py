@@ -1,13 +1,17 @@
-"""Tests for spectral CRPS on complete regular grids."""
+"""Tests for spectral CRPS on structured grids."""
 
 import numpy as np
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from weathergen.train.loss_modules.loss_functions import (
     crps_kernel_pointwise,
     global_fft_crps,
+    kernel_crps,
 )
+from weathergen.train.loss_modules.loss_module_physical import LossPhysical
+from weathergen.train.utils import TRAIN
 
 
 def _write_template(path, n_side=4):
@@ -30,6 +34,47 @@ def test_crps_kernel_alpha_interpolates_classical_and_fair():
 
     assert torch.allclose(classical, torch.tensor([0.5]))
     assert torch.allclose(fair, torch.tensor([0.0]))
+
+
+def test_kernel_crps_alpha_interpolates_classical_and_fair():
+    target = torch.tensor([[0.0]])
+    preds = torch.tensor([[[0.0]], [[2.0]]])
+
+    classical, _ = kernel_crps(target, preds, None, None, fair=False)
+    fair, _ = kernel_crps(target, preds, None, None, fair=True)
+    almost_fair, _ = kernel_crps(target, preds, None, None, alpha=0.99)
+
+    assert torch.allclose(classical, torch.tensor(0.5))
+    assert torch.allclose(fair, torch.tensor(0.0))
+    assert torch.allclose(almost_fair, torch.tensor(0.005), atol=1e-7)
+
+
+def test_physical_loss_configures_alpha_and_stream_scoping():
+    loss_module = LossPhysical(
+        cf=OmegaConf.create({"streams": {}}),
+        mode_cfg=OmegaConf.create({"forecast": {"offset": 0}}),
+        stage=TRAIN,
+        device="cpu",
+        global_fft_crps={
+            "weight": 1.0,
+            "alpha": 0.99,
+            "grid_mode": "structured_projected",
+            "stream_names": ["MEPS"],
+        },
+        kernel_crps={"weight": 1.0, "alpha": 0.99},
+    )
+
+    assert loss_module._loss_is_enabled_for_stream("global_fft_crps", "MEPS")
+    assert not loss_module._loss_is_enabled_for_stream("global_fft_crps", "ERA55")
+    assert loss_module._loss_is_enabled_for_stream("kernel_crps", "MEPS")
+    assert loss_module._loss_is_enabled_for_stream("kernel_crps", "ERA55")
+    assert loss_module.global_fft_crps_params == {
+        "alpha": 0.99,
+        "grid_mode": "structured_projected",
+    }
+    kernel = next(fn for fn, _, name in loss_module.loss_fcts if name == "kernel_crps")
+    loss, _ = kernel(torch.tensor([[0.0]]), torch.tensor([[[0.0]], [[2.0]]]), None, None)
+    assert torch.allclose(loss, torch.tensor(0.005), atol=1e-7)
 
 
 def test_global_fft_crps_zero_for_identical_ensemble_and_target(tmp_path):
@@ -99,6 +144,49 @@ def test_global_fft_crps_reorders_shuffled_regular_grid_points(tmp_path):
     )
 
     assert torch.allclose(loss_ordered, loss_shuffled, atol=1e-7)
+
+
+def test_global_fft_crps_accepts_structured_projected_template(tmp_path):
+    template_path = tmp_path / "curvilinear-grid.npz"
+    lat, lon = np.meshgrid(
+        np.linspace(40.0, 44.0, 4),
+        np.linspace(5.0, 9.0, 4),
+        indexing="ij",
+    )
+    lat = lat + 0.01 * lon
+    lon = lon + 0.01 * lat
+    np.savez(
+        template_path,
+        lat=lat.ravel(),
+        lon=lon.ravel(),
+        ny=4,
+        nx=4,
+    )
+    coords = torch.from_numpy(np.stack((lat.ravel(), lon.ravel()), axis=1))
+    target = torch.arange(16, dtype=torch.float32).reshape(16, 1)
+    pred = target.unsqueeze(0).repeat(2, 1, 1)
+
+    with pytest.raises(ValueError, match="uniformly spaced rectilinear"):
+        global_fft_crps(
+            target,
+            pred,
+            coords,
+            weights_channels=None,
+            weights_points=None,
+            template_path=str(template_path),
+        )
+
+    loss, _ = global_fft_crps(
+        target,
+        pred,
+        coords,
+        weights_channels=None,
+        weights_points=None,
+        template_path=str(template_path),
+        grid_mode="structured_projected",
+    )
+
+    assert torch.isfinite(loss)
 
 
 def test_global_fft_crps_rejects_incomplete_grid(tmp_path):
