@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 
 stat_loss_fcts = ["stats", "kernel_crps"]  # Names of loss functions that need std computed
+_FFT_COORD_TOLERANCE = 2e-5
 
 
 def gaussian(x, mu=0.0, std_dev=1.0):
@@ -207,19 +208,19 @@ def _load_fft_crps_template(
 def _template_point_order(
     template_grid: np.typing.NDArray, source_points: np.typing.NDArray
 ) -> np.typing.NDArray:
-    """Return source indices in template order, requiring an exact grid match."""
+    """Return source indices in template order, allowing for float32 coordinate rounding."""
     if source_points.shape != template_grid.shape:
         raise ValueError(
             "FFT CRPS only supports complete rectangular grids: source points must "
             "match the template point count."
         )
-    if np.allclose(source_points, template_grid, rtol=0.0, atol=1e-5):
+    if np.allclose(source_points, template_grid, rtol=0.0, atol=_FFT_COORD_TOLERANCE):
         return np.arange(source_points.shape[0])
 
     from scipy.spatial import cKDTree
 
     distances, cells = cKDTree(template_grid).query(source_points)
-    if np.any(distances > 1e-5) or np.unique(cells).size != template_grid.shape[0]:
+    if np.any(distances > _FFT_COORD_TOLERANCE) or np.unique(cells).size != template_grid.shape[0]:
         raise ValueError(
             "FFT CRPS only supports complete rectangular grids: each source point "
             "must match exactly one template cell."
