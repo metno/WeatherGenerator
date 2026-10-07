@@ -212,7 +212,8 @@ def _template_point_order(
     if source_points.shape != template_grid.shape:
         raise ValueError(
             "FFT CRPS only supports complete rectangular grids: source points must "
-            "match the template point count."
+            f"match the template point count (got {source_points.shape[0]}, "
+            f"expected {template_grid.shape[0]})."
         )
     if np.allclose(source_points, template_grid, rtol=0.0, atol=_FFT_COORD_TOLERANCE):
         return np.arange(source_points.shape[0])

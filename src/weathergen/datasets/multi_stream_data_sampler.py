@@ -33,6 +33,9 @@ from weathergen.datasets.utils import (
     get_tokens_lens,
 )
 from weathergen.readers_extra.registry import get_extra_reader
+from weathergen.train.loss_modules.loss_functions import (
+    _load_fft_crps_template,
+)
 from weathergen.train.utils import Stage, get_batch_size_from_config
 from weathergen.utils.distributed import is_root
 
@@ -40,6 +43,41 @@ type AnyDataReader = DataReaderBase | DataReaderAnemoi | DataReaderObs
 type StreamName = str
 
 logger = logging.getLogger(__name__)
+
+
+def _load_fft_crps_point_counts(mode_cfg, streams) -> dict[str, int]:
+    templates = {}
+    for loss_module_config in mode_cfg.get("losses", {}).values():
+        fft_config = loss_module_config.get("loss_fcts", {}).get("global_fft_crps")
+        if fft_config is None:
+            continue
+
+        stream_names = fft_config.get("stream_names")
+        if stream_names is None:
+            stream_names = list(streams)
+
+        for stream_name in stream_names:
+            stream_info = streams[stream_name]
+            template_path = stream_info.get("template_path")
+            if not template_path:
+                raise ValueError(
+                    f"global_fft_crps uses stream {stream_name!r}, but it has no template_path."
+                )
+
+            template_grid, _ = _load_fft_crps_template(
+                str(template_path), fft_config.get("grid_mode", "regular_latlon")
+            )
+            existing_template = templates.get(stream_name)
+            if existing_template is not None and not np.array_equal(
+                existing_template, template_grid
+            ):
+                raise ValueError(
+                    f"Conflicting FFT CRPS templates configured for stream {stream_name!r}."
+                )
+            templates[stream_name] = template_grid
+
+    return {stream_name: template.shape[0] for stream_name, template in templates.items()}
+
 
 FORECAST_DEFAULTS = {
     "offset": 0,
@@ -120,6 +158,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         # initialise fsm, but can change for future mini_epochs
         self.batch_size = get_batch_size_from_config(mode_cfg)
         self.shuffle = mode_cfg.shuffle
+        self.fft_crps_point_counts = _load_fft_crps_point_counts(mode_cfg, cf.streams)
 
         self.len_timedelta = mode_cfg.time_window_len
         self.step_timedelta = mode_cfg.time_window_step
@@ -216,6 +255,113 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         perms_len -= (fsm + self.output_offset) * (self.time_step // self.step_timedelta)
 
         return np.arange(self.max_input_steps, perms_len)
+
+    def _fft_grid_issue(self, batch: ModelBatch) -> str | None:
+        for sample in batch.target_samples.samples:
+            for stream_name, expected_points in self.fft_crps_point_counts.items():
+                stream_data = sample.streams_data.get(stream_name)
+                if stream_data is None:
+                    continue
+
+                stream_info = self.streams_datasets[stream_name].info
+                tokenize_spacetime = stream_info.get("tokenize_spacetime", False)
+                for step in batch.target_samples.output_idxs:
+                    if step >= len(stream_data.target_coords_raw):
+                        raise ValueError(
+                            f"Missing target coordinates for FFT CRPS stream {stream_name!r} "
+                            f"at forecast step {step}."
+                        )
+                    coords_tensor = stream_data.target_coords_raw[step]
+                    if not isinstance(coords_tensor, torch.Tensor):
+                        if len(coords_tensor) == 0:
+                            return (
+                                f"FFT CRPS stream {stream_name!r}, sample "
+                                f"{stream_data.sample_idx}, step {step}: got 0 points, "
+                                f"expected {expected_points}; skipping this sample."
+                            )
+                        raise TypeError(
+                            f"Expected tensor coordinates for FFT CRPS stream {stream_name!r}."
+                        )
+                    if coords_tensor.numel() == 0:
+                        if coords_tensor.ndim == 2 and coords_tensor.shape[1] == 2:
+                            return (
+                                f"FFT CRPS stream {stream_name!r}, sample "
+                                f"{stream_data.sample_idx}, step {step}: got 0 points, "
+                                f"expected {expected_points}; skipping this sample."
+                            )
+                        return (
+                            f"FFT CRPS stream {stream_name!r}, sample "
+                            f"{stream_data.sample_idx}, step {step}: got 0 points, "
+                            f"expected {expected_points}; skipping this sample."
+                        )
+
+                    coords = coords_tensor.detach().cpu().numpy()
+                    times = stream_data.target_times_raw[step]
+                    if isinstance(times, torch.Tensor):
+                        times = times.detach().cpu().numpy()
+                    else:
+                        times = np.asarray(times)
+
+                    if times.size not in (0, coords.shape[0]):
+                        return (
+                            f"FFT CRPS stream {stream_name!r}, sample "
+                            f"{stream_data.sample_idx}, step {step}: got {coords.shape[0]} "
+                            f"coordinates but {times.size} timestamps."
+                        )
+                    if times.size == 0:
+                        continue
+
+                    target_values = stream_data.target_tokens[step]
+                    if not isinstance(target_values, torch.Tensor):
+                        raise TypeError(
+                            f"Expected tensor targets for FFT CRPS stream {stream_name!r}."
+                        )
+                    if target_values.ndim != 2 or target_values.shape[0] != coords.shape[0]:
+                        return (
+                            f"FFT CRPS stream {stream_name!r}, sample "
+                            f"{stream_data.sample_idx}, step {step}: got {coords.shape[0]} "
+                            f"coordinates and target shape {tuple(target_values.shape)}; "
+                            "skipping this sample."
+                        )
+
+                    if tokenize_spacetime and times.size:
+                        time_groups = [
+                            (str(time), coords[times == time], times == time)
+                            for time in np.unique(times)
+                        ]
+                    else:
+                        time_label = ", ".join(str(time) for time in np.unique(times))
+                        time_groups = [
+                            (time_label or "unknown", coords, np.ones(len(coords), bool))
+                        ]
+
+                    for time_label, source_points, time_mask in time_groups:
+                        if source_points.shape[0] != expected_points:
+                            return (
+                                f"FFT CRPS stream {stream_name!r}, sample "
+                                f"{stream_data.sample_idx}, step {step}, time {time_label}: "
+                                f"got {source_points.shape[0]} points, expected "
+                                f"{expected_points}; "
+                                "skipping this sample."
+                            )
+                        if not np.isfinite(source_points).all():
+                            return (
+                                f"FFT CRPS stream {stream_name!r}, sample "
+                                f"{stream_data.sample_idx}, step {step}, time {time_label}: "
+                                "coordinates contain non-finite values; skipping this sample."
+                            )
+                        target_time_mask = torch.as_tensor(time_mask, dtype=torch.bool)
+                        target_values_at_time = target_values[target_time_mask]
+                        if not torch.isfinite(target_values_at_time).all():
+                            n_nonfinite = (~torch.isfinite(target_values_at_time)).sum().item()
+                            return (
+                                f"FFT CRPS stream {stream_name!r}, sample "
+                                f"{stream_data.sample_idx}, step {step}, time {time_label}: "
+                                f"found {n_nonfinite} non-finite target values; "
+                                "skipping this sample."
+                            )
+
+        return None
 
     def _init_stream_datasets(self, cf) -> dict[StreamName, _Stream]:
         """Load dataset readers for all streams from config."""
@@ -779,6 +925,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             # num_forecast_steps needs to be constant per batch
             # (amortized through data parallel training)
             num_forecast_steps = perms_num_forecast_steps[i]
+            fft_grid_skips = 0
 
             # use while loop due to the scattered nature of the data in time and to
             # ensure batches are not empty
@@ -787,6 +934,16 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 idx_raw += 1
 
                 batch = self._get_batch(idx, num_forecast_steps)
+                fft_grid_issue = self._fft_grid_issue(batch)
+                if fft_grid_issue is not None:
+                    fft_grid_skips += 1
+                    logger.warning("Skipping incomplete FFT CRPS sample: %s", fft_grid_issue)
+                    if fft_grid_skips >= len(perms):
+                        raise ValueError(
+                            "Could not find a complete FFT CRPS grid after checking "
+                            f"{fft_grid_skips} samples. Last issue: {fft_grid_issue}"
+                        )
+                    continue
 
                 # ensure the batch is valid, i.e. not completely empty and no NaN values
                 # student teacher has no classical targets
