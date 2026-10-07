@@ -146,6 +146,25 @@ def test_global_fft_crps_reorders_shuffled_regular_grid_points(tmp_path):
     assert torch.allclose(loss_ordered, loss_shuffled, atol=1e-7)
 
 
+def test_global_fft_crps_accepts_float32_coordinate_rounding(tmp_path):
+    template_path = tmp_path / "grid.npz"
+    coords = _write_template(template_path)
+    coords[0, 0] += 1.1e-5
+    target = torch.arange(16, dtype=torch.float32).reshape(16, 1)
+    pred = target.unsqueeze(0).repeat(2, 1, 1)
+
+    loss, _ = global_fft_crps(
+        target,
+        pred,
+        coords,
+        weights_channels=None,
+        weights_points=None,
+        template_path=str(template_path),
+    )
+
+    assert torch.isfinite(loss)
+
+
 def test_global_fft_crps_accepts_structured_projected_template(tmp_path):
     template_path = tmp_path / "curvilinear-grid.npz"
     lat, lon = np.meshgrid(
