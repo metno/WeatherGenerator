@@ -214,7 +214,10 @@ def test_global_fft_crps_rejects_incomplete_grid(tmp_path):
     target = torch.zeros(15, 1)
     pred = torch.zeros(2, 15, 1)
 
-    with pytest.raises(ValueError, match="complete rectangular grids"):
+    with pytest.raises(
+        ValueError,
+        match=r"complete rectangular grids.*got 15, expected 16",
+    ):
         global_fft_crps(
             target,
             pred,
