@@ -94,7 +94,7 @@ class MultiSelfAttentionHeadVarlen(torch.nn.Module):
         s = [x.shape[0], self.num_heads, x.shape[-1] // self.num_heads]
         qs = self.lnorm_q(self.proj_heads_q(x).reshape(s)).to(self.dtype)
         ks = self.lnorm_k(self.proj_heads_k(x).reshape(s)).to(self.dtype)
-        vs = self.proj_heads_v(x).reshape(s)
+        vs = self.proj_heads_v(x).reshape(s).to(self.dtype)
 
         if self.with_2d_rope:
             if coords is None:
@@ -118,7 +118,7 @@ class MultiSelfAttentionHeadVarlen(torch.nn.Module):
             dropout_p=dropout_rate,
         )
 
-        out = self.proj_out(outs.flatten(-2, -1))
+        out = self.proj_out(outs.flatten(-2, -1).to(x.dtype))
 
         if self.with_residual:
             out = out + x_in
@@ -196,11 +196,11 @@ class MultiSelfAttentionHeadVarlenFlex(torch.nn.Module):
         s = [x.shape[0], 1, self.num_heads, -1]
         qs = self.lnorm_q(self.proj_heads_q(x).reshape(s)).to(self.dtype).permute([1, 2, 0, 3])
         ks = self.lnorm_k(self.proj_heads_k(x).reshape(s)).to(self.dtype).permute([1, 2, 0, 3])
-        vs = self.proj_heads_v(x).reshape(s).permute([1, 2, 0, 3])
+        vs = self.proj_heads_v(x).reshape(s).to(self.dtype).permute([1, 2, 0, 3])
 
         outs = self.compiled_flex_attention(qs, ks, vs).transpose(1, 2).squeeze()
 
-        out = self.dropout(self.proj_out(outs.flatten(-2, -1)))
+        out = self.dropout(self.proj_out(outs.flatten(-2, -1).to(x.dtype)))
         if self.with_residual:
             out = out + x_in
 
@@ -286,7 +286,7 @@ class MultiSelfAttentionHeadLocal(torch.nn.Module):
         s = [x.shape[0], x.shape[1], self.num_heads, -1]
         qs = self.lnorm_q(self.proj_heads_q(x).reshape(s)).to(self.dtype).permute([0, 2, 1, 3])
         ks = self.lnorm_k(self.proj_heads_k(x).reshape(s)).to(self.dtype).permute([0, 2, 1, 3])
-        vs = self.proj_heads_v(x).reshape(s).permute([0, 2, 1, 3])
+        vs = self.proj_heads_v(x).reshape(s).to(self.dtype).permute([0, 2, 1, 3])
 
         if self.with_2d_rope:
             if coords is None:
@@ -295,7 +295,7 @@ class MultiSelfAttentionHeadLocal(torch.nn.Module):
 
         outs = self.flex_attention(qs, ks, vs, block_mask=self.block_mask).transpose(1, 2)
 
-        out = self.proj_out(self.dropout(outs.flatten(-2, -1)))
+        out = self.proj_out(self.dropout(outs.flatten(-2, -1).to(x.dtype)))
         if self.with_residual:
             out = x_in + out
 
@@ -378,7 +378,7 @@ class MultiCrossAttentionHeadVarlen(torch.nn.Module):
         qs = self.lnorm_q(self.proj_heads_q(x_q).reshape(s)).to(self.dtype)
         s = [x_kv.shape[0], self.num_heads, self.dim_head_proj]
         ks = self.lnorm_k(self.proj_heads_k(x_kv).reshape(s)).to(self.dtype)
-        vs = self.proj_heads_v(x_kv).reshape(s)
+        vs = self.proj_heads_v(x_kv).reshape(s).to(self.dtype)
 
         # set dropout rate according to training/eval mode as required by flash_attn
         dropout_rate = self.dropout_rate if self.training else 0.0
@@ -400,7 +400,7 @@ class MultiCrossAttentionHeadVarlen(torch.nn.Module):
         else:
             assert False
 
-        outs = self.proj_out(outs.flatten(-2, -1))
+        outs = self.proj_out(outs.flatten(-2, -1).to(x_q.dtype))
         if self.with_residual:
             outs = x_q_in + outs
 
@@ -494,7 +494,7 @@ class MultiCrossAttentionHeadVarlenSlicedQ(torch.nn.Module):
         ]
         s = [x_kv.shape[0], self.num_heads, self.dim_head_proj]
         ks = self.lnorm_k(self.proj_heads_k(x_kv).reshape(s)).to(self.dtype)
-        vs = self.proj_heads_v(x_kv).reshape(s)
+        vs = self.proj_heads_v(x_kv).reshape(s).to(self.dtype)
 
         # set dropout rate according to training/eval mode as required by flash_attn
         dropout_rate = self.dropout_rate if self.training else 0.0
@@ -517,7 +517,7 @@ class MultiCrossAttentionHeadVarlenSlicedQ(torch.nn.Module):
                 )
             ]
 
-        outs = self.proj_out(torch.stack(outs).transpose(1, 0).flatten(-2, -1))
+        outs = self.proj_out(torch.stack(outs).transpose(1, 0).flatten(-2, -1).to(x_q.dtype))
         if self.with_residual:
             outs = x_q_in + outs.reshape(x_q_in.shape)
 
@@ -610,7 +610,7 @@ class MultiSelfAttentionHead(torch.nn.Module):
         # ordering of tensors (seq, heads, embed) (which differs from torch's flash attention implt)
         outs = flash_attn_func(qs, ks, vs, softcap=self.softcap, dropout_p=dropout_rate)
 
-        out = self.proj_out(outs.flatten(-2, -1))
+        out = self.proj_out(outs.flatten(-2, -1).to(x.dtype))
         if self.with_residual:
             out = out + x_in
 
@@ -688,13 +688,13 @@ class MultiCrossAttentionHead(torch.nn.Module):
         qs = self.lnorm_q(self.proj_heads_q(x_q).reshape(s)).to(self.dtype).transpose(-3, -2)
         s = [x_kv.shape[0], -1, self.num_heads, self.dim_head_proj]
         ks = self.lnorm_k(self.proj_heads_k(x_kv).reshape(s)).to(self.dtype).transpose(-3, -2)
-        vs = self.proj_heads_v(x_kv).reshape(s).transpose(-3, -2)
+        vs = self.proj_heads_v(x_kv).reshape(s).to(self.dtype).transpose(-3, -2)
 
         # correct ordering of tensors with seq dimension second but last is critical
         with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
             outs = self.att(qs, ks, vs).transpose(2, 1)
 
-        outs = self.dropout(self.proj_out(outs.flatten(-2, -1)))
+        outs = self.dropout(self.proj_out(outs.flatten(-2, -1).to(x_q.dtype)))
         if self.with_residual:
             outs = x_q_in + outs
 
