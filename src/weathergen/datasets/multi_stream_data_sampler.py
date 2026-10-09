@@ -148,6 +148,15 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         steps = np.array(forecast_cfg["num_steps"], dtype=np.int32).reshape(-1)
         self.list_num_forecast_steps = np.array(steps, dtype=np.int32)
 
+        # DEBUG: effective forecast settings for this stage
+        logger.warning(
+            f"DEBUG [{stage}] forecast: offset={self.output_offset} "
+            f"time_step={self.time_step} policy={self.forecast_policy} "
+            f"num_steps={self.list_num_forecast_steps} "
+            f"window_len={mode_cfg.time_window_len} window_step={mode_cfg.time_window_step}"
+        )
+        self._debug_n = 0
+
         # initialise fsm, but can change for future mini_epochs
         self.batch_size = get_batch_size_from_config(mode_cfg)
         self.shuffle = mode_cfg.shuffle
@@ -877,6 +886,25 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 idx, num_forecast_steps, i_max, stream_ds
             )
 
+            # DEBUG: actual source/target times for the first few batches
+            if self._debug_n < 3:
+                def _trange(rd):
+                    if rd.is_empty():
+                        return "empty"
+                    t = np.asarray(rd.datetimes)
+                    spoof = " SPOOF" if getattr(rd, "is_spoof", False) else ""
+                    return f"{t.min()}..{t.max()} (n={len(t)}){spoof}"
+
+                tgt_steps = list(
+                    range(self.output_offset, self._get_output_length(num_forecast_steps))
+                )
+                logger.warning(
+                    f"DEBUG [{self._stage}] stream={stream_name} idx={idx} "
+                    f"num_forecast_steps={num_forecast_steps} target_steps={tgt_steps} | "
+                    f"source={[_trange(r) for r in input_data]} | "
+                    f"target={[_trange(r) for r in output_data]}"
+                )
+
             # tokenize windows
             # *_tokens = [ (cells_idx, cells_idx_lens), ... ] with length = #time_steps
             input_tokens = self._tok(stream_info).get_tokens_windows(stream_info, input_data, True)
@@ -930,6 +958,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         source_in_steps = input_steps.max().item()
         target_in_steps = np.array([tc.get("num_steps_input", 1) for _, tc in target_cfgs.items()])
         target_in_steps = 1 if len(target_in_steps) == 0 else target_in_steps.max().item()
+        self._debug_n += 1
         batch = self._preprocess_model_batch(batch, source_in_steps, target_in_steps)
 
         return batch

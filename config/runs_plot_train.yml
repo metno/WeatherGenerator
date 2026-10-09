@@ -1,5 +1,6 @@
 train : 
   plot :
+<<<<<<< HEAD
     oo5ycd5w : 
       slurm_id: 805761
       description: "e00 hp5 0-297"
@@ -11,4 +12,13 @@ train :
     sqsvm93f : 
       slurm_id: 800708
       description: "e02 hp5/8 0-243"
+=======
+    i7elf1j3 : 
+      slurm_id: 2186464
+      description: "autoencoder"
+      eval: vgbndhco
+    i7t09ac5 : 
+      slurm_id: 2197552
+      description: "forecast"
+>>>>>>> c46a920 (added debug print in data_sampler Fixed issue with forecast_reference_time in metno_parser)
       eval: vgbndhco

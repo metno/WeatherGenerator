@@ -112,7 +112,7 @@ class MetnoParser(CfParser):
 
         if da_fs:
             da_fs = self.concatenate(da_fs, dim="forecast_step", sortby_dim="forecast_step")
-            da_fs = self.regrid(da_fs)
+            da_fs = self.regrid(da_fs, ref_time)
             da_fs = self.add_global_attributes(
                 da_fs,
                 source_interval_start=source_interval_start,
@@ -189,7 +189,7 @@ class MetnoParser(CfParser):
 
         return data
 
-    def regrid(self, ds: xr.DataArray) -> xr.Dataset:
+    def regrid(self, ds: xr.DataArray, ref_time: np.datetime64) -> xr.Dataset:
         # The export worker returns one sample/stream at a time and concatenates over
         # forecast steps, so expected dims are:
         # - without ensemble:   (forecast_step, ipoint, channel)
@@ -235,8 +235,18 @@ class MetnoParser(CfParser):
             new_ds[name].attrs["standard_name"] = f"projection_{name}_coordinate"
             new_ds[name].attrs["units"] = "m"
         new_ds["time"].attrs["units"] = "seconds since 1970-01-01T00:00:00 +00:00"
-        new_ds["forecast_reference_time"] = ([], times[0], {}, {"dtype": "double"})
+        ref_s = float(
+            np.datetime64(ref_time).astype("datetime64[s]").astype("int64")
+        )
+        new_ds["forecast_reference_time"] = ([], ref_s, {}, {"dtype": "double"})
         new_ds["forecast_reference_time"].attrs["units"] = "seconds since 1970-01-01T00:00:00 +00:00"
+        new_ds["forecast_reference_time"].attrs["standard_name"] = "forecast_reference_time"
+
+        new_ds["forecast_period"] = (
+            ("time",),
+            times - ref_s,
+            {"units": "seconds", "standard_name": "forecast_period"},
+        )
         if has_ens:
             new_ds["ensemble_member"].attrs["standard_name"] = "realization"
 
