@@ -271,6 +271,12 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                             f"Missing target coordinates for FFT CRPS stream {stream_name!r} "
                             f"at forecast step {step}."
                         )
+                    missing_date_issue = self._anemoi_missing_date_issue(
+                        stream_name, stream_data, step
+                    )
+                    if missing_date_issue is not None:
+                        return missing_date_issue
+
                     coords_tensor = stream_data.target_coords_raw[step]
                     if not isinstance(coords_tensor, torch.Tensor):
                         if len(coords_tensor) == 0:
@@ -362,6 +368,61 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                             )
 
         return None
+
+    def _anemoi_missing_date_issue(
+        self, stream_name: str, stream_data: StreamData, step: int
+    ) -> str | None:
+        readers = self.streams_datasets[stream_name].readers
+        if not readers:
+            return None
+
+        missing_date_sets = [getattr(reader, "missing_dates", None) for reader in readers]
+        if any(dates is None for dates in missing_date_sets):
+            return None
+
+        missing_dates = set(missing_date_sets[0])
+        for dates in missing_date_sets[1:]:
+            missing_dates.intersection_update(dates)
+        if not missing_dates:
+            return None
+
+        target_times = (
+            stream_data.target_times_raw[step]
+            if step < len(stream_data.target_times_raw)
+            else np.array([], dtype="datetime64[ns]")
+        )
+        if isinstance(target_times, torch.Tensor):
+            target_times = target_times.detach().cpu().numpy()
+        else:
+            target_times = np.asarray(target_times)
+
+        if target_times.size:
+            candidate_dates = {
+                np.datetime64(timestamp, "ns") for timestamp in target_times
+            }
+        else:
+            target_idx = stream_data.sample_idx + (
+                self.time_step * step
+            ) // self.step_timedelta
+            target_window = self.time_window_handler.window(target_idx)
+            candidate_dates = {
+                date
+                for date in missing_dates
+                if target_window.start <= date < target_window.end
+            }
+
+        matching_dates = sorted(candidate_dates.intersection(missing_dates))
+        if not matching_dates:
+            return None
+
+        date_labels = ", ".join(
+            np.datetime_as_string(date, unit="s") for date in matching_dates
+        )
+        return (
+            f"Anemoi dataset marks target timestamp(s) {date_labels} missing for FFT CRPS "
+            f"stream {stream_name!r}, sample {stream_data.sample_idx}, step {step}; "
+            "skipping this sample."
+        )
 
     def _init_stream_datasets(self, cf) -> dict[StreamName, _Stream]:
         """Load dataset readers for all streams from config."""

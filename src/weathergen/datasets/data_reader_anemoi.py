@@ -32,8 +32,15 @@ from weathergen.utils.distributed import is_root
 _logger = logging.getLogger(__name__)
 
 
+def _get_anemoi_missing_dates(dataset: Dataset) -> frozenset[np.datetime64]:
+    missing_indices = getattr(dataset, "missing", ())
+    return frozenset(np.datetime64(dataset.dates[index], "ns") for index in missing_indices)
+
+
 class DataReaderAnemoi(DataReaderTimestep):
     "Wrapper for Anemoi datasets"
+
+    missing_dates: frozenset[np.datetime64]
 
     def __init__(
         self,
@@ -72,6 +79,7 @@ class DataReaderAnemoi(DataReaderTimestep):
 
         # open  dataset to peak that it is compatible with requested parameters
         ds0: Dataset = anemoi_datasets.open_dataset(filename)
+        self.missing_dates = _get_anemoi_missing_dates(ds0)
         # If there is no overlap with the time range, the dataset will be empty
         if tw_handler.t_start >= ds0.dates[-1] or tw_handler.t_end <= ds0.dates[0]:
             name = stream_info["name"]
