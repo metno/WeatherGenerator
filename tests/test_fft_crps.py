@@ -119,6 +119,97 @@ def test_global_fft_crps_is_finite_and_differentiable(tmp_path):
     assert torch.isfinite(pred.grad).all()
 
 
+def test_global_fft_crps_scale_is_independent_of_grid_size(tmp_path):
+    generator = torch.Generator().manual_seed(0)
+    losses = []
+    for n_side in (16, 64):
+        template_path = tmp_path / f"grid_{n_side}.npz"
+        coords = _write_template(template_path, n_side=n_side)
+        target = torch.zeros(n_side * n_side, 1)
+        pred = 0.5 * torch.randn(4, n_side * n_side, 1, generator=generator)
+        loss, _ = global_fft_crps(
+            target,
+            pred,
+            coords,
+            weights_channels=None,
+            weights_points=None,
+            template_path=str(template_path),
+        )
+        losses.append(loss.item())
+
+    assert losses[1] == pytest.approx(losses[0], rel=0.2)
+
+
+def test_global_fft_crps_does_not_depend_on_target_spatial_variance(tmp_path):
+    template_path = tmp_path / "grid.npz"
+    coords = _write_template(template_path)
+    error = 0.1 * torch.randn(3, 16, 1, generator=torch.Generator().manual_seed(3))
+    varying_target = torch.sin(torch.arange(16, dtype=torch.float32)).reshape(16, 1)
+    constant_target = torch.full((16, 1), 0.5)
+
+    losses = [
+        global_fft_crps(
+            target,
+            target.unsqueeze(0) + error,
+            coords,
+            weights_channels=None,
+            weights_points=None,
+            template_path=str(template_path),
+        )[0]
+        for target in (varying_target, constant_target)
+    ]
+
+    assert torch.isfinite(losses[1])
+    assert torch.allclose(losses[0], losses[1], atol=1e-6)
+
+
+def test_global_fft_crps_per_channel_losses_include_channel_weights(tmp_path):
+    template_path = tmp_path / "grid.npz"
+    coords = _write_template(template_path)
+    target = torch.sin(torch.arange(32, dtype=torch.float32)).reshape(16, 2)
+    pred = torch.stack((target + 0.1, target - 0.3))
+
+    _, unweighted_chs = global_fft_crps(
+        target,
+        pred,
+        coords,
+        weights_channels=None,
+        weights_points=None,
+        template_path=str(template_path),
+    )
+    loss, loss_chs = global_fft_crps(
+        target,
+        pred,
+        coords,
+        weights_channels=torch.tensor([2.0, 0.0]),
+        weights_points=None,
+        template_path=str(template_path),
+    )
+
+    assert torch.allclose(loss_chs, unweighted_chs * torch.tensor([2.0, 0.0]))
+    assert torch.allclose(loss, loss_chs.mean())
+
+
+def test_physical_loss_global_fft_crps_detaches_per_channel_losses(tmp_path):
+    template_path = tmp_path / "grid.npz"
+    coords = _write_template(template_path)
+    target = torch.sin(torch.arange(16, dtype=torch.float32)).reshape(16, 1)
+    pred = torch.stack((target + 0.1, target - 0.2)).requires_grad_()
+
+    loss, loss_chs = LossPhysical._loss_global_fft_crps(
+        target,
+        pred,
+        coords,
+        [torch.ones(16, dtype=torch.bool)],
+        None,
+        template_path=str(template_path),
+        stream_name="test",
+    )
+
+    assert loss.requires_grad
+    assert not loss_chs.requires_grad
+
+
 def test_global_fft_crps_reorders_shuffled_regular_grid_points(tmp_path):
     template_path = tmp_path / "grid.npz"
     coords = _write_template(template_path)
