@@ -112,7 +112,7 @@ class DataReaderAnemoiRT(DataReaderTimestep):
             "pretrained model expected."
         )
         self.target_channels = stream_info.get(str(stage) + "_target_channels")
-        self.target_idx = []
+        self.target_idx = [None for ch in self.target_channels]
 
         # select/filter requested geoinfo channels (can be any variable, not just constant-in-time)
         assert stream_info.get("geoinfo_channels") is not None, "pretrained model expected."
