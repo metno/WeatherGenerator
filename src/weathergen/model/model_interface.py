@@ -27,8 +27,9 @@ from weathergen.model.attention import (
     MultiSelfAttentionHeadLocal,
     MultiSelfAttentionHeadVarlen,
 )
+from weathergen.model.latent_cascade import CascadeBlock
 from weathergen.model.layers import MLP
-from weathergen.model.model import Model, ModelParams
+from weathergen.model.model import Model, build_model_params
 from weathergen.model.utils import apply_fct_to_blocks, freeze_weights
 from weathergen.utils.distributed import is_root
 from weathergen.utils.performance import register_nvtx_hooks
@@ -65,7 +66,9 @@ def init_model_and_shard(
 
     # TODO: this should be handled in the encoder to be close where q_cells is defined
     if "q_cells" in cf.freeze_modules:
-        model.encoder.q_cells.requires_grad = False
+        # all latent levels (only model.encoder.q_cells for a single latent level)
+        for q_cells in model.encoder.q_cells_all_levels():
+            q_cells.requires_grad = False
 
     if with_ddp and not with_fsdp:
         # create DDP model if running without FSDP
@@ -117,6 +120,34 @@ def init_model_and_shard(
                 # Needed for pushforward trick.
                 fully_shard(module, reshard_after_forward=False, **fsdp_kwargs)
 
+        # multi-resolution latent: the same sharding for the engines of the coarser levels
+        # (the finest level uses the modules above). Query aggregation engines are swept
+        # into the root group by fully_shard(model), as for one level.
+        if model.encoder.multi_level:
+            per_level_blocks = [
+                e.ae_global_blocks for e in model.encoder._ae_global_per_level.values()
+            ]
+            if not model.encoder.share_local_assimilation:
+                per_level_blocks += [
+                    e.ae_local_blocks for e in model.encoder._ae_local_per_level.values()
+                ]
+                per_level_blocks += [
+                    e.ae_adapter for e in model.encoder._ae_local_global_per_level.values()
+                ]
+            for blocks in per_level_blocks:
+                for module in blocks.modules():
+                    if isinstance(module, modules_to_shard):
+                        fully_shard(module, **fsdp_kwargs)
+            for engine in (model._forecast_per_level or {}).values():
+                for module in engine.fe_blocks.modules():
+                    if isinstance(module, modules_to_shard):
+                        fully_shard(module, reshard_after_forward=False, **fsdp_kwargs)
+            # attention blocks of the latent cascades (cross-attention + MLP)
+            for cascade in model.latent_cascades():
+                for module in cascade.modules():
+                    if isinstance(module, modules_to_shard):
+                        fully_shard(module, **fsdp_kwargs)
+
         for module in model.latent_heads.modules():
             if isinstance(module, modules_to_shard):
                 fully_shard(module, **fsdp_kwargs)
@@ -166,12 +197,31 @@ def init_model_and_shard(
             if with_fsdp:
                 model.reset_parameters()
 
-    # model params
-    model_params = ModelParams(cf).create(cf)
+    # the latent cascades keep their parent/child index maps in non-persistent buffers: with
+    # meta-device initialisation (FSDP) they are neither in the checkpoint nor rebuilt by
+    # to_empty / reset_parameters, so rebuild them from the pyramid on the device
+    if with_ddp and with_fsdp:
+        for cascade in model.latent_cascades():
+            cascade.rebuild_index_buffers(torch.device(f"cuda:{cf.local_rank}"))
+
+    # model params (one set per latent level for a multi-resolution latent)
+    model_params = build_model_params(cf).create(cf)
     model_params.reset_parameters(cf)
     model_params = model_params.to(f"cuda:{cf.local_rank}")
 
     return model, model_params
+
+
+def reinit_new_cascade_blocks(model, missing_keys) -> None:
+    """
+    Re-apply the zero initialisation of latent-cascade blocks that were not in the loaded
+    checkpoint (e.g. a cascade added when fine-tuning a pretrained model): re-initialising
+    the missing modules resets their Linear layers to random values. Blocks that were loaded
+    from the checkpoint are left untouched.
+    """
+    for name, module in model.named_modules():
+        if isinstance(module, CascadeBlock) and any(k.startswith(name + ".") for k in missing_keys):
+            module.init_residual_branches()
 
 
 def load_model(cf, model, device, run_id: str, mini_epoch=-1):
@@ -229,6 +279,7 @@ def load_model(cf, model, device, run_id: str, mini_epoch=-1):
                 module_to_init = all_modules[path]
                 module_to_init.to_empty(device="cuda")
                 module_to_init.reset_parameters()
+            reinit_new_cascade_blocks(model, mkeys)
 
     else:
         # fix mismatch between state_dict keys that can occur between interactive/non-interactive

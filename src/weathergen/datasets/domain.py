@@ -236,12 +236,22 @@ class Domain:
         If the block is absent or `domain.enabled` is false, returns the global
         domain, i.e. exactly the behaviour without cropping.
         """
-        dom_cfg = cf.get("domain", None)
+        return cls.from_level_config(cf.healpix_level, cf.get("domain", None))
+
+    @classmethod
+    def from_level_config(cls, healpix_level: int, dom_cfg) -> "Domain":
+        """
+        Build (or fetch from the cache) the domain at `healpix_level` for a `domain`
+        config block. A missing block or `enabled: false` gives the global domain.
+
+        Shared by `from_config` (single latent level) and the multi-resolution
+        `DomainPyramid` (one block per latent level).
+        """
         if dom_cfg is None or not dom_cfg.get("enabled", True):
-            key = (cf.healpix_level,)
+            key = (int(healpix_level),)
         else:
             key = (
-                cf.healpix_level,
+                int(healpix_level),
                 float(dom_cfg["lon_min"]),
                 float(dom_cfg["lon_max"]),
                 float(dom_cfg["lat_min"]),
@@ -268,6 +278,22 @@ class Domain:
         if self.is_global:
             return global_idxs.astype(np.int64, copy=False)
         return self.to_compact[global_idxs]
+
+    def to_compact_safe(self, global_idxs: NDArray) -> NDArray[np.int64]:
+        """
+        Bounds-safe global -> compact lookup: the compact index of each global nested
+        index, or -1 if it is outside the domain or out of range for this level.
+
+        Unlike `remap()` (hot path, assumes valid indices, identity for a global
+        domain), this always consults `to_compact`, so it is safe for the cross-level
+        parent/child maps of the multi-resolution latent (`DomainPyramid`), where a
+        computed parent or child may fall outside this level's active set.
+        """
+        g = np.asarray(global_idxs, dtype=np.int64)
+        out = np.full(g.shape, -1, dtype=np.int64)
+        in_range = (g >= 0) & (g < self.num_total_cells)
+        out[in_range] = self.to_compact[g[in_range]]
+        return out
 
     def inside_mask(self, global_idxs: NDArray) -> NDArray[np.bool_]:
         """Boolean mask of which global cell indices are in the domain."""
