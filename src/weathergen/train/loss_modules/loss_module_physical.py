@@ -286,7 +286,7 @@ class LossPhysical(LossModuleBase):
                 grid_mode=grid_mode,
             )
             substep_losses.append(loss)
-            substep_losses_chs.append(loss_chs)
+            substep_losses_chs.append(loss_chs.detach())
 
         if not substep_losses:
             return (

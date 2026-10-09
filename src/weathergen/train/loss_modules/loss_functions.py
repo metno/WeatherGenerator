@@ -256,6 +256,10 @@ def global_fft_crps(
     ``weights_points`` is accepted for loss-function API compatibility. Spatial
     point weights are not applied because a Fourier coefficient depends on the
     whole grid.
+
+    An orthonormal FFT is used so the loss scale does not grow with the number
+    of grid points. As in ``kernel_crps``, the returned per-channel losses include
+    the channel weights.
     """
     if not 0.0 <= alpha <= 1.0:
         raise ValueError(f"alpha must be in [0, 1], got {alpha}")
@@ -302,18 +306,16 @@ def global_fft_crps(
         target_grid = target_grid_data[..., channel].masked_fill(~channel_valid, 0.0)
         pred_grid = pred_grid_data[..., channel].masked_fill(~channel_valid.unsqueeze(0), 0.0)
 
-        target_fft = torch.fft.fft2(target_grid)
-        pred_fft = torch.fft.fft2(pred_grid)
+        # orthonormal FFT keeps the loss scale independent of the grid size
+        target_fft = torch.fft.fft2(target_grid, norm="ortho")
+        pred_fft = torch.fft.fft2(pred_grid, norm="ortho")
         spectral_crps = crps_kernel_pointwise(target_fft, pred_fft, alpha)
-        target_std = target_grid[channel_valid].std(unbiased=False).clamp(min=1e-8)
-        loss_chs[channel] = (spectral_crps * frequency_mask).mean() / target_std
+        loss_chs[channel] = (spectral_crps * frequency_mask).mean()
 
     if weights_channels is not None:
         weights_channels = weights_channels.to(device=target.device, dtype=loss_chs.dtype)
-        loss = (loss_chs * weights_channels).mean()
-    else:
-        loss = loss_chs.mean()
-    return loss, loss_chs
+        loss_chs = loss_chs * weights_channels
+    return loss_chs.mean(), loss_chs
 
 
 def lp_loss(
