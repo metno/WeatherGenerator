@@ -95,7 +95,7 @@ def parse_args(args: list) -> argparse.Namespace:
         "--format",
         dest="output_format",
         type=str,
-        choices=["netcdf", "verif", "quaver"],
+        choices=["netcdf", "verif", "quaver", "metno"],
         help="Output file format; netcdf (CF-compliant netcdfs), \
         verif (netcdf compatible with MetNor verif tool), quaver (GRIB files for Quaver tool)",
         required=True,
@@ -185,6 +185,14 @@ def parse_args(args: list) -> argparse.Namespace:
         help="Path to GRIB template file",
         required=False,
         dest="quaver_template_folder",
+    )
+
+    parser.add_argument(
+        "--metno-template",
+        type=str,
+        help="Path to NetCDF template file",
+        required=False,
+        dest="metno_template",
     )
 
     parser.add_argument(
