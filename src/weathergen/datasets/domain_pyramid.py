@@ -45,8 +45,12 @@ exactly the single-latent behaviour.
 
     latent_levels:
       - level: 5                  # coarse level, global (no domain block)
+        dim_embed: 1024           # optional: size of this level's latent vectors
       - level: 8                  # fine level, cropped
         domain: {lon_min: -10.0, lon_max: 35.0, lat_min: 50.0, lat_max: 75.0, pad_rings: 1}
+
+`dim_embed` (default `ae_global_dim_embed`) sets the latent vector size of one level; it
+is read by the model (`latent_dim_embed`), the geometry here does not depend on it.
 """
 
 import logging
@@ -331,6 +335,19 @@ def build_domain_pyramid(cf) -> DomainPyramid:
         pyramid = DomainPyramid.from_config(cf)
         _PYRAMID_CACHE[key] = pyramid
     return pyramid
+
+
+def latent_dim_embed(cf, level: int) -> int:
+    """
+    Size of the latent vectors of latent level `level`: the level's `dim_embed` entry in
+    `latent_levels`, else `ae_global_dim_embed` (always the latter for a single level).
+    """
+    for entry in cf.get("latent_levels", None) or []:
+        if int(entry["level"]) == level and entry.get("dim_embed", None) is not None:
+            dim = int(entry["dim_embed"])
+            assert dim > 0, f"latent_levels: dim_embed of level {level} must be positive"
+            return dim
+    return int(cf.ae_global_dim_embed)
 
 
 def model_domain(cf) -> Domain:

@@ -43,6 +43,11 @@ Operators "linear" / "none" (kept for comparison with the original branch) use t
 alone (down) and the mean of the children (up), with a zero-initialised Linear ("linear")
 or a plain addition ("none", not the identity).
 
+Levels may have different latent sizes (`dim_embed` in `latent_levels`): the attention
+blocks then use the target level's size for the queries, the residual stream and the MLP,
+and the source level's size for the keys/values; the "linear" operator maps between the
+two sizes; "none" (a plain addition) requires equal sizes.
+
 Only the spatial cell tokens take part; the register/class tokens are passed through.
 With a single-level pyramid there are no pairs and the cascade is a no-op.
 """
@@ -54,6 +59,7 @@ import numpy as np
 import torch
 from numpy.typing import NDArray
 
+from weathergen.datasets.domain_pyramid import latent_dim_embed
 from weathergen.model.attention import MultiCrossAttentionHeadVarlen
 from weathergen.model.layers import MLP
 from weathergen.utils.utils import get_dtype
@@ -69,7 +75,8 @@ class CascadeBlock(torch.nn.Module):
         x <- x + MLP(LN(x))
 
     Inputs are packed variable-length sequences (flash-attention varlen layout): segment i
-    of the queries attends to segment i of the keys/values only.
+    of the queries attends to segment i of the keys/values only. `dim` is the size of x,
+    `dim_kv` (default `dim`) that of x_kv.
     """
 
     def __init__(
@@ -86,12 +93,13 @@ class CascadeBlock(torch.nn.Module):
         attention_dtype=torch.bfloat16,
         with_flash: bool = True,
         zero_init: bool = False,
+        dim_kv: int | None = None,
     ):
         super().__init__()
         self.zero_init = zero_init
         self.attention = MultiCrossAttentionHeadVarlen(
             dim,
-            dim,
+            dim_kv or dim,
             num_heads=num_heads,
             dropout_rate=dropout_rate,
             with_residual=True,
@@ -134,17 +142,24 @@ class _PairOperator(torch.nn.Module):
     """
     "none" / "linear" operators of one (coarse, fine) pair, on pre-reduced sources:
     down: the parent's latent copied to each fine cell; up: the mean of the active children.
+    `dim` is the latent size of the coarse level, `dim_fine` (default `dim`) that of the fine.
     """
 
-    def __init__(self, dim: int, kind: str = "none"):
+    def __init__(self, dim: int, kind: str = "none", dim_fine: int | None = None):
         super().__init__()
         self.kind = kind
+        dim_fine = dim_fine or dim
         if kind == "none":
+            if dim_fine != dim:
+                raise ValueError(
+                    "cascade operator 'none' adds the latents of two levels and needs equal "
+                    f"latent sizes (got {dim} and {dim_fine}); use 'linear' or 'attention'"
+                )
             self.down_proj = None
             self.up_proj = None
         elif kind == "linear":
-            self.down_proj = torch.nn.Linear(dim, dim, bias=False)
-            self.up_proj = torch.nn.Linear(dim, dim, bias=False)
+            self.down_proj = torch.nn.Linear(dim, dim_fine, bias=False)
+            self.up_proj = torch.nn.Linear(dim_fine, dim, bias=False)
             self.init_residual_branches()
         else:
             raise ValueError(f"unknown cascade operator kind={kind!r}")
@@ -167,7 +182,7 @@ class LatentCascade(torch.nn.Module):
 
     Args:
         domain_pyramid    : provides the exact parent/child maps and the ring tables.
-        dim               : latent feature dim (ae_global_dim_embed).
+        dim               : latent feature dim, an int for all levels or {level: dim}.
         num_queries       : ae_local_num_queries (tokens per cell).
         num_aux           : number of prepended register+class tokens per sample.
         num_cycles        : number of V-cycles; 0 => inert.
@@ -184,7 +199,7 @@ class LatentCascade(torch.nn.Module):
     def __init__(
         self,
         domain_pyramid,
-        dim: int,
+        dim: int | dict[int, int],
         num_queries: int,
         num_aux: int,
         num_cycles: int = 0,
@@ -207,13 +222,14 @@ class LatentCascade(torch.nn.Module):
         assert operator in ("attention", "linear", "none"), f"unknown operator {operator!r}"
         assert down_rings >= 0 and num_blocks >= 1
         self.pyramid = domain_pyramid
-        self.dim = dim
+        self.levels = domain_pyramid.levels
+        dims = dim if isinstance(dim, dict) else {lvl: dim for lvl in self.levels}
+        self.dims = {int(lvl): int(d) for lvl, d in dims.items()}
         self.num_queries = num_queries
         self.num_aux = num_aux
         self.num_cycles = num_cycles
         self.operator_kind = operator
         self.down_rings = down_rings
-        self.levels = domain_pyramid.levels
 
         # adjacent (coarse, fine) pairs, coarse -> fine order
         self.pairs = list(zip(self.levels[:-1], self.levels[1:], strict=True))
@@ -224,10 +240,10 @@ class LatentCascade(torch.nn.Module):
                 key = f"{lc}_{lf}"
                 if operator == "attention":
 
-                    def blocks():
+                    def blocks(dim_q, dim_kv):
                         return torch.nn.ModuleList(
                             CascadeBlock(
-                                dim,
+                                dim_q,
                                 num_heads,
                                 mlp_hidden_factor=mlp_hidden_factor,
                                 dropout_rate=dropout_rate,
@@ -239,14 +255,16 @@ class LatentCascade(torch.nn.Module):
                                 attention_dtype=attention_dtype,
                                 with_flash=with_flash,
                                 zero_init=zero_init,
+                                dim_kv=dim_kv,
                             )
                             for _ in range(num_blocks)
                         )
 
-                    self._ops[f"{key}_down"] = blocks()
-                    self._ops[f"{key}_up"] = blocks()
+                    # down: fine cells attend to coarse cells; up: the reverse
+                    self._ops[f"{key}_down"] = blocks(self.dims[lf], self.dims[lc])
+                    self._ops[f"{key}_up"] = blocks(self.dims[lc], self.dims[lf])
                 else:
-                    self._ops[key] = _PairOperator(dim, operator)
+                    self._ops[key] = _PairOperator(self.dims[lc], operator, self.dims[lf])
 
             # geometry as non-persistent buffers (move with .to(device), not checkpointed)
             for name, arr in self._index_arrays().items():
@@ -259,7 +277,7 @@ class LatentCascade(torch.nn.Module):
         c = cf.get(key, None) or {}
         return cls(
             domain_pyramid,
-            dim=cf.ae_global_dim_embed,
+            dim={lvl: latent_dim_embed(cf, lvl) for lvl in domain_pyramid.levels},
             num_queries=cf.ae_local_num_queries,
             num_aux=cf.num_register_tokens + cf.num_class_tokens,
             num_cycles=c.get("num_cycles", 0),
@@ -371,7 +389,7 @@ class LatentCascade(torch.nn.Module):
         b, _, nq, d = target.shape
         num_tgt = tgt.shape[0]
         x = target[:, tgt].reshape(b * num_tgt * nq, d)
-        x_kv = source[:, src].reshape(-1, d)
+        x_kv = source[:, src].reshape(-1, source.shape[-1])
         zero = torch.zeros(1, dtype=torch.int32, device=target.device)
         x_lens = torch.cat(
             [zero, torch.full((b * num_tgt,), nq, dtype=torch.int32, device=zero.device)]

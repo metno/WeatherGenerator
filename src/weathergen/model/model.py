@@ -21,7 +21,7 @@ from torch.utils.checkpoint import checkpoint
 from weathergen.common.config import Config
 from weathergen.datasets.batch import ModelBatch
 from weathergen.datasets.domain import Domain
-from weathergen.datasets.domain_pyramid import build_domain_pyramid
+from weathergen.datasets.domain_pyramid import build_domain_pyramid, latent_dim_embed
 from weathergen.datasets.utils import healpix_verts_rots, r3tos2
 from weathergen.model.encoder import EncoderModule
 from weathergen.model.engines import (
@@ -118,7 +118,7 @@ class ModelParams(torch.nn.Module):
         pe = torch.zeros(
             self.num_healpix_cells,
             cf.ae_local_num_queries,
-            cf.ae_global_dim_embed,
+            latent_dim_embed(cf, self.healpix_level),
             dtype=self.dtype,
         )
         self.pe_global = torch.nn.Parameter(pe, requires_grad=False)
@@ -210,7 +210,7 @@ class ModelParams(torch.nn.Module):
         self.pe_embed.data[:, 0::2] = torch.sin(position * div[: self.pe_embed[:, 0::2].shape[1]])
         self.pe_embed.data[:, 1::2] = torch.cos(position * div[: self.pe_embed[:, 1::2].shape[1]])
 
-        dim_embed = cf.ae_global_dim_embed
+        dim_embed = self.pe_global.shape[-1]
 
         if self.rope_2D:
             # Precompute per-cell center coordinates (lat, lon in radians) for 2D RoPE.
@@ -420,7 +420,7 @@ class Model(torch.nn.Module):
         if loss_cfg["head"].lower() == "mlp":
             return LatentPredictionHeadMLP(
                 name,
-                global_cfg.ae_global_dim_embed,
+                self.encoder.dims_embed[self.healpix_level],
                 loss_cfg,
                 use_class_token=use_class_token,
                 use_patch_token=use_patch_token,
@@ -429,7 +429,7 @@ class Model(torch.nn.Module):
             return LatentPredictionHeadTransformer(
                 global_cfg,
                 name,
-                global_cfg.ae_global_dim_embed,
+                self.encoder.dims_embed[self.healpix_level],
                 loss_cfg,
                 use_class_token=use_class_token,
                 use_patch_token=use_patch_token,
@@ -439,6 +439,20 @@ class Model(torch.nn.Module):
         else:
             assert False, f"Unknown latent prediction head type {loss_cfg['head']}"
 
+    def _decoder_kv_dims(self, stream_name: str) -> tuple[int, dict[int, int]]:
+        """
+        Latent size of a stream's own latent level, and {level: latent size} of its other
+        decode levels with a different latent size (their keys are projected, `kv_proj`).
+        """
+        dims = self.encoder.dims_embed
+        dim_latent = dims[self.encoder.stream_encode_level[stream_name]]
+        kv_level_dims = {
+            lvl: dims[lvl]
+            for lvl in self.encoder.stream_decode_levels[stream_name]
+            if dims[lvl] != dim_latent
+        }
+        return dim_latent, kv_level_dims
+
     def create(self) -> "Model":
         """Create each individual module of the model"""
         cf = self.cf
@@ -447,9 +461,12 @@ class Model(torch.nn.Module):
             cf, self.sources_size, self.targets_num_channels, self.targets_coords_size
         )
 
+        latent_dims = self.encoder.dims_embed  # latent vector size per latent level
         mode_cfg = cf.training_config
         if cf.fe_num_blocks > 0:
-            self.forecast_engine = ForecastingEngine(cf, mode_cfg, self.num_healpix_cells)
+            self.forecast_engine = ForecastingEngine(
+                cf, mode_cfg, self.num_healpix_cells, dim_embed=latent_dims[self.healpix_level]
+            )
         else:
             self.forecast_engine = IdentityEngine()
 
@@ -460,7 +477,10 @@ class Model(torch.nn.Module):
                 self._forecast_per_level = torch.nn.ModuleDict(
                     {
                         str(lvl): ForecastingEngine(
-                            cf, mode_cfg, len(self.domain_pyramid.domain(lvl))
+                            cf,
+                            mode_cfg,
+                            len(self.domain_pyramid.domain(lvl)),
+                            dim_embed=latent_dims[lvl],
                         )
                         for lvl in self.domain_pyramid.levels
                         if lvl != self.healpix_level
@@ -534,11 +554,13 @@ class Model(torch.nn.Module):
                     else:
                         assert False
 
+                    dim_latent, kv_level_dims = self._decoder_kv_dims(stream_name)
+
                     if cf.decoder_type == "Linear":
                         tte = BilinearDecoder(
                             stream_name,
                             dims_embed[0],
-                            cf.ae_global_dim_embed,
+                            dim_latent,
                             self.targets_num_channels[i_stream],
                         )
                     else:
@@ -548,6 +570,8 @@ class Model(torch.nn.Module):
                             if cf.decoder_type != "PerceiverIOCoordConditioning"
                             else TargetPredictionEngineClassic
                         )
+                        # latent sizes of the keys (only the default decoder supports them)
+                        kv_kwargs = {"dim_latent": dim_latent, "kv_level_dims": kv_level_dims}
                         tte = tte_version(
                             cf,
                             dims_embed,
@@ -556,6 +580,7 @@ class Model(torch.nn.Module):
                             tr_mlp_hidden_factor,
                             softcap,
                             stream_config=si,
+                            **(kv_kwargs if tte_version is TargetPredictionEngineClassic else {}),
                         )
 
                     self.target_token_engines[stream_name] = tte
@@ -596,6 +621,13 @@ class Model(torch.nn.Module):
                         f"{stream_name} shares spatial prediction head with {pred_spatial_shared}."
                     )
 
+                    dim_s, proj_s = self._decoder_kv_dims(stream_name)
+                    dim_o, proj_o = self._decoder_kv_dims(pred_spatial_shared)
+                    if dim_s != dim_o or not proj_s.items() <= proj_o.items():
+                        msg = f"Stream {stream_name} cannot share the decoder of "
+                        msg += f"{pred_spatial_shared}: different latent sizes (dim_embed)."
+                        raise ValueError(msg)
+
                     self.embed_target_coords[stream_name] = self.embed_target_coords[
                         pred_spatial_shared
                     ]
@@ -627,7 +659,7 @@ class Model(torch.nn.Module):
 
         # Latent heads for losses
         self.latent_heads = nn.ModuleDict()
-        self.latent_pre_norm = nn.LayerNorm(cf.ae_global_dim_embed)
+        self.latent_pre_norm = nn.LayerNorm(latent_dims[self.healpix_level])
 
         ssl_losses_cfgs = [
             v
@@ -638,7 +670,7 @@ class Model(torch.nn.Module):
         # TODO: support multiple LossLatentSSLStudentTeacher terms
         assert len(ssl_losses_cfgs) <= 1, "To be implemented."
         for ssl_target_losses in ssl_losses_cfgs:
-            self.latent_pre_norm = nn.LayerNorm(cf.ae_global_dim_embed)
+            self.latent_pre_norm = nn.LayerNorm(latent_dims[self.healpix_level])
             for loss, loss_conf in ssl_target_losses.loss_fcts.items():
                 if loss == "iBOT":
                     self.latent_heads[loss] = self._create_latent_pred_head(
@@ -766,12 +798,14 @@ class Model(torch.nn.Module):
                 if lvl == self.healpix_level:
                     continue
                 key = str(lvl)
-                print(f"  Level hl{lvl}:")
+                print(f"  Level hl{lvl} (latent size {enc.dims_embed[lvl]}):")
                 if not enc.share_local_assimilation:
                     n_local = get_num_parameters(enc._ae_local_per_level[key])
-                    n_adapter = get_num_parameters(enc._ae_local_global_per_level[key])
                     print(f"   Local assimilation engine: {n_local:,}")
-                    print(f"   Local-global adapter: {n_adapter:,}")
+                if enc._ae_local_global_per_level is not None:
+                    if key in enc._ae_local_global_per_level:
+                        n_adapter = get_num_parameters(enc._ae_local_global_per_level[key])
+                        print(f"   Local-global adapter: {n_adapter:,}")
                 q = enc._q_cells_param_dict[key]
                 print(f"   Learnable queries: {(q.numel() if q.requires_grad else 0):,}")
                 n_agg = get_num_parameters(enc._ae_aggregation_per_level[key])
@@ -1047,17 +1081,26 @@ class Model(torch.nn.Module):
                       parent), i.e. the large-scale context. If the ancestor lies outside
                       level l's domain, this part is left out of the segment (masked).
         Default for a fine stream over levels [5, 8]: 9 + 9 = 18 keys per cell.
+        Keys of a level whose latent size differs from that of level ls are projected to
+        it by the decoder's `kv_proj` (latent_levels: dim_embed).
 
         Returns (tokens_nbors, tokens_nbors_lens, tokens_flat) with the layout used by
-        the target prediction engines (and the Linear decoder).
+        the target prediction engines (and the Linear decoder, which only reads
+        tokens_flat, the latent of level ls).
         """
         ls = self.encoder.stream_encode_level[stream_name]
         nq = self.cf.ae_local_num_queries
         num_cells_s = len(self.domain_pyramid.domain(ls))
+        toks_s = tokens_lvl[ls][:, self.num_aux_tokens :]
+        if self.cf.decoder_type == "Linear":
+            return None, None, toks_s.reshape(-1, toks_s.shape[-1])
+        kv_proj = getattr(self.target_token_engines[stream_name], "kv_proj", None)
 
         parts, valids = [], []
         for lvl in self.encoder.stream_decode_levels[stream_name]:
             toks_l = tokens_lvl[lvl][:, self.num_aux_tokens :]
+            if kv_proj is not None and str(lvl) in kv_proj:
+                toks_l = kv_proj[str(lvl)](toks_l)
             dim = toks_l.shape[-1]
             num_cells_l = len(self.domain_pyramid.domain(lvl))
             hp_nbours = model_params.params_for(lvl).hp_nbours.to(torch.long)
@@ -1092,5 +1135,4 @@ class Model(torch.nn.Module):
                 mask.sum(dim=1).to(torch.int32),
             ]
         )
-        toks_s = tokens_lvl[ls][:, self.num_aux_tokens :]
         return tokens_nbors, tokens_nbors_lens, toks_s.reshape(-1, toks_s.shape[-1])

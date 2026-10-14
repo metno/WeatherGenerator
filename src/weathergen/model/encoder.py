@@ -14,7 +14,7 @@ from torch.utils.checkpoint import checkpoint
 from weathergen.common.config import Config
 from weathergen.datasets.batch import ModelBatch
 from weathergen.datasets.domain import Domain
-from weathergen.datasets.domain_pyramid import build_domain_pyramid
+from weathergen.datasets.domain_pyramid import build_domain_pyramid, latent_dim_embed
 from weathergen.datasets.stream_levels import assign_stream_levels
 from weathergen.model.engines import (
     EmbeddingEngine,
@@ -91,49 +91,65 @@ class EncoderModule(torch.nn.Module):
                 deterministic=cf.latent_noise_deterministic_latents,
             )
 
+        # latent vector size of every latent level (`dim_embed` in `latent_levels`, default
+        # ae_global_dim_embed)
+        self.dims_embed = {lvl: latent_dim_embed(cf, lvl) for lvl in self.domain_pyramid.levels}
+        dim_embed = self.dims_embed[self.healpix_level]
+
         # local -> global assimilation engine adapter
         ae_adapter_type = cf.get("ae_adapter_type", "cross_attention")
-        if ae_adapter_type == "sum":
-            self.ae_local_global_engine = Local2GlobalSumEngine(cf)
-        else:
-            self.ae_local_global_engine = Local2GlobalAssimilationEngine(cf)
+        adapter_class = (
+            Local2GlobalSumEngine if ae_adapter_type == "sum" else Local2GlobalAssimilationEngine
+        )
+        self.ae_local_global_engine = adapter_class(cf, dim_embed)
 
         # learnable queries
         self.q_cells = torch.nn.Parameter(self._build_q_cells(cf, self.domain), requires_grad=True)
 
         # query aggregation engine
-        self.ae_aggregation_engine = QueryAggregationEngine(cf, self.num_healpix_cells)
+        self.ae_aggregation_engine = QueryAggregationEngine(cf, self.num_healpix_cells, dim_embed)
 
         # global assimilation engine
-        self.ae_global_engine = GlobalAssimilationEngine(cf, self.num_healpix_cells)
+        self.ae_global_engine = GlobalAssimilationEngine(cf, self.num_healpix_cells, dim_embed)
 
         # multi-resolution latent: modules of the coarser levels, keyed by str(level).
         # Embedding engine, local assimilation engine and local->global adapter are shared
-        # across levels unless `share_local_assimilation: false`.
+        # across levels unless `share_local_assimilation: false`. A level whose latent size
+        # differs from the finest level's always has its own adapter (the adapter's queries
+        # are the level's latent vectors); its local assimilation engine stays shared.
         self.latent_cascade: LatentCascade | None = None
+        self._ae_local_global_per_level: torch.nn.ModuleDict | None = None
         if self.multi_level:
             coarser = [lvl for lvl in self.domain_pyramid.levels if lvl != self.healpix_level]
             self.share_local_assimilation = cf.get("share_local_assimilation", True)
+            own_adapter = [
+                lvl
+                for lvl in coarser
+                if not self.share_local_assimilation or self.dims_embed[lvl] != dim_embed
+            ]
             if not self.share_local_assimilation:
                 self._ae_local_per_level = torch.nn.ModuleDict()
+            if own_adapter:
                 self._ae_local_global_per_level = torch.nn.ModuleDict()
-                for lvl in coarser:
+            for lvl in own_adapter:
+                if not self.share_local_assimilation:
                     self._ae_local_per_level[str(lvl)] = LocalAssimilationEngine(cf)
-                    self._ae_local_global_per_level[str(lvl)] = (
-                        Local2GlobalSumEngine(cf)
-                        if ae_adapter_type == "sum"
-                        else Local2GlobalAssimilationEngine(cf)
-                    )
+                self._ae_local_global_per_level[str(lvl)] = adapter_class(cf, self.dims_embed[lvl])
             self._q_cells_param_dict = torch.nn.ParameterDict()
             self._ae_aggregation_per_level = torch.nn.ModuleDict()
             self._ae_global_per_level = torch.nn.ModuleDict()
             for lvl in coarser:
                 dom_l = self.domain_pyramid.domain(lvl)
+                dim_l = self.dims_embed[lvl]
                 self._q_cells_param_dict[str(lvl)] = torch.nn.Parameter(
                     self._build_q_cells(cf, dom_l), requires_grad=True
                 )
-                self._ae_aggregation_per_level[str(lvl)] = QueryAggregationEngine(cf, len(dom_l))
-                self._ae_global_per_level[str(lvl)] = GlobalAssimilationEngine(cf, len(dom_l))
+                self._ae_aggregation_per_level[str(lvl)] = QueryAggregationEngine(
+                    cf, len(dom_l), dim_l
+                )
+                self._ae_global_per_level[str(lvl)] = GlobalAssimilationEngine(
+                    cf, len(dom_l), dim_l
+                )
 
             # coarse <-> fine exchange after encoding (inert with num_cycles: 0)
             self.latent_cascade = LatentCascade.from_config(
@@ -146,9 +162,10 @@ class EncoderModule(torch.nn.Module):
 
     def _build_q_cells(self, cf: Config, domain: Domain) -> torch.Tensor:
         """Initial learnable queries for the cells of `domain` (one latent level)."""
+        dim_embed = self.dims_embed[domain.healpix_level]
         if cf.ae_local_queries_per_cell:
-            s = (len(domain), cf.ae_local_num_queries, cf.ae_global_dim_embed)
-            q_cells = torch.rand(s, requires_grad=True) / cf.ae_global_dim_embed
+            s = (len(domain), cf.ae_local_num_queries, dim_embed)
+            q_cells = torch.rand(s, requires_grad=True) / dim_embed
             # add meta data
             # global nested ids of the cells (== arange(num_healpix_cells) for a global domain)
             cell_ids = torch.from_numpy(domain.active_cells)
@@ -168,8 +185,8 @@ class EncoderModule(torch.nn.Module):
             q_cells[:, :, -9] = torch.arange(cf.ae_local_num_queries)
             q_cells[:, :, -10] = torch.arange(cf.ae_local_num_queries)
         else:
-            s = (1, cf.ae_local_num_queries, cf.ae_global_dim_embed)
-            q_cells = torch.rand(s, requires_grad=True) / cf.ae_global_dim_embed
+            s = (1, cf.ae_local_num_queries, dim_embed)
+            q_cells = torch.rand(s, requires_grad=True) / dim_embed
         return q_cells
 
     def _level_modules(self, level: int | None):
@@ -187,10 +204,13 @@ class EncoderModule(torch.nn.Module):
             )
         key = str(level)
         if self.share_local_assimilation:
-            ae_local, ae_local_global = self.ae_local_engine, self.ae_local_global_engine
+            ae_local = self.ae_local_engine
         else:
             ae_local = self._ae_local_per_level[key]
+        if self._ae_local_global_per_level is not None and key in self._ae_local_global_per_level:
             ae_local_global = self._ae_local_global_per_level[key]
+        else:
+            ae_local_global = self.ae_local_global_engine
         return (
             self._q_cells_param_dict[key],
             self._ae_aggregation_per_level[key],

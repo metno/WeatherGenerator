@@ -131,6 +131,8 @@ def init_model_and_shard(
                 per_level_blocks += [
                     e.ae_local_blocks for e in model.encoder._ae_local_per_level.values()
                 ]
+            # own adapters: unshared, or a level with another latent size (dim_embed)
+            if model.encoder._ae_local_global_per_level is not None:
                 per_level_blocks += [
                     e.ae_adapter for e in model.encoder._ae_local_global_per_level.values()
                 ]

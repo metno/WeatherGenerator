@@ -261,19 +261,21 @@ class LocalAssimilationEngine(torch.nn.Module):
 class Local2GlobalAssimilationEngine(torch.nn.Module):
     name: "Local2GlobalAssimilationEngine"
 
-    def __init__(self, cf: Config) -> None:
+    def __init__(self, cf: Config, dim_embed: int | None = None) -> None:
         """
         Initialize the Local2GlobalAssimilationEngine with the configuration.
 
         :param cf: Configuration object containing parameters for the engine.
+        :param dim_embed: size of the latent vectors (default cf.ae_global_dim_embed).
         """
         super(Local2GlobalAssimilationEngine, self).__init__()
         self.cf = cf
+        dim_embed = dim_embed or self.cf.ae_global_dim_embed
         self.ae_adapter = torch.nn.ModuleList()
 
         self.ae_adapter.append(
             MultiCrossAttentionHeadVarlenSlicedQ(
-                self.cf.ae_global_dim_embed,
+                dim_embed,
                 self.cf.ae_local_dim_embed,
                 num_slices_q=self.cf.ae_local_num_queries,
                 dim_head_proj=self.cf.ae_adapter_embed,
@@ -293,8 +295,8 @@ class Local2GlobalAssimilationEngine(torch.nn.Module):
         for _ in range(ae_adapter_num_blocks - 1):
             self.ae_adapter.append(
                 MLP(
-                    self.cf.ae_global_dim_embed,
-                    self.cf.ae_global_dim_embed,
+                    dim_embed,
+                    dim_embed,
                     with_residual=True,
                     dropout_rate=self.cf.ae_adapter_dropout_rate,
                     norm_type=self.cf.norm_type,
@@ -303,7 +305,7 @@ class Local2GlobalAssimilationEngine(torch.nn.Module):
             )
             self.ae_adapter.append(
                 MultiCrossAttentionHeadVarlenSlicedQ(
-                    self.cf.ae_global_dim_embed,
+                    dim_embed,
                     self.cf.ae_local_dim_embed,
                     num_slices_q=self.cf.ae_local_num_queries,
                     dim_head_proj=self.cf.ae_adapter_embed,
@@ -343,17 +345,18 @@ class Local2GlobalSumEngine(torch.nn.Module):
 
     name: "Local2GlobalSumEngine"
 
-    def __init__(self, cf: Config) -> None:
+    def __init__(self, cf: Config, dim_embed: int | None = None) -> None:
         super(Local2GlobalSumEngine, self).__init__()
         self.cf = cf
-        self.proj = torch.nn.Linear(cf.ae_local_dim_embed, cf.ae_global_dim_embed, bias=False)
+        dim_embed = dim_embed or self.cf.ae_global_dim_embed
+        self.proj = torch.nn.Linear(cf.ae_local_dim_embed, dim_embed, bias=False)
         ae_adapter_num_blocks = cf.get("ae_adapter_num_blocks", 2)
         self.mlp_blocks = torch.nn.ModuleList()
         for _ in range(ae_adapter_num_blocks - 1):
             self.mlp_blocks.append(
                 MLP(
-                    cf.ae_global_dim_embed,
-                    cf.ae_global_dim_embed,
+                    dim_embed,
+                    dim_embed,
                     with_residual=True,
                     dropout_rate=cf.ae_adapter_dropout_rate,
                     norm_type=cf.norm_type,
@@ -390,7 +393,7 @@ class Local2GlobalSumEngine(torch.nn.Module):
 class QueryAggregationEngine(torch.nn.Module):
     name: "QueryAggregationEngine"
 
-    def __init__(self, cf: Config, num_healpix_cells: int) -> None:
+    def __init__(self, cf: Config, num_healpix_cells: int, dim_embed: int | None = None) -> None:
         """
         Initialize the QueryAggregationEngine with the configuration.
 
@@ -399,9 +402,11 @@ class QueryAggregationEngine(torch.nn.Module):
 
         :param cf: Configuration object containing parameters for the engine.
         :param num_healpix_cells: Number of healpix cells used for local queries.
+        :param dim_embed: size of the latent vectors (default cf.ae_global_dim_embed).
         """
         super(QueryAggregationEngine, self).__init__()
         self.cf = cf
+        dim_embed = dim_embed or self.cf.ae_global_dim_embed
         self.num_healpix_cells = num_healpix_cells
 
         self.ae_aggregation_blocks = torch.nn.ModuleList()
@@ -414,7 +419,7 @@ class QueryAggregationEngine(torch.nn.Module):
             if i % global_rate == 0 or i + 1 == self.cf.ae_aggregation_num_blocks:
                 self.ae_aggregation_blocks.append(
                     MultiSelfAttentionHeadVarlen(
-                        self.cf.ae_global_dim_embed,
+                        dim_embed,
                         num_heads=self.cf.ae_aggregation_num_heads,
                         dropout_rate=self.cf.ae_aggregation_dropout_rate,
                         with_qk_lnorm=self.cf.ae_aggregation_with_qk_lnorm,
@@ -430,7 +435,7 @@ class QueryAggregationEngine(torch.nn.Module):
                 assert False, "Incompatible with batchsize > 1 here"
                 self.ae_aggregation_blocks.append(
                     MultiSelfAttentionHeadLocal(
-                        self.cf.ae_global_dim_embed,
+                        dim_embed,
                         num_heads=self.cf.ae_aggregation_num_heads,
                         qkv_len=self.num_healpix_cells * self.cf.ae_local_num_queries,
                         block_factor=self.cf.ae_aggregation_block_factor,
@@ -446,8 +451,8 @@ class QueryAggregationEngine(torch.nn.Module):
             # MLP block
             self.ae_aggregation_blocks.append(
                 MLP(
-                    self.cf.ae_global_dim_embed,
-                    self.cf.ae_global_dim_embed,
+                    dim_embed,
+                    dim_embed,
                     with_residual=True,
                     dropout_rate=self.cf.ae_aggregation_dropout_rate,
                     hidden_factor=self.cf.ae_aggregation_mlp_hidden_factor,
@@ -469,15 +474,17 @@ class QueryAggregationEngine(torch.nn.Module):
 class GlobalAssimilationEngine(torch.nn.Module):
     name: "GlobalAssimilationEngine"
 
-    def __init__(self, cf: Config, num_healpix_cells: int) -> None:
+    def __init__(self, cf: Config, num_healpix_cells: int, dim_embed: int | None = None) -> None:
         """
         Initialize the GlobalAssimilationEngine with the configuration.
 
         :param cf: Configuration object containing parameters for the engine.
         :param num_healpix_cells: Number of healpix cells used for local queries.
+        :param dim_embed: size of the latent vectors (default cf.ae_global_dim_embed).
         """
         super(GlobalAssimilationEngine, self).__init__()
         self.cf = cf
+        dim_embed = dim_embed or self.cf.ae_global_dim_embed
         self.num_healpix_cells = num_healpix_cells
 
         self.ae_global_blocks = torch.nn.ModuleList()
@@ -490,7 +497,7 @@ class GlobalAssimilationEngine(torch.nn.Module):
             if i % global_rate == 0 or i + 1 == self.cf.ae_global_num_blocks:
                 self.ae_global_blocks.append(
                     MultiSelfAttentionHead(
-                        self.cf.ae_global_dim_embed,
+                        dim_embed,
                         num_heads=self.cf.ae_global_num_heads,
                         dropout_rate=self.cf.ae_global_dropout_rate,
                         with_qk_lnorm=self.cf.ae_global_with_qk_lnorm,
@@ -505,7 +512,7 @@ class GlobalAssimilationEngine(torch.nn.Module):
             else:
                 self.ae_global_blocks.append(
                     MultiSelfAttentionHeadLocal(
-                        self.cf.ae_global_dim_embed,
+                        dim_embed,
                         num_heads=self.cf.ae_global_num_heads,
                         qkv_len=self.num_healpix_cells * self.cf.ae_local_num_queries,
                         block_factor=self.cf.ae_global_block_factor,
@@ -522,8 +529,8 @@ class GlobalAssimilationEngine(torch.nn.Module):
             # MLP block
             self.ae_global_blocks.append(
                 MLP(
-                    self.cf.ae_global_dim_embed,
-                    self.cf.ae_global_dim_embed,
+                    dim_embed,
+                    dim_embed,
                     with_residual=True,
                     dropout_rate=self.cf.ae_global_dropout_rate,
                     hidden_factor=self.cf.ae_global_mlp_hidden_factor,
@@ -532,9 +539,7 @@ class GlobalAssimilationEngine(torch.nn.Module):
                 )
             )
         if self.cf.get("ae_global_trailing_layer_norm", False):
-            self.ae_global_blocks.append(
-                torch.nn.LayerNorm(self.cf.ae_global_dim_embed, elementwise_affine=False)
-            )
+            self.ae_global_blocks.append(torch.nn.LayerNorm(dim_embed, elementwise_affine=False))
 
     def forward(self, tokens, coords=None):
         aux_info = None
@@ -557,15 +562,24 @@ class IdentityEngine(torch.nn.Module):
 class ForecastingEngine(torch.nn.Module):
     name: "ForecastingEngine"
 
-    def __init__(self, cf: Config, mode_cfg, num_healpix_cells: int, dim_aux: int = None) -> None:
+    def __init__(
+        self,
+        cf: Config,
+        mode_cfg,
+        num_healpix_cells: int,
+        dim_aux: int = None,
+        dim_embed: int | None = None,
+    ) -> None:
         """
         Initialize the ForecastingEngine with the configuration.
 
         :param cf: Configuration object containing parameters for the engine.
         :param num_healpix_cells: Number of healpix cells used for local queries.
+        :param dim_embed: size of the latent vectors (default cf.ae_global_dim_embed).
         """
         super(ForecastingEngine, self).__init__()
         self.cf = cf
+        dim_embed = dim_embed or self.cf.ae_global_dim_embed
         self.num_healpix_cells = num_healpix_cells
         self.fe_blocks = torch.nn.ModuleList()
 
@@ -576,7 +590,7 @@ class ForecastingEngine(torch.nn.Module):
                 if (i % global_rate == 0) or i + 1 == self.cf.fe_num_blocks:
                     self.fe_blocks.append(
                         MultiSelfAttentionHead(
-                            self.cf.ae_global_dim_embed,
+                            dim_embed,
                             num_heads=self.cf.fe_num_heads,
                             dropout_rate=self.cf.fe_dropout_rate,
                             with_qk_lnorm=self.cf.fe_with_qk_lnorm,
@@ -592,7 +606,7 @@ class ForecastingEngine(torch.nn.Module):
                 else:
                     self.fe_blocks.append(
                         MultiSelfAttentionHeadLocal(
-                            self.cf.ae_global_dim_embed,
+                            dim_embed,
                             num_heads=self.cf.fe_num_heads,
                             qkv_len=self.num_healpix_cells * self.cf.ae_local_num_queries,
                             block_factor=self.cf.ae_global_block_factor,
@@ -610,8 +624,8 @@ class ForecastingEngine(torch.nn.Module):
                 # Add MLP block
                 self.fe_blocks.append(
                     MLP(
-                        self.cf.ae_global_dim_embed,
-                        self.cf.ae_global_dim_embed,
+                        dim_embed,
+                        dim_embed,
                         with_residual=True,
                         dropout_rate=self.cf.fe_dropout_rate,
                         norm_type=self.cf.norm_type,
@@ -621,9 +635,7 @@ class ForecastingEngine(torch.nn.Module):
                 )
                 # Optionally, add LayerNorm after i-th layer
                 if i in self.cf.get("fe_layer_norm_after_blocks", []):
-                    self.fe_blocks.append(
-                        torch.nn.LayerNorm(self.cf.ae_global_dim_embed, elementwise_affine=False)
-                    )
+                    self.fe_blocks.append(torch.nn.LayerNorm(dim_embed, elementwise_affine=False))
 
         def init_weights_final(m):
             if isinstance(m, torch.nn.Linear):
@@ -715,6 +727,8 @@ class TargetPredictionEngineClassic(nn.Module):
         tr_mlp_hidden_factor,
         softcap,
         stream_config: dict,
+        dim_latent: int | None = None,
+        kv_level_dims: dict[int, int] | None = None,
     ):
         """
         Initialize the TargetPredictionEngine with the configuration.
@@ -725,6 +739,12 @@ class TargetPredictionEngineClassic(nn.Module):
         :param tr_dim_head_proj: Dimension for head projection.
         :param tr_mlp_hidden_factor: Hidden factor for the MLP layers.
         :param softcap: Softcap value for the attention layers.
+        :param dim_latent: size of the latent keys/values read by the decoder (default
+            cf.ae_global_dim_embed); for a multi-resolution latent, that of the stream's
+            own latent level.
+        :param kv_level_dims: multi-resolution latent: {level: latent size} of the decode
+            levels whose latent size differs from dim_latent; their keys are mapped to
+            dim_latent by a linear projection per level (`kv_proj`).
         """
         super(TargetPredictionEngineClassic, self).__init__()
         self.name = f"TargetPredictionEngine_{stream_config['name']}"
@@ -736,13 +756,14 @@ class TargetPredictionEngineClassic(nn.Module):
         self.tr_mlp_hidden_factor = tr_mlp_hidden_factor
         self.softcap = softcap
         self.tte = torch.nn.ModuleList()
+        dim_latent = dim_latent or self.cf.ae_global_dim_embed
 
         for i in range(len(self.dims_embed) - 1):
             # Multi-Cross Attention Head
             self.tte.append(
                 MultiCrossAttentionHeadVarlen(
                     dim_embed_q=self.dims_embed[i],
-                    dim_embed_kv=self.cf.ae_global_dim_embed,
+                    dim_embed_kv=dim_latent,
                     num_heads=stream_config["target_readout"]["num_heads"],
                     dim_head_proj=self.tr_dim_head_proj,
                     with_residual=True,
@@ -787,6 +808,17 @@ class TargetPredictionEngineClassic(nn.Module):
                     dim_aux=(self.dim_coord_in if self.cf.pred_mlp_adaln else None),
                     norm_eps=self.cf.mlp_norm_eps,
                 )
+            )
+
+        # multi-resolution latent with per-level latent sizes: keys of the other decode
+        # levels are projected to dim_latent (applied in Model.predict_decoders_kv_multi_level)
+        self.kv_proj = None
+        if kv_level_dims:
+            self.kv_proj = torch.nn.ModuleDict(
+                {
+                    str(lvl): torch.nn.Linear(dim, dim_latent, bias=False)
+                    for lvl, dim in kv_level_dims.items()
+                }
             )
 
     def forward(self, latent, output, latent_lens, output_lens, coordinates):
