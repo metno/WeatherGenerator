@@ -97,7 +97,7 @@ class DataReaderAnemoi(DataReaderTimestep):
             return
 
         kwargs = {}
-        if "frequency" in stream_info:
+        if "force_frequency" not in stream_info and "frequency" in stream_info:
             frequency = timedelta_to_str(stream_info["frequency"])
             kwargs["frequency"] = frequency
         if "subsampling_rate" in stream_info:
