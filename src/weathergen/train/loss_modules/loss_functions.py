@@ -2187,3 +2187,306 @@ def global_haar_wavelet_reshape_varweighted_crps(
         loss = torch.mean(loss_chs)
 
     return loss, loss_chs
+
+
+##############################################
+# Haar energy-matching loss (additional term)
+##############################################
+def _load_haar_template(owner, template_path: str, stream_name: str, tag: str):
+    """
+    Load and cache the template output grid on `owner` (a function object).
+
+    Returns (template_grid, (ny, nx)) with template_grid of shape (ny*nx, 2)
+    holding (lat, lon) in C order, or (None, None) if the template is missing
+    or cannot be read (reported once per stream).
+    Supports .npz (keys lat, lon, ny, nx) and NetCDF (latitude, longitude, y, x).
+    """
+    grid_key = f"_{tag}_template_grid_{template_path}"
+    shape_key = f"_{tag}_template_shape_{template_path}"
+    template_grid = getattr(owner, grid_key, None)
+    if template_grid is not None:
+        return template_grid, getattr(owner, shape_key)
+
+    if not template_path:
+        msg = "template_path is empty"
+    else:
+        try:
+            if template_path.endswith(".npz"):
+                _z = np.load(template_path)
+                olat, olon = _z["lat"], _z["lon"]
+                ny, nx = int(_z["ny"]), int(_z["nx"])
+            else:
+                import xarray as _xr
+
+                with _xr.open_dataset(template_path) as _ds:
+                    olat = _ds.latitude.values
+                    olon = _ds.longitude.values
+                    ny = len(_ds.y.values)
+                    nx = len(_ds.x.values)
+            template_grid = np.stack(
+                [np.asarray(olat).ravel(), np.asarray(olon).ravel()], axis=1
+            )
+            setattr(owner, grid_key, template_grid)
+            setattr(owner, shape_key, (ny, nx))
+            print(
+                f"[{owner.__name__}] stream={stream_name} template loaded: "
+                f"grid=({ny}x{nx})  n_output_points={ny * nx}"
+            )
+            return template_grid, (ny, nx)
+        except Exception as _e:
+            msg = f"failed to load template '{template_path}': {_e}"
+
+    _key = f"_{tag}_template_error_reported_{stream_name}"
+    if not getattr(owner, _key, False):
+        setattr(owner, _key, True)
+        print(f"[{owner.__name__}] stream={stream_name} {msg}. Setting loss to zero.")
+    return None, None
+
+
+def global_haar_energy_reshape(
+    target: torch.Tensor,
+    pred: torch.Tensor,
+    target_coords_raw: torch.Tensor,
+    weights_channels: torch.Tensor | None,
+    weights_points: torch.Tensor | None,
+    template_path: str = "",
+    num_levels: int = 3,
+    level_start: int = 0,
+    eps_rel: float = 0.01,
+    eps_field_rel: float = 1e-4,
+    eps_abs: float = 1e-8,
+    min_field_var: float = 1e-8,
+    ensemble_mode: str = "per_member",
+    regrid_method: str = "nearest",
+    monitor_every_n: int = 0,
+    stream_name: str = "",
+):
+    """
+    Haar detail-energy matching loss. Meant as an ADDITIONAL term next to an
+    MSE-type loss (e.g. global_haar_wavelet_reshape_varweighted), weighted by
+    its own config weight (lambda). On its own it does not constrain where
+    structures are, only how much energy each scale/orientation carries.
+
+    Motivation: MSE-trained models damp the energy of poorly predictable
+    scales (MSE-optimal amplitude is rho * sigma_t), so a scatter of predicted
+    vs target detail energy has slope < 1, worse at fine scales. This term
+    pulls that slope back to 1.
+
+    Definition. Regrid target and prediction onto the template grid, apply a
+    num_levels Haar cascade, and for every level l, channel c, band
+    b in {LH, HL, HH} compute the domain-mean energy over in-domain cells:
+
+        E_t(l,c,b) = mean_cells t_b^2        E_p(l,c,b) = mean_cells p_b^2
+
+    (the 2^l normalisation used for plotting cancels in the ratio, so it is
+    omitted). The per-term loss is the squared log ratio
+
+        ( log(E_p + eps) - log(E_t + eps) )^2
+
+    with a within-sample, detached floor
+
+        eps(l,c,b) = max( eps_rel * E_t(l,c,b),
+                          eps_field_rel * field_var(c),
+                          eps_abs )
+
+    where field_var(c) is the in-domain variance of the target field of
+    channel c in this sample. For normal samples the first term dominates and
+    the loss depends only on E_p / E_t; the second term keeps a nearly empty
+    band (calm sample, field still has variance) from producing huge
+    penalties for a small amount of predicted texture; eps_abs is a numerical
+    backstop. Channels whose field_var <= min_field_var in this sample (a
+    completely flat field) contribute zero.
+
+    Per channel the terms are averaged over the 3 bands and over the levels
+    lvl >= level_start; channels are combined as in the other losses.
+
+    Ensembles (pred has ens_size > 1). The ensemble mean is never used, since
+    averaging members removes fine-scale energy by construction:
+        "per_member"  : log-ratio loss per member, then averaged (default;
+                        every member must have realistic energy)
+        "mean_energy" : member energies averaged first, then compared
+                        (constrains the ensemble only on average)
+    With ens_size == 1 both are identical.
+
+    Masking. Template cells with no nearby data point (regional crop),
+    padding cells, and cells where the target is NaN are excluded. A detail
+    coefficient at a coarser level is used only if all four cells it is built
+    from are valid.
+
+    Monitoring. After each call the per-level ratios E_p / E_t (member-mean
+    energy, detached, NaN where undefined or level skipped) are stored as
+        global_haar_energy_reshape.last_energy_ratios[stream_name]
+    with shape (num_levels, num_channels, 3), band order (LH, HL, HH).
+    If monitor_every_n > 0, a short summary is printed every n-th call per
+    stream (median over channels per level and band).
+
+    Args:
+        target            : (num_points, num_channels)
+        pred              : (ens_size, num_points, num_channels)
+        target_coords_raw : (num_points, 2) geographic (lat, lon) degrees
+        weights_channels  : (num_channels,) or None
+        weights_points    : unused, kept for API consistency
+        template_path     : .npz or NetCDF template with 2D lat/lon
+        num_levels        : number of Haar levels
+        level_start       : first level that contributes to the loss
+        eps_rel           : floor relative to the target band energy
+        eps_field_rel     : floor relative to the target field variance;
+                            should be well below the typical E_t/field_var
+                            ratio at the finest level used (read it off the
+                            energy scatter plots; ~1-10% of that ratio)
+        eps_abs           : absolute numerical backstop for the floor
+        min_field_var     : channels flatter than this are skipped
+        ensemble_mode     : "per_member" or "mean_energy"
+        regrid_method     : "nearest" or "linear" (see _reshape_regrid_to_grid)
+        monitor_every_n   : print a ratio summary every n calls (0 = never)
+        stream_name       : used for prints and the monitoring dict
+
+    Returns:
+        loss     : scalar
+        loss_chs : (num_channels,) per-channel loss (not channel-weighted)
+    """
+    _self = global_haar_energy_reshape
+    assert ensemble_mode in ("per_member", "mean_energy"), ensemble_mode
+
+    if pred.dim() == 2:
+        pred = pred.unsqueeze(0)
+    num_points, num_channels = target.shape
+    ens_size = pred.shape[0]
+    dev = target.device
+    C, E = num_channels, ens_size
+
+    # NaN in target -> 0 in both, and remembered as an invalid-cell indicator
+    nan_t = torch.isnan(target)
+    tgt = torch.where(nan_t, torch.zeros_like(target), target).float()
+    prd = torch.where(nan_t.unsqueeze(0), torch.zeros_like(pred), pred).float()
+
+    def _zero():
+        # zero loss that stays attached to the graph (safe for DDP / backward)
+        z = prd.sum() * 0.0
+        return z, torch.zeros(C, device=dev)
+
+    template_grid, ny_nx = _load_haar_template(_self, template_path, stream_name, "en")
+    if template_grid is None:
+        return _zero()
+    ny, nx = ny_nx
+
+    # --- regrid target and every member in one call ---
+    # columns ordered (member, channel); target is tiled to the same layout so
+    # the helper's out-of-domain handling (p := t) lines up column by column.
+    # The NaN indicator is appended to both so it is regridded identically.
+    nan_ind = nan_t.float()
+    p_cols = prd.permute(1, 0, 2).reshape(num_points, E * C)
+    t_cols = tgt.repeat(1, E)
+    t_flat, p_flat, valid_cell, empty = _reshape_regrid_to_grid(
+        torch.cat([t_cols, nan_ind], dim=1),
+        torch.cat([p_cols, nan_ind], dim=1),
+        target_coords_raw, template_grid, ny, nx, E * C + C, dev,
+        regrid_method=regrid_method, stream_name=stream_name, _report_owner=_self,
+    )
+    if empty:
+        _key = f"_en_empty_domain_reported_{stream_name}"
+        if not getattr(_self, _key, False):
+            setattr(_self, _key, True)
+            print(
+                f"[global_haar_energy_reshape] stream={stream_name} no template "
+                f"cell near any data point; check template_path vs domain. Loss=0."
+            )
+        return _zero()
+
+    t_g = t_flat[:, :C].reshape(ny, nx, C).permute(2, 0, 1)                # (C,ny,nx)
+    p_g = p_flat[:, : E * C].reshape(ny, nx, E, C).permute(2, 3, 0, 1)     # (E,C,ny,nx)
+    nan_g = t_flat[:, E * C :].reshape(ny, nx, C).permute(2, 0, 1) > 0     # (C,ny,nx)
+    valid = valid_cell.view(1, ny, nx) & ~nan_g                            # (C,ny,nx)
+
+    # --- pad to a multiple of 2^num_levels (padding is invalid) ---
+    factor = 2**num_levels
+    ny_p = int(math.ceil(ny / factor)) * factor
+    nx_p = int(math.ceil(nx / factor)) * factor
+    pad = (0, nx_p - nx, 0, ny_p - ny)
+    if pad[1] or pad[3]:
+        t_g = F.pad(t_g, pad)
+        p_g = F.pad(p_g, pad)
+        valid = F.pad(valid.float(), pad) > 0.5
+
+    # --- in-domain target field variance per channel (eps reference) ---
+    vf = valid.float()
+    n_cells = vf.sum((-2, -1))                                             # (C,)
+    t_det = t_g.detach()
+    mean_c = (t_det * vf).sum((-2, -1)) / n_cells.clamp(min=1)
+    field_var = (((t_det - mean_c[:, None, None]) ** 2) * vf).sum((-2, -1)) / n_cells.clamp(
+        min=1
+    )
+    chan_active = (field_var > min_field_var) & (n_cells >= 4)             # (C,)
+
+    # --- Haar cascade and energy loss ---
+    loss_acc = torch.zeros(C, device=dev)
+    n_used = torch.zeros(C, device=dev)
+    ratios = torch.full((num_levels, C, 3), float("nan"), device=dev)
+
+    t_f, p_f, v_f = t_g, p_g, valid
+    for lvl in range(num_levels):
+        t_LL, t_LH, t_HL, t_HH = haar_2d(t_f)      # (C,h,w)
+        p_LL, p_LH, p_HL, p_HH = haar_2d(p_f)      # (E,C,h,w)
+        # a coefficient is valid only if all four parent cells are valid
+        v_c = v_f[..., 0::2, 0::2] & v_f[..., 1::2, 0::2] & v_f[..., 0::2, 1::2] & v_f[..., 1::2, 1::2]
+
+        if lvl >= level_start:
+            m = v_c.float().unsqueeze(1)                                   # (C,1,h,w)
+            n = m.sum((-2, -1)).squeeze(1)                                 # (C,)
+            has = n > 0
+            n_safe = n.clamp(min=1)[:, None]                               # (C,1)
+
+            t_b = torch.stack([t_LH, t_HL, t_HH], dim=1).detach()          # (C,3,h,w)
+            p_b = torch.stack([p_LH, p_HL, p_HH], dim=2)                   # (E,C,3,h,w)
+            E_t = (t_b**2 * m).sum((-2, -1)) / n_safe                      # (C,3)
+            E_p = (p_b**2 * m).sum((-2, -1)) / n_safe                      # (E,C,3)
+
+            eps = torch.maximum(eps_rel * E_t, (eps_field_rel * field_var)[:, None])
+            eps = eps.clamp(min=eps_abs)                                   # (C,3)
+            log_t = torch.log(E_t + eps)
+            if ensemble_mode == "per_member":
+                term = ((torch.log(E_p + eps) - log_t) ** 2).mean(0)       # (C,3)
+            else:
+                term = (torch.log(E_p.mean(0) + eps) - log_t) ** 2         # (C,3)
+
+            use = has & chan_active
+            loss_acc = loss_acc + torch.where(use, term.mean(1), torch.zeros_like(n))
+            n_used = n_used + use.float()
+
+            with torch.no_grad():
+                r = E_p.mean(0) / E_t.clamp(min=eps_abs)
+                ratios[lvl] = torch.where(use[:, None], r, torch.full_like(r, float("nan")))
+
+        t_f, p_f, v_f = t_LL, p_LL, v_c
+
+    loss_chs = loss_acc / n_used.clamp(min=1)
+    if weights_channels is not None:
+        loss = torch.mean(loss_chs * weights_channels.to(dev))
+    else:
+        loss = torch.mean(loss_chs)
+    loss = loss + prd.sum() * 0.0  # keep attached even if every term was skipped
+
+    # --- monitoring ---
+    if not hasattr(_self, "last_energy_ratios"):
+        _self.last_energy_ratios = {}
+    _self.last_energy_ratios[stream_name] = ratios.detach()
+
+    if monitor_every_n > 0:
+        _ck = f"_en_call_count_{stream_name}"
+        _cnt = getattr(_self, _ck, 0)
+        setattr(_self, _ck, _cnt + 1)
+        if _cnt % monitor_every_n == 0:
+            r_np = ratios.cpu().numpy()
+            parts = []
+            for lvl in range(level_start, num_levels):
+                with np.errstate(all="ignore"):
+                    med = np.nanmedian(r_np[lvl], axis=0) if np.isfinite(r_np[lvl]).any() else [np.nan] * 3
+                parts.append(
+                    f"L{lvl}(LH={med[0]:.3f} HL={med[1]:.3f} HH={med[2]:.3f})"
+                )
+            print(
+                f"[haar_energy] stream={stream_name} call={_cnt} "
+                f"loss={loss.item():.4f} median Ep/Et: " + " ".join(parts)
+            )
+
+    return loss, loss_chs

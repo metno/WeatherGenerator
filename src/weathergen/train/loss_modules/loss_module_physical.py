@@ -118,6 +118,7 @@ class LossPhysical(LossModuleBase):
             "global_haar_wavelet_reshape_varweighted",
             "global_haar_wavelet_reshape_varweighted_crps",
             "global_haar_ll_reshape_varweighted",
+            "global_haar_energy_reshape",
             "global_fft_mse",
         )
         self.loss_fcts = []
@@ -328,6 +329,32 @@ class LossPhysical(LossModuleBase):
             regrid_method=regrid_method,
             var_weight_rel=var_weight_rel,
             level_start=level_start,
+        )
+
+    @staticmethod
+    def _loss_global_haar_energy(
+        target, pred, target_coords_raw, weights_channels,
+        stream_name="", template_path="",
+        num_levels=3, level_start=0,
+        eps_rel=0.01, eps_field_rel=1e-4, eps_abs=1e-8,
+        min_field_var=1e-8, ensemble_mode="per_member",
+        regrid_method="nearest", monitor_every_n=0,
+    ):
+        if target.shape[0] == 0:
+            return (
+                torch.tensor(0.0, device=target.device, requires_grad=True),
+                torch.zeros(target.shape[-1], device=target.device),
+            )
+        target_coords_raw = target_coords_raw.to(target.device)
+        return loss_fns.global_haar_energy_reshape(
+            target, pred, target_coords_raw,
+            weights_channels=weights_channels, weights_points=None,
+            template_path=template_path,
+            num_levels=num_levels, level_start=level_start,
+            eps_rel=eps_rel, eps_field_rel=eps_field_rel, eps_abs=eps_abs,
+            min_field_var=min_field_var, ensemble_mode=ensemble_mode,
+            regrid_method=regrid_method, monitor_every_n=monitor_every_n,
+            stream_name=stream_name,
         )
 
     @staticmethod
@@ -569,6 +596,30 @@ class LossPhysical(LossModuleBase):
                                 **_ov,
                             )
 
+                        elif loss_fct_name == "global_haar_energy_reshape":
+                            # Same override pattern as the other Haar losses: keys in
+                            # the stream's `haar_energy_overrides` block win over the
+                            # global loss config; regrid_method may also be given at
+                            # the top level of the stream config.
+                            _ov = dict(loss_fct_params)
+                            _ov.update(stream_info.get("haar_energy_overrides", {}))
+                            if "regrid_method" in stream_info:
+                                _ov["regrid_method"] = stream_info["regrid_method"]
+                            _regrid = _ov.pop("regrid_method", "nearest")
+                            _ov.pop("template_path", None)
+                            # clear last diagnostics so an early return is not
+                            # logged with the ratios of a previous call
+                            getattr(
+                                loss_fns.global_haar_energy_reshape, "last_energy_ratios", {}
+                            ).pop(stream_name, None)
+                            loss_lfct, loss_lfct_chs = self._loss_global_haar_energy(
+                                target, pred, targets_coords_batch[target_idx],
+                                weights_channels, stream_name=stream_name,
+                                template_path=stream_info.get("template_path", ""),
+                                regrid_method=_regrid,
+                                **_ov,
+                            )
+
                         elif loss_fct_name == "global_fft_mse":
                             loss_lfct, loss_lfct_chs = self._loss_global_fft(
                                 target, pred, targets_coords_batch[target_idx],
@@ -595,6 +646,27 @@ class LossPhysical(LossModuleBase):
                             losses_all[stream_name][str(timestep_idx)][loss_fct_name][ch_n] = (
                                 spoof_weight * v if v != 0.0 and not is_spoof else torch.nan
                             )
+
+                        # Diagnostics for the energy loss: per level, the ratio
+                        # E_p / E_t (averaged over LH/HL/HH) of this call, logged per
+                        # channel as pseudo loss entries
+                        #   global_haar_energy_reshape_ratio_L<lvl>
+                        # so they reach the same metrics as the losses (train + val).
+                        # 1.0 = energies on the 1:1 line; < 1 = prediction too smooth.
+                        if loss_fct_name == "global_haar_energy_reshape":
+                            _ratios = getattr(
+                                loss_fns.global_haar_energy_reshape, "last_energy_ratios", {}
+                            ).get(stream_name)
+                            if _ratios is not None and _ratios.shape[1] == len(target_channels):
+                                _r_lvl = _ratios.nanmean(dim=-1)  # (levels, channels)
+                                for _lvl in range(_r_lvl.shape[0]):
+                                    _key = f"{loss_fct_name}_ratio_L{_lvl}"
+                                    _d = losses_all[stream_name][str(timestep_idx)][_key] = {}
+                                    for ch_n, v in zip(target_channels, _r_lvl[_lvl], strict=True):
+                                        _d[ch_n] = (
+                                            v if not is_spoof and bool(torch.isfinite(v))
+                                            else torch.nan
+                                        )
 
                         # Update EMA for dynamic loss if enabled
                         if (
