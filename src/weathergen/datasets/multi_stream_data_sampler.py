@@ -38,6 +38,7 @@ from weathergen.datasets.utils import (
 from weathergen.readers_extra.registry import get_extra_reader
 from weathergen.train.loss_modules.loss_functions import (
     _load_fft_crps_template,
+    _template_point_order,
 )
 from weathergen.train.utils import Stage, get_batch_size_from_config
 from weathergen.utils.distributed import is_root
@@ -48,7 +49,7 @@ type StreamName = str
 logger = logging.getLogger(__name__)
 
 
-def _load_fft_crps_point_counts(mode_cfg, streams) -> dict[str, int]:
+def _load_fft_crps_templates(mode_cfg, streams) -> dict[str, np.typing.NDArray]:
     templates = {}
     for loss_module_config in mode_cfg.get("losses", {}).values():
         fft_config = loss_module_config.get("loss_fcts", {}).get("global_fft_crps")
@@ -79,7 +80,7 @@ def _load_fft_crps_point_counts(mode_cfg, streams) -> dict[str, int]:
                 )
             templates[stream_name] = template_grid
 
-    return {stream_name: template.shape[0] for stream_name, template in templates.items()}
+    return templates
 
 
 FORECAST_DEFAULTS = {
@@ -191,7 +192,7 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         # initialise fsm, but can change for future mini_epochs
         self.batch_size = get_batch_size_from_config(mode_cfg)
         self.shuffle = mode_cfg.shuffle
-        self.fft_crps_point_counts = _load_fft_crps_point_counts(mode_cfg, cf.streams)
+        self.fft_crps_templates = _load_fft_crps_templates(mode_cfg, cf.streams)
 
         self.len_timedelta = mode_cfg.time_window_len
         self.step_timedelta = mode_cfg.time_window_step
@@ -307,7 +308,8 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
     def _fft_grid_issue(self, batch: ModelBatch) -> str | None:
         for sample in batch.target_samples.samples:
-            for stream_name, expected_points in self.fft_crps_point_counts.items():
+            for stream_name, template_grid in self.fft_crps_templates.items():
+                expected_points = template_grid.shape[0]
                 stream_data = sample.streams_data.get(stream_name)
                 if stream_data is None:
                     continue
@@ -391,19 +393,19 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                         ]
 
                     for time_label, source_points, time_mask in time_groups:
-                        if source_points.shape[0] != expected_points:
-                            return (
-                                f"FFT CRPS stream {stream_name!r}, sample "
-                                f"{stream_data.sample_idx}, step {step}, time {time_label}: "
-                                f"got {source_points.shape[0]} points, expected "
-                                f"{expected_points}; "
-                                "skipping this sample."
-                            )
                         if not np.isfinite(source_points).all():
                             return (
                                 f"FFT CRPS stream {stream_name!r}, sample "
                                 f"{stream_data.sample_idx}, step {step}, time {time_label}: "
                                 "coordinates contain non-finite values; skipping this sample."
+                            )
+                        try:
+                            _template_point_order(template_grid, source_points)
+                        except ValueError as exc:
+                            return (
+                                f"FFT CRPS stream {stream_name!r}, sample "
+                                f"{stream_data.sample_idx}, step {step}, time {time_label}: "
+                                f"{str(exc).rstrip('.')}; skipping this sample."
                             )
                         target_time_mask = torch.as_tensor(time_mask, dtype=torch.bool)
                         target_values_at_time = target_values[target_time_mask]

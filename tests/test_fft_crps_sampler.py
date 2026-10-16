@@ -6,11 +6,11 @@ import torch
 from weathergen.datasets.data_reader_anemoi import _get_anemoi_missing_dates
 from weathergen.datasets.multi_stream_data_sampler import (
     MultiStreamDataSampler,
-    _load_fft_crps_point_counts,
+    _load_fft_crps_templates,
 )
 
 
-def test_fft_crps_point_counts_respect_stream_scope(tmp_path):
+def test_fft_crps_templates_respect_stream_scope(tmp_path):
     template_path = tmp_path / "grid.npz"
     lat, lon = np.meshgrid(
         np.linspace(40.0, 44.0, 4),
@@ -32,7 +32,9 @@ def test_fft_crps_point_counts_respect_stream_scope(tmp_path):
         "ERA55": {"template_path": "unused.npz"},
     }
 
-    assert _load_fft_crps_point_counts(mode_config, streams) == {"MEPS": 16}
+    templates = _load_fft_crps_templates(mode_config, streams)
+    assert templates.keys() == {"MEPS"}
+    assert templates["MEPS"].shape == (16, 2)
 
 
 def test_anemoi_missing_indices_are_mapped_to_timestamps():
@@ -57,7 +59,8 @@ def _sampler_and_batch(
     )
 
     sampler = object.__new__(MultiStreamDataSampler)
-    sampler.fft_crps_point_counts = {"MEPS": lat.size}
+    template_coords = np.stack((lat.ravel(), lon.ravel()), axis=1)
+    sampler.fft_crps_templates = {"MEPS": template_coords}
     sampler.streams_datasets = {
         "MEPS": SimpleNamespace(
             info={"tokenize_spacetime": tokenize_spacetime},
@@ -91,6 +94,8 @@ def test_fft_grid_issue_reports_timestamp_with_incomplete_grid():
     assert "sample 37" in issue
     assert "2021-03-01T06:00" in issue
     assert "got 15 points, expected 16" in issue
+    assert issue.count("got 15") == 1
+    assert ".;" not in issue
 
 
 def test_fft_grid_issue_skips_anemoi_reported_missing_timestamp():
@@ -165,6 +170,39 @@ def test_fft_grid_issue_accepts_complete_point_count():
     sampler, batch = _sampler_and_batch(coords, times)
 
     assert sampler._fft_grid_issue(batch) is None
+
+
+def test_fft_grid_issue_accepts_complete_template_with_additional_crop_points():
+    lat, lon = np.meshgrid(
+        np.linspace(40.0, 44.0, 4),
+        np.linspace(5.0, 9.0, 4),
+        indexing="ij",
+    )
+    template_coords = np.stack((lat.ravel(), lon.ravel()), axis=1)
+    coords = np.concatenate((template_coords, [[35.0, 0.0]]))
+    times = np.full(len(coords), np.datetime64("2021-03-01T06:00"))
+    sampler, batch = _sampler_and_batch(coords, times)
+
+    assert sampler._fft_grid_issue(batch) is None
+
+
+def test_fft_grid_issue_rejects_missing_template_cell_with_additional_crop_point():
+    lat, lon = np.meshgrid(
+        np.linspace(40.0, 44.0, 4),
+        np.linspace(5.0, 9.0, 4),
+        indexing="ij",
+    )
+    template_coords = np.stack((lat.ravel(), lon.ravel()), axis=1)
+    coords = np.concatenate((template_coords[:-1], [[35.0, 0.0]]))
+    times = np.full(len(coords), np.datetime64("2021-03-01T06:00"))
+    sampler, batch = _sampler_and_batch(coords, times)
+
+    issue = sampler._fft_grid_issue(batch)
+
+    assert issue is not None
+    assert "every template cell must match exactly once" in issue
+    assert "1 of 16 cells missing" in issue
+    assert issue.endswith("cells missing, 0 matched more than once); skipping this sample.")
 
 
 def test_fft_grid_issue_rejects_nonfinite_target_values():

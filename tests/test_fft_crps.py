@@ -6,12 +6,24 @@ import torch
 from omegaconf import OmegaConf
 
 from weathergen.train.loss_modules.loss_functions import (
+    _FFT_POINT_ORDER_CACHE,
+    _FFT_TEMPLATE_TREE_CACHE,
+    _template_point_order,
     crps_kernel_pointwise,
     global_fft_crps,
     kernel_crps,
 )
 from weathergen.train.loss_modules.loss_module_physical import LossPhysical
 from weathergen.train.utils import TRAIN
+
+
+def _write_template_grid(n_side=4):
+    lat, lon = np.meshgrid(
+        np.linspace(40.0, 44.0, n_side),
+        np.linspace(5.0, 9.0, n_side),
+        indexing="ij",
+    )
+    return np.stack((lat.ravel(), lon.ravel()), axis=1)
 
 
 def _write_template(path, n_side=4):
@@ -237,6 +249,34 @@ def test_global_fft_crps_reorders_shuffled_regular_grid_points(tmp_path):
     assert torch.allclose(loss_ordered, loss_shuffled, atol=1e-7)
 
 
+def test_global_fft_crps_uses_template_rectangle_from_larger_source_set(tmp_path):
+    template_path = tmp_path / "grid.npz"
+    coords = _write_template(template_path)
+    extra_coords = torch.tensor([[35.0, 0.0], [50.0, 20.0]])
+    all_coords = torch.cat((coords, extra_coords))
+    target = torch.sin(torch.arange(len(all_coords), dtype=torch.float32)).unsqueeze(1)
+    pred = torch.stack((target + 0.1, target - 0.2))
+
+    loss_with_extra_points, _ = global_fft_crps(
+        target,
+        pred,
+        all_coords,
+        weights_channels=None,
+        weights_points=None,
+        template_path=str(template_path),
+    )
+    loss_on_rectangle, _ = global_fft_crps(
+        target[: len(coords)],
+        pred[:, : len(coords)],
+        coords,
+        weights_channels=None,
+        weights_points=None,
+        template_path=str(template_path),
+    )
+
+    assert torch.allclose(loss_with_extra_points, loss_on_rectangle, atol=1e-7)
+
+
 def test_global_fft_crps_accepts_float32_coordinate_rounding(tmp_path):
     template_path = tmp_path / "grid.npz"
     coords = _write_template(template_path)
@@ -307,7 +347,7 @@ def test_global_fft_crps_rejects_incomplete_grid(tmp_path):
 
     with pytest.raises(
         ValueError,
-        match=r"complete rectangular grids.*got 15, expected 16",
+        match=r"complete rectangular grids.*got 15 points, expected 16",
     ):
         global_fft_crps(
             target,
@@ -317,6 +357,56 @@ def test_global_fft_crps_rejects_incomplete_grid(tmp_path):
             weights_points=None,
             template_path=str(template_path),
         )
+
+
+def test_global_fft_crps_rejects_missing_template_cell_with_extra_source_point(tmp_path):
+    template_path = tmp_path / "grid.npz"
+    coords = _write_template(template_path)
+    source_coords = torch.cat((coords[:-1], torch.tensor([[35.0, 0.0]])))
+    target = torch.zeros(len(source_coords), 1)
+    pred = torch.zeros(2, len(source_coords), 1)
+
+    with pytest.raises(ValueError, match=r"1 of 16 cells missing, 0 matched more than once"):
+        global_fft_crps(
+            target,
+            pred,
+            source_coords,
+            weights_channels=None,
+            weights_points=None,
+            template_path=str(template_path),
+        )
+
+
+def test_template_point_order_reports_duplicated_cells():
+    template = _write_template_grid()
+    source = np.concatenate((template, template[:1]))
+
+    with pytest.raises(ValueError, match=r"0 of 16 cells missing, 1 matched more than once"):
+        _template_point_order(template, source)
+
+
+def test_template_point_order_cache_returns_independent_copy():
+    template = _write_template_grid()
+    source = np.concatenate((template[::-1], [[35.0, 0.0]]))
+
+    order = _template_point_order(template, source)
+    expected = order.copy()
+    order[:] = 0
+
+    np.testing.assert_array_equal(_template_point_order(template, source), expected)
+
+
+def test_template_point_order_reuses_template_tree():
+    template = _write_template_grid()
+    _FFT_POINT_ORDER_CACHE.clear()
+    _FFT_TEMPLATE_TREE_CACHE.clear()
+
+    _template_point_order(template, np.concatenate((template[::-1], [[35.0, 0.0]])))
+    tree = next(iter(_FFT_TEMPLATE_TREE_CACHE.values()))
+    _template_point_order(template, np.concatenate((template[::-1], [[36.0, 0.0]])))
+
+    assert len(_FFT_TEMPLATE_TREE_CACHE) == 1
+    assert next(iter(_FFT_TEMPLATE_TREE_CACHE.values())) is tree
 
 
 def test_global_fft_crps_rejects_irregular_source_points(tmp_path):

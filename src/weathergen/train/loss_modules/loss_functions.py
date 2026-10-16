@@ -8,7 +8,9 @@
 # nor does it submit to any jurisdiction.
 
 
+from collections import OrderedDict
 from functools import lru_cache
+from hashlib import blake2b
 
 import numpy as np
 import torch
@@ -16,6 +18,30 @@ import torch.nn.functional as F
 
 stat_loss_fcts = ["stats", "kernel_crps"]  # Names of loss functions that need std computed
 _FFT_COORD_TOLERANCE = 2e-5
+_FFT_POINT_ORDER_CACHE: OrderedDict[tuple, np.typing.NDArray] = OrderedDict()
+_FFT_POINT_ORDER_CACHE_SIZE = 8
+_FFT_TEMPLATE_TREE_CACHE: OrderedDict[tuple, object] = OrderedDict()
+_FFT_TEMPLATE_TREE_CACHE_SIZE = 4
+
+
+def _array_digest(array: np.typing.NDArray) -> bytes:
+    return blake2b(memoryview(array).cast("B"), digest_size=16).digest()
+
+
+def _template_tree(template_grid: np.typing.NDArray, template_key: tuple):
+    """Return a cached KD-tree for the template so it is not rebuilt on every cache miss."""
+    tree = _FFT_TEMPLATE_TREE_CACHE.get(template_key)
+    if tree is not None:
+        _FFT_TEMPLATE_TREE_CACHE.move_to_end(template_key)
+        return tree
+
+    from scipy.spatial import cKDTree
+
+    tree = cKDTree(template_grid)
+    _FFT_TEMPLATE_TREE_CACHE[template_key] = tree
+    if len(_FFT_TEMPLATE_TREE_CACHE) > _FFT_TEMPLATE_TREE_CACHE_SIZE:
+        _FFT_TEMPLATE_TREE_CACHE.popitem(last=False)
+    return tree
 
 
 def gaussian(x, mu=0.0, std_dev=1.0):
@@ -208,28 +234,50 @@ def _load_fft_crps_template(
 def _template_point_order(
     template_grid: np.typing.NDArray, source_points: np.typing.NDArray
 ) -> np.typing.NDArray:
-    """Return source indices in template order, allowing for float32 coordinate rounding."""
-    if source_points.shape != template_grid.shape:
+    """Return source indices in template order, allowing for additional source points."""
+    if source_points.ndim != 2 or source_points.shape[1] != 2:
+        raise ValueError("FFT CRPS source points must have shape (points, 2).")
+    if source_points.shape[0] < template_grid.shape[0]:
         raise ValueError(
-            "FFT CRPS only supports complete rectangular grids: source points must "
-            f"match the template point count (got {source_points.shape[0]}, "
-            f"expected {template_grid.shape[0]})."
-        )
-    if np.allclose(source_points, template_grid, rtol=0.0, atol=_FFT_COORD_TOLERANCE):
-        return np.arange(source_points.shape[0])
-
-    from scipy.spatial import cKDTree
-
-    distances, cells = cKDTree(template_grid).query(source_points)
-    if np.any(distances > _FFT_COORD_TOLERANCE) or np.unique(cells).size != template_grid.shape[0]:
-        raise ValueError(
-            "FFT CRPS only supports complete rectangular grids: each source point "
-            "must match exactly one template cell."
+            "FFT CRPS only supports complete rectangular grids: got "
+            f"{source_points.shape[0]} points, expected {template_grid.shape[0]} "
+            "template points."
         )
 
-    order = np.empty(cells.shape[0], dtype=np.int64)
-    order[cells] = np.arange(cells.shape[0])
-    return order
+    template_grid = np.ascontiguousarray(template_grid, dtype=np.float64)
+    source_points = np.ascontiguousarray(source_points, dtype=np.float64)
+    template_key = (template_grid.shape, _array_digest(template_grid))
+    cache_key = (*template_key, source_points.shape, _array_digest(source_points))
+    cached_order = _FFT_POINT_ORDER_CACHE.get(cache_key)
+    if cached_order is not None:
+        _FFT_POINT_ORDER_CACHE.move_to_end(cache_key)
+        return cached_order.copy()
+
+    if source_points.shape == template_grid.shape and np.allclose(
+        source_points, template_grid, rtol=0.0, atol=_FFT_COORD_TOLERANCE
+    ):
+        order = np.arange(source_points.shape[0])
+    else:
+        distances, cells = _template_tree(template_grid, template_key).query(source_points)
+        matched = distances <= _FFT_COORD_TOLERANCE
+        matched_cells = cells[matched]
+        counts = np.bincount(matched_cells, minlength=template_grid.shape[0])
+        if np.any(counts != 1):
+            n_missing = int(np.count_nonzero(counts == 0))
+            n_duplicated = int(np.count_nonzero(counts > 1))
+            raise ValueError(
+                "FFT CRPS only supports complete rectangular grids: every template cell "
+                f"must match exactly once ({n_missing} of {template_grid.shape[0]} cells "
+                f"missing, {n_duplicated} matched more than once)."
+            )
+
+        order = np.empty(template_grid.shape[0], dtype=np.int64)
+        order[matched_cells] = np.flatnonzero(matched)
+
+    _FFT_POINT_ORDER_CACHE[cache_key] = order
+    if len(_FFT_POINT_ORDER_CACHE) > _FFT_POINT_ORDER_CACHE_SIZE:
+        _FFT_POINT_ORDER_CACHE.popitem(last=False)
+    return order.copy()
 
 
 def global_fft_crps(
@@ -246,8 +294,9 @@ def global_fft_crps(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute spectral CRPS on a complete rectangular grid.
 
-    Source points may be flattened or reordered, but must match every template
-    cell exactly once. ``regular_latlon`` validates a uniformly spaced
+    Source points may be flattened or reordered and may include points outside
+    the template rectangle. They must contain every template cell exactly once.
+    ``regular_latlon`` validates a uniformly spaced
     rectilinear latitude/longitude grid. ``structured_projected`` uses the
     template's 2D cell order and assumes uniform spacing in the native projected
     coordinates; those projected coordinates are not available for validation.
