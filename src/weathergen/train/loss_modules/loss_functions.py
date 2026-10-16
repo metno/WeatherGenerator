@@ -886,6 +886,202 @@ def global_fft_mse(
     return loss, loss_chs
 
 
+# ---------------------------------------------------------------------------
+# Regridding geometry cache for the *_reshape_* Haar losses.
+#
+# The geometry of regridding scattered points onto the template (nearest-
+# neighbour indices, in-domain mask, optional linear weights) depends only on
+# the template and the target coordinates, not on the values. Building it
+# costs several KD-trees over ~1e6 points per call, and every Haar loss used to
+# rebuild it. It is now cached and shared by all losses that call
+# _reshape_regrid_to_grid.
+#
+# Multi-GPU / multi-node: the cache is per process (each rank has its own),
+# holds only deterministic functions of (template, coordinates), and is never
+# communicated, so ranks cannot diverge or block each other. Not checkpointed;
+# rebuilt after a restart.
+# Correctness: a hit requires the coordinates to be exactly equal to the
+# cached ones (hash for lookup, then np.array_equal), so a hash collision or
+# changed coordinates can never return wrong indices; changing coordinates
+# simply miss and cost the same as without the cache.
+# Results are bit-identical to the uncached path.
+# ---------------------------------------------------------------------------
+REGRID_CACHE_ENABLE = True
+REGRID_CACHE_MAX_ENTRIES = 4      # LRU entries (per process, all streams)
+REGRID_CACHE_REPORT_EVERY = 500   # print hit statistics every N lookups (0 = never)
+
+_REGRID_CACHE: "OrderedDict[tuple, dict]" = None  # created lazily
+_REGRID_STATS = {"lookups": 0, "hits": 0, "miss_time": 0.0, "misses": 0}
+_TEMPLATE_INFO: list = []  # [(template_array, fingerprint, tmpl_dx)]
+
+
+def _fingerprint(arr) -> str:
+    import hashlib
+
+    a = np.ascontiguousarray(arr)
+    h = hashlib.blake2b(digest_size=16)
+    h.update(str((a.dtype.str, a.shape)).encode())
+    h.update(a.data)
+    return h.hexdigest()
+
+
+def _template_info(template_grid):
+    """(fingerprint, median nearest-neighbour spacing) of a template, computed once."""
+    for arr, fp, dx in _TEMPLATE_INFO:
+        if arr is template_grid:
+            return fp, dx
+    from scipy.spatial import cKDTree as _cKDTree
+
+    fp = _fingerprint(template_grid)
+    for _arr, _fp, _dx in _TEMPLATE_INFO:   # same content held by another loss
+        if _fp == fp:
+            _TEMPLATE_INFO.append((template_grid, fp, _dx))
+            return fp, _dx
+    _tmpl_nn, _ = _cKDTree(template_grid).query(template_grid, k=2)
+    dx = float(np.median(_tmpl_nn[:, 1]))
+    _TEMPLATE_INFO.append((template_grid, fp, dx))
+    return fp, dx
+
+
+def _regrid_geometry_nearest(ipoints, template_grid, tmpl_dx):
+    """Nearest-neighbour indices and in-domain mask (numpy). Same maths as before."""
+    import scipy.interpolate as _sci
+    from scipy.spatial import cKDTree as _cKDTree
+
+    interpolator = _sci.NearestNDInterpolator(ipoints, np.arange(ipoints.shape[0]))
+    Isort = interpolator(template_grid).astype(int)
+
+    # --- domain crop: mask template cells with no nearby data point ---
+    # template_grid is the FULL (uncropped) grid. Under a regional `domain:` the
+    # data covers only a sub-box, and NearestNDInterpolator extrapolates every
+    # outside cell to the nearest edge point, smearing it across the sphere.
+    # Reject cells whose nearest actual data point is far away. The radius is
+    # scaled by the coarser of {template spacing, data spacing} so a legitimately
+    # coarse stream (ERA5) on a fine template (MEPS) fills its natural footprint
+    # while genuine out-of-domain cells are still rejected.
+    if ipoints.shape[0] >= 2:
+        _tree_data = _cKDTree(ipoints)
+        _self_nn, _ = _tree_data.query(ipoints, k=2)
+        _data_dx = float(np.median(_self_nn[:, 1]))
+    else:
+        _tree_data = _cKDTree(ipoints)
+        _data_dx = tmpl_dx
+    _max_dist = max(max(tmpl_dx, _data_dx) * 2.0, 1e-6)
+    _data_nn, _ = _tree_data.query(template_grid, k=1)
+    valid = _data_nn <= _max_dist
+    return Isort, valid
+
+
+def _regrid_geometry_linear(ipoints, template_grid):
+    """Barycentric weights (numpy) or an error string. Same maths as before."""
+    if ipoints.shape[0] < 3:
+        return None
+    try:
+        from scipy.spatial import Delaunay as _Delaunay
+
+        _tri = _Delaunay(ipoints)
+        _simplex = _tri.find_simplex(template_grid)
+        _inside = _simplex >= 0
+        if not _inside.any():
+            return None
+        _sx = _simplex[_inside]
+        _T = _tri.transform[_sx, :2]
+        _r = template_grid[_inside] - _tri.transform[_sx, 2]
+        _bary2 = np.einsum("mij,mj->mi", _T, _r)
+        _bary = np.concatenate([_bary2, 1.0 - _bary2.sum(axis=1, keepdims=True)], axis=1)
+        _verts = _tri.simplices[_sx]
+        _rows = np.repeat(np.flatnonzero(_inside), 3)
+        _cols = _verts.reshape(-1)
+        _wts = _bary.reshape(-1).astype(np.float32)
+        return {"inside": _inside, "rows": _rows, "cols": _cols, "wts": _wts}
+    except Exception as _e_lin:
+        return str(_e_lin)
+
+
+def _regrid_geometry(ipoints, template_grid, regrid_method, dev):
+    """
+    Geometry for _reshape_regrid_to_grid as device tensors:
+      {"Isort": (M,) long, "valid": (M,) bool,
+       "lin": None | error str | {"W": sparse (M,N), "inside": (M,1) bool}}
+    Cached per process (see REGRID_CACHE_* above).
+    """
+    import time
+    from collections import OrderedDict
+
+    global _REGRID_CACHE
+    want_linear = regrid_method == "linear"
+    fp_tmpl, tmpl_dx = _template_info(template_grid)
+
+    entry = None
+    key = None
+    if REGRID_CACHE_ENABLE:
+        if _REGRID_CACHE is None:
+            _REGRID_CACHE = OrderedDict()
+        key = (fp_tmpl, _fingerprint(ipoints))
+        _REGRID_STATS["lookups"] += 1
+        entry = _REGRID_CACHE.get(key)
+        if entry is not None and not np.array_equal(entry["ipoints"], ipoints):
+            entry = None  # hash collision: never trust it
+        if entry is not None:
+            _REGRID_STATS["hits"] += 1
+            _REGRID_CACHE.move_to_end(key)
+
+    t0 = time.perf_counter()
+    computed = False
+    if entry is None:
+        Isort, valid = _regrid_geometry_nearest(ipoints, template_grid, tmpl_dx)
+        entry = {"ipoints": ipoints.copy(), "Isort": Isort, "valid": valid,
+                 "lin_np": "not_computed", "dev": {}}
+        computed = True
+    if want_linear and isinstance(entry["lin_np"], str) and entry["lin_np"] == "not_computed":
+        entry["lin_np"] = _regrid_geometry_linear(ipoints, template_grid)
+        entry["dev"] = {}  # device copies lack the linear weights
+        computed = True
+    if computed:
+        _REGRID_STATS["misses"] += 1
+        _REGRID_STATS["miss_time"] += time.perf_counter() - t0
+        if REGRID_CACHE_ENABLE:
+            _REGRID_CACHE[key] = entry
+            _REGRID_CACHE.move_to_end(key)
+            while len(_REGRID_CACHE) > max(REGRID_CACHE_MAX_ENTRIES, 1):
+                _REGRID_CACHE.popitem(last=False)
+
+    # device tensors (one copy per device per entry)
+    dkey = str(dev)
+    d = entry["dev"].get(dkey)
+    if d is None or (want_linear and "lin" not in d):
+        d = {
+            "Isort": torch.from_numpy(entry["Isort"]).long().to(dev),
+            "valid": torch.from_numpy(entry["valid"]).to(dev),
+        }
+        lin_np = entry["lin_np"]
+        if want_linear:
+            if isinstance(lin_np, dict):
+                W = torch.sparse_coo_tensor(
+                    torch.from_numpy(np.stack([lin_np["rows"], lin_np["cols"]])).long(),
+                    torch.from_numpy(lin_np["wts"]),
+                    size=(template_grid.shape[0], ipoints.shape[0]),
+                    device=dev,
+                    check_invariants=False,
+                ).coalesce()
+                d["lin"] = {"W": W,
+                            "inside": torch.from_numpy(lin_np["inside"]).to(dev).unsqueeze(-1)}
+            else:
+                d["lin"] = lin_np  # None or error string
+        entry["dev"][dkey] = d
+
+    n = REGRID_CACHE_REPORT_EVERY
+    if REGRID_CACHE_ENABLE and n > 0 and _REGRID_STATS["lookups"] % n == 0:
+        s = _REGRID_STATS
+        avg_miss = s["miss_time"] / max(s["misses"], 1)
+        print(
+            f"[regrid_cache] lookups={s['lookups']} hits={s['hits']} "
+            f"({100.0 * s['hits'] / max(s['lookups'], 1):.1f}%) "
+            f"entries={len(_REGRID_CACHE)} avg_build_time={avg_miss:.2f}s"
+        )
+    return d
+
+
 def _reshape_regrid_to_grid(
     target,
     pred_mean,
@@ -904,7 +1100,8 @@ def _reshape_regrid_to_grid(
     template grid, returning flat (ny*nx, C) tensors plus a per-cell validity mask.
 
     Shared by the *_reshape_varweighted family so the domain-crop fix and the
-    nearest/linear regridding option stay identical across them.
+    nearest/linear regridding option stay identical across them. The geometry
+    (indices, mask, linear weights) is cached per process; see REGRID_CACHE_*.
 
     Returns
     -------
@@ -924,43 +1121,15 @@ def _reshape_regrid_to_grid(
                   as a differentiable sparse weight matrix to both target and
                   pred. Cells outside the source convex hull fall back to nearest.
     """
-    import numpy as _np
-    import scipy.interpolate as _sci
-    from scipy.spatial import cKDTree as _cKDTree
-
     owner = _report_owner  # object to hang one-shot warning flags on (a function)
 
     ilat = target_coords_raw[:, 0].cpu().numpy()
     ilon = target_coords_raw[:, 1].cpu().numpy()
-    ipoints = _np.concatenate([ilat[:, None], ilon[:, None]], axis=1)
+    ipoints = np.concatenate([ilat[:, None], ilon[:, None]], axis=1)
 
-    # nearest index gather (always computed: it is the default and the fallback)
-    interpolator = _sci.NearestNDInterpolator(ipoints, _np.arange(len(ilat)))
-    Isort = interpolator(template_grid).astype(int)
-    Isort_t = torch.from_numpy(Isort).long().to(dev)
-
-    # --- domain crop: mask template cells with no nearby data point ---
-    # template_grid is the FULL (uncropped) grid. Under a regional `domain:` the
-    # data covers only a sub-box, and NearestNDInterpolator extrapolates every
-    # outside cell to the nearest edge point, smearing it across the sphere.
-    # Reject cells whose nearest actual data point is far away. The radius is
-    # scaled by the coarser of {template spacing, data spacing} so a legitimately
-    # coarse stream (ERA5) on a fine template (MEPS) fills its natural footprint
-    # while genuine out-of-domain cells are still rejected.
-    _tree_tmpl = _cKDTree(template_grid)
-    _tmpl_nn, _ = _tree_tmpl.query(template_grid, k=2)
-    _tmpl_dx = float(_np.median(_tmpl_nn[:, 1]))
-    if ipoints.shape[0] >= 2:
-        _tree_self = _cKDTree(ipoints)
-        _self_nn, _ = _tree_self.query(ipoints, k=2)
-        _data_dx = float(_np.median(_self_nn[:, 1]))
-    else:
-        _data_dx = _tmpl_dx
-    _max_dist = max(max(_tmpl_dx, _data_dx) * 2.0, 1e-6)
-
-    _tree_data = _cKDTree(ipoints)
-    _data_nn, _ = _tree_data.query(template_grid, k=1)
-    valid_cell = torch.from_numpy(_data_nn <= _max_dist).to(dev)  # (ny*nx,)
+    geo = _regrid_geometry(ipoints, template_grid, regrid_method, dev)
+    Isort_t = geo["Isort"]
+    valid_cell = geo["valid"]
 
     # nearest gather
     t_flat = target.float()[Isort_t]
@@ -970,48 +1139,23 @@ def _reshape_regrid_to_grid(
     p_flat = torch.where(_valid_c, p_flat, t_flat.detach())
 
     # --- optional linear (barycentric) regridding ---
-    if regrid_method == "linear" and ipoints.shape[0] >= 3:
-        try:
-            from scipy.spatial import Delaunay as _Delaunay
-
-            _tri = _Delaunay(ipoints)
-            _simplex = _tri.find_simplex(template_grid)
-            _inside = _simplex >= 0
-            if _inside.any():
-                _sx = _simplex[_inside]
-                _T = _tri.transform[_sx, :2]
-                _r = template_grid[_inside] - _tri.transform[_sx, 2]
-                _bary2 = _np.einsum("mij,mj->mi", _T, _r)
-                _bary = _np.concatenate(
-                    [_bary2, 1.0 - _bary2.sum(axis=1, keepdims=True)], axis=1
+    if regrid_method == "linear":
+        lin = geo.get("lin")
+        if isinstance(lin, dict):
+            _t_lin = torch.sparse.mm(lin["W"], target.float())
+            _p_lin = torch.sparse.mm(lin["W"], pred_mean.float())
+            t_flat = torch.where(lin["inside"], _t_lin, t_flat)
+            p_flat = torch.where(lin["inside"], _p_lin, p_flat)
+            p_flat = torch.where(_valid_c, p_flat, t_flat.detach())
+        elif isinstance(lin, str) and owner is not None:
+            _key = f"_regrid_linear_failed_{stream_name}"
+            if not getattr(owner, _key, False):
+                setattr(owner, _key, True)
+                print(
+                    f"[reshape_regrid] stream={stream_name} linear regrid "
+                    f"failed ({lin}); falling back to nearest."
                 )
-                _verts = _tri.simplices[_sx]
-                _rows = _np.repeat(_np.flatnonzero(_inside), 3)
-                _cols = _verts.reshape(-1)
-                _wts = _bary.reshape(-1).astype(_np.float32)
-                _W = torch.sparse_coo_tensor(
-                    torch.from_numpy(_np.stack([_rows, _cols])).long(),
-                    torch.from_numpy(_wts),
-                    size=(template_grid.shape[0], ipoints.shape[0]),
-                    device=dev,
-                    check_invariants=False,
-                ).coalesce()
-                _t_lin = torch.sparse.mm(_W, target.float())
-                _p_lin = torch.sparse.mm(_W, pred_mean.float())
-                _inside_t = torch.from_numpy(_inside).to(dev).unsqueeze(-1)
-                t_flat = torch.where(_inside_t, _t_lin, t_flat)
-                p_flat = torch.where(_inside_t, _p_lin, p_flat)
-                p_flat = torch.where(_valid_c, p_flat, t_flat.detach())
-        except Exception as _e_lin:
-            if owner is not None:
-                _key = f"_regrid_linear_failed_{stream_name}"
-                if not getattr(owner, _key, False):
-                    setattr(owner, _key, True)
-                    print(
-                        f"[reshape_regrid] stream={stream_name} linear regrid "
-                        f"failed ({_e_lin}); falling back to nearest."
-                    )
-    elif regrid_method not in ("nearest", "linear"):
+    elif regrid_method != "nearest":
         if owner is not None:
             _key = f"_regrid_bad_method_{stream_name}"
             if not getattr(owner, _key, False):

@@ -647,20 +647,22 @@ class LossPhysical(LossModuleBase):
                                 spoof_weight * v if v != 0.0 and not is_spoof else torch.nan
                             )
 
-                        # Diagnostics for the energy loss: per level, the ratio
-                        # E_p / E_t (averaged over LH/HL/HH) of this call, logged per
+                        # Diagnostics for the energy loss: per level, log10(E_p / E_t)
+                        # of this call (averaged over LH/HL/HH in log space), logged per
                         # channel as pseudo loss entries
-                        #   global_haar_energy_reshape_ratio_L<lvl>
+                        #   global_haar_energy_reshape_log10ratio_L<lvl>
                         # so they reach the same metrics as the losses (train + val).
-                        # 1.0 = energies on the 1:1 line; < 1 = prediction too smooth.
+                        # 0 = energies on the 1:1 line; -0.3 = half the target energy
+                        # (too smooth); +1 = ten times too much. Log space keeps the
+                        # cross-channel .avg robust (log of the geometric mean).
                         if loss_fct_name == "global_haar_energy_reshape":
                             _ratios = getattr(
                                 loss_fns.global_haar_energy_reshape, "last_energy_ratios", {}
                             ).get(stream_name)
                             if _ratios is not None and _ratios.shape[1] == len(target_channels):
-                                _r_lvl = _ratios.nanmean(dim=-1)  # (levels, channels)
+                                _r_lvl = torch.log10(_ratios.clamp(min=1e-6)).nanmean(dim=-1)
                                 for _lvl in range(_r_lvl.shape[0]):
-                                    _key = f"{loss_fct_name}_ratio_L{_lvl}"
+                                    _key = f"{loss_fct_name}_log10ratio_L{_lvl}"
                                     _d = losses_all[stream_name][str(timestep_idx)][_key] = {}
                                     for ch_n, v in zip(target_channels, _r_lvl[_lvl], strict=True):
                                         _d[ch_n] = (
