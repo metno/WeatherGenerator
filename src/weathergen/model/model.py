@@ -759,7 +759,8 @@ class Model(torch.nn.Module):
                 "latent_state",
                 self.tokens_to_latent_state(None, tokens),
             )
-            output = self.predict_decoders(model_params, step, tokens, source_samples, output)
+            if step % self.cf.training_config.get("output_time_freq", 1) == 0:
+                output = self.predict_decoders(model_params, step, tokens, source_samples, output)
 
             # latent predictions (raw and with SSL heads)
             output = self.predict_latent(model_params, step, tokens, batch, output)
