@@ -48,6 +48,8 @@ exactly the single-latent behaviour.
         dim_embed: 1024           # optional: size of this level's latent vectors
       - level: 8                  # fine level, cropped
         domain: {lon_min: -10.0, lon_max: 35.0, lat_min: 50.0, lat_max: 75.0, pad_rings: 1}
+        # or the footprint of a grid (see domain.py):
+        # domain: {points_file: /abs/path/meps_template.nc, pad_rings: 1}
 
 `dim_embed` (default `ae_global_dim_embed`) sets the latent vector size of one level; it
 is read by the model (`latent_dim_embed`), the geometry here does not depend on it.
@@ -60,7 +62,7 @@ import astropy_healpix as hp
 import numpy as np
 from numpy.typing import NDArray
 
-from weathergen.datasets.domain import Domain
+from weathergen.datasets.domain import Domain, domain_config_key
 
 _logger = logging.getLogger(__name__)
 
@@ -231,6 +233,19 @@ class DomainPyramid:
             int((children_compact >= 0).any(axis=1).sum()),
             len(dom_c),
         )
+        num_unpaired = int((parent_compact < 0).sum())
+        if num_unpaired > 0:
+            _logger.warning(
+                "DomainPyramid hl%d<->hl%d: %d of %d fine cells have no parent in the coarse "
+                "domain; they get no coarse information. Make the hl%d domain larger (e.g. "
+                "more pad_rings) so that it covers the hl%d domain.",
+                lc,
+                lf,
+                num_unpaired,
+                len(dom_f),
+                lc,
+                lf,
+            )
 
     def _pair_key(self, lc: int, lf: int) -> tuple[int, int]:
         assert (lc, lf) in self._child_of_parent, (
@@ -310,16 +325,11 @@ def _unique_rows(a: NDArray[np.int64], pad: int) -> NDArray[np.int64]:
 
 
 def _pyramid_cache_key(cf) -> tuple:
-    def _dom_key(d):
-        if d is None or not d.get("enabled", True):
-            return None
-        keys = ("lon_min", "lon_max", "lat_min", "lat_max")
-        return tuple(float(d[k]) for k in keys) + (int(d.get("pad_rings", 0)),)
-
     levels_cfg = cf.get("latent_levels", None)
     if not levels_cfg:
-        return ("single", int(cf.healpix_level), _dom_key(cf.get("domain", None)))
-    return tuple(sorted((int(e["level"]), _dom_key(e.get("domain", None))) for e in levels_cfg))
+        return ("single", domain_config_key(cf.healpix_level, cf.get("domain", None)))
+    keys = [domain_config_key(e["level"], e.get("domain", None)) for e in levels_cfg]
+    return tuple(sorted(keys, key=lambda k: k[0]))
 
 
 def build_domain_pyramid(cf) -> DomainPyramid:

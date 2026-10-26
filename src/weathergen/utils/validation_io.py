@@ -413,7 +413,7 @@ def _get_healpix_coords(cf, domain=None) -> tuple[npt.NDArray, npt.NDArray] | No
     if domain is None:
         domain = model_domain(cf)
     healpix_level = domain.healpix_level
-    cache_key = (healpix_level, None if domain.is_global else domain.bbox, domain.pad_rings)
+    cache_key = domain.key
     cached = _HEALPIX_COORDS_CACHE.get(cache_key)
     if cached is not None:
         return cached
