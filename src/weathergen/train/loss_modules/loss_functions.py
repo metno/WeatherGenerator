@@ -224,6 +224,40 @@ def mse(
     )
 
 
+def nse(
+    target: torch.Tensor,
+    pred: torch.Tensor,
+    weights_channels: torch.Tensor | None,
+    weights_points: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute Nash–Sutcliffe efficiency loss, ``1 - NSE``.
+
+    Uses the per-channel, point-weighted target mean over valid points in this
+    call (not a stored climatology). Arguments and reduction follow ``lp_loss``.
+    Clamp the denominator to keep constant-target losses finite.
+    """
+    if target.dtype in (torch.float16, torch.bfloat16):
+        target = target.float()
+    if pred.dtype in (torch.float16, torch.bfloat16):
+        pred = pred.float()
+    pred = pred.mean(0)
+
+    weights = torch.isfinite(target).to(target.dtype)
+    if weights_points is not None:
+        weights = weights * weights_points[:, None]
+    target = torch.where(weights != 0, target, 0)
+    pred = torch.where(weights != 0, pred, 0)
+    weight_sum = weights.sum(0)
+    target_mean = (weights * target).sum(0) / torch.where(weight_sum > 0, weight_sum, 1)
+
+    squared_error = (weights * (target - pred).square()).sum(0)
+    squared_deviation = (weights * (target - target_mean).square()).sum(0)
+    loss_chs = squared_error / squared_deviation.clamp_min(1e-8)
+    loss = torch.mean(loss_chs * weights_channels if weights_channels is not None else loss_chs)
+
+    return loss, loss_chs
+
+
 def rss(
     target: torch.Tensor,
     pred: torch.Tensor,
