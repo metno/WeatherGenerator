@@ -89,6 +89,9 @@ class LossPhysical(LossModuleBase):
     applies channel-specific weights, constructs masks for missing data, and
     aggregates losses across different data streams, channels, and forecast steps.
     It provides both the main loss for backpropagation and detailed loss metrics for logging.
+
+    A stream's optional ``loss_fcts`` overrides the global physical losses while
+    retaining their sample routing, in both training and validation.
     """
 
     def __init__(
@@ -111,15 +114,17 @@ class LossPhysical(LossModuleBase):
         self.forecast_offset = self.mode_cfg.forecast.offset
 
         # dynamically load loss functions based on configuration and stage
-        self.loss_fcts = [
-            [
-                getattr(loss_fns, name),
-                params.get("weight", 1.0),
-                name,
+        self.physical_loss_names = loss_fcts.keys() - {"dynamic_loss"}
+        self.loss_fcts = {
+            stream_name: [
+                [getattr(loss_fns, name), params.get("weight", 1.0), name]
+                for name, params in (
+                    loss_fcts if stream_info.get("loss_fcts") is None else stream_info.loss_fcts
+                ).items()
+                if name != "dynamic_loss"
             ]
-            for name, params in loss_fcts.items()
-            if name != "dynamic_loss"
-        ]
+            for stream_name, stream_info in self.cf.streams.items()
+        }
 
         self.dynamic_loss_ema = DynamicLossEMA(
             self.dynamic_loss_cfg if self.stage == TRAIN else None,
@@ -357,9 +362,14 @@ class LossPhysical(LossModuleBase):
                     # loss_st_corr: loss for give source-target correspondence
                     loss_st_corr = torch.tensor(0.0, device=self.device, requires_grad=True)
                     ctr_loss_fcts = 0
-                    for loss_fct, loss_fct_weight, loss_fct_name in self.loss_fcts:
-                        # skip is loss is not computed for this sample
-                        if loss_fct_name not in pred_params.global_params["loss"]:
+                    for loss_fct, loss_fct_weight, loss_fct_name in self.loss_fcts[stream_name]:
+                        # Overrides inherit global physical routing, even when names differ.
+                        routing_names = (
+                            self.physical_loss_names
+                            if stream_info.get("loss_fcts") is not None
+                            else {loss_fct_name}
+                        )
+                        if not routing_names.intersection(pred_params.global_params["loss"]):
                             continue
 
                         # spoofed inputs are masked in the output calculations
