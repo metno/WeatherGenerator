@@ -232,7 +232,7 @@ class EncoderModule(torch.nn.Module):
         return self._q_cells_param_dict[str(self.domain_pyramid.finest)]
 
     @torch.no_grad()
-    def reinit_q_cells(self) -> None:
+    def reinit_q_cells(self, levels=None) -> None:
         """
         Re-initialise the learnable query banks of all levels exactly as the constructor
         does (_build_q_cells). Needed after a meta-device (FSDP) construction: there the
@@ -240,7 +240,7 @@ class EncoderModule(torch.nn.Module):
         storage uninitialised (zeros or garbage). Works for plain and sharded (DTensor)
         parameters.
         """
-        for lvl in self.domain_pyramid.levels:
+        for lvl in self.domain_pyramid.levels if levels is None else levels:
             dom = self.domain_pyramid.domain(lvl)
             full = self._build_q_cells(self.cf, len(dom), lvl, dom.active_cells)
             _copy_full_into_(self._q_cells_param_dict[str(lvl)], full)

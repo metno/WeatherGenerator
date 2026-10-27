@@ -56,71 +56,138 @@ type StreamName = str
 
 
 @torch.no_grad()
+def _reinit_parameter(modules: dict[str, nn.Module], key: str, done_owners: set) -> bool:
+    """
+    Initialise ONE parameter (given by its state_dict key) exactly as the module
+    constructors would. Returns False if the key does not belong to `modules`.
+
+    Rules (applied to the module that owns the parameter, then overridden by its
+    ancestors from the innermost to the outermost, i.e. the same order in which the
+    nested constructors run):
+      leaf default : nn.Linear / nn.LayerNorm / EfficientBilinear -> reset_parameters();
+                     RMSNorm.weight -> 1
+      AdaLayerNorm(zero_init=True)   : last aux Linear -> 0        (DiT zero init)
+      AdaLayerNormLayer              : modulation Linear -> 0
+      Self/CrossAttentionBlock       : all Linear -> xavier, bias 0; their
+                                       AdaLayerNormLayer modulation Linear -> 0 again
+      ForecastingEngine              : all Linear in fe_blocks -> N(0, 0.001)  (near-identity)
+      LatentCascade _PairOperator    : linear down/up projections -> 0
+      LatentCascade _CrossAttn       : output projection -> 0
+      TargetPredictionEngine         : pos_embed -> 0
+      EncoderModule                  : _q_cells_param_dict.<level> -> _build_q_cells(level)
+    """
+    owner_path, pname = key.rsplit(".", 1) if "." in key else ("", key)
+    owner = modules.get(owner_path)
+    if owner is None or not hasattr(owner, pname):
+        return False
+    param = getattr(owner, pname)
+
+    # ---- leaf default (once per owning module) ----
+    if owner_path not in done_owners:
+        done_owners.add(owner_path)
+        if isinstance(owner, nn.Linear | nn.LayerNorm | EfficientBilinear):
+            owner.reset_parameters()
+        elif isinstance(owner, RMSNorm):
+            owner.weight.fill_(1.0)
+
+    # ---- parameters that are not inside a leaf layer ----
+    if isinstance(owner, TargetPredictionEngine) and pname == "pos_embed":
+        param.zero_()
+        return True
+    if owner_path.endswith("_q_cells_param_dict"):
+        enc = modules.get(owner_path.rsplit(".", 1)[0] if "." in owner_path else "")
+        if isinstance(enc, EncoderModule):
+            enc.reinit_q_cells(levels=[int(pname)])
+            return True
+
+    # ---- context overrides, innermost ancestor first, outermost last ----
+    if not isinstance(owner, nn.Linear):
+        return True
+    parts = owner_path.split(".") if owner_path else []
+    ancestors = [".".join(parts[:i]) for i in range(len(parts) - 1, -1, -1)]  # inner -> outer
+    for apath in ancestors:
+        anc = modules.get(apath)
+        if anc is None:
+            continue
+        if isinstance(anc, AdaLayerNorm):
+            if getattr(anc, "zero_init", False) and owner is anc.embed_aux[-1]:
+                nn.init.zeros_(owner.weight)
+                nn.init.zeros_(owner.bias)
+        elif isinstance(anc, AdaLayerNormLayer):
+            if owner is anc.adaLN_modulation[-1]:
+                nn.init.zeros_(owner.weight)
+                nn.init.zeros_(owner.bias)
+        elif isinstance(anc, SelfAttentionBlock | CrossAttentionBlock):
+            nn.init.xavier_uniform_(owner.weight)
+            if owner.bias is not None:
+                nn.init.constant_(owner.bias, 0)
+            if anc.with_adanorm:
+                for blk_name in ("mhsa_block", "cross_attn_block", "mlp_block"):
+                    blk = getattr(anc, blk_name, None)
+                    if isinstance(blk, AdaLayerNormLayer) and owner is blk.adaLN_modulation[-1]:
+                        nn.init.zeros_(owner.weight)
+                        nn.init.zeros_(owner.bias)
+        elif isinstance(anc, ForecastingEngine):
+            if owner_path.startswith(apath + ".fe_blocks." if apath else "fe_blocks."):
+                nn.init.normal_(owner.weight, mean=0, std=0.001)
+                if owner.bias is not None:
+                    nn.init.normal_(owner.bias, mean=0, std=0.001)
+        elif isinstance(anc, _PairOperator):
+            if anc.kind == "linear" and (owner is anc.down_proj or owner is anc.up_proj):
+                nn.init.zeros_(owner.weight)
+        elif isinstance(anc, _CrossAttn):
+            if owner is anc.o_proj:
+                nn.init.zeros_(owner.weight)
+    return True
+
+
+@torch.no_grad()
 def reinit_parameters(root: nn.Module) -> None:
     """
     Re-create the initialisation the module constructors apply, for every parameter in
-    `root`.
+    `root` (rules: see _reinit_parameter).
 
     Needed when a model is built on the `meta` device (the FSDP path in
-    init_model_and_shard) or when new modules are added on top of a checkpoint: the
-    constructors' initialisation then only ever existed on `meta`, and to_empty()
-    allocates UNINITIALISED storage (zeros or garbage). Resetting only nn.Linear /
-    nn.LayerNorm, as before, left several parameters uninitialised and overwrote the
-    special initialisations below with the default Linear init.
-
-    Pass 1 (leaf defaults): nn.Linear / nn.LayerNorm / EfficientBilinear via their own
-    reset_parameters(); RMSNorm weight = 1.
-
-    Pass 2 (constructor overrides), children before parents exactly as in the
-    constructors (nn.Module.apply is post-order):
-      - AdaLayerNorm(zero_init=True): last aux Linear = 0      (DiT zero init)
-      - AdaLayerNormLayer: modulation Linear = 0
-      - SelfAttentionBlock / CrossAttentionBlock: xavier on all Linear, then their
-        AdaLayerNormLayer wrappers zeroed again (same order as their __init__)
-      - ForecastingEngine: all Linear ~ N(0, 0.001)            (near-identity start)
-      - LatentCascade operators: linear projections / attention out-proj = 0
-      - TargetPredictionEngine.pos_embed = 0
-      - EncoderModule: learnable query banks q_cells (all levels) via _build_q_cells
+    init_model_and_shard): the constructors' initialisation then only ever existed on
+    `meta`, and to_empty() allocates UNINITIALISED storage (zeros or garbage). Resetting
+    only nn.Linear / nn.LayerNorm, as before, left several parameters uninitialised and
+    overwrote the special initialisations with the default Linear init.
 
     All operations are in-place torch.nn.init / fill / copy calls, which also work on
     FSDP2 DTensor parameters.
     """
-    # pass 1: leaf defaults
-    for m in root.modules():
-        if isinstance(m, nn.Linear | nn.LayerNorm | EfficientBilinear):
-            m.reset_parameters()
-        elif isinstance(m, RMSNorm):
-            m.weight.fill_(1.0)
+    modules = dict(root.named_modules())
+    done: set = set()
+    for key, _ in root.named_parameters():
+        _reinit_parameter(modules, key, done)
 
-    # pass 2: constructor-specific initialisations
-    def _post(m: nn.Module) -> None:
-        if isinstance(m, AdaLayerNorm):
-            if getattr(m, "zero_init", False):
-                nn.init.zeros_(m.embed_aux[-1].weight)
-                nn.init.zeros_(m.embed_aux[-1].bias)
-        elif isinstance(m, AdaLayerNormLayer):
-            m.initialise_weights()
-        elif isinstance(m, SelfAttentionBlock | CrossAttentionBlock):
-            m.initialise_weights()
-            if m.with_adanorm:
-                for blk_name in ("mhsa_block", "cross_attn_block", "mlp_block"):
-                    blk = getattr(m, blk_name, None)
-                    if isinstance(blk, AdaLayerNormLayer):
-                        blk.initialise_weights()
-        elif isinstance(m, ForecastingEngine):
-            m.init_weights_final()
-        elif isinstance(m, _PairOperator):
-            if m.kind == "linear":
-                nn.init.zeros_(m.down_proj.weight)
-                nn.init.zeros_(m.up_proj.weight)
-        elif isinstance(m, _CrossAttn):
-            nn.init.zeros_(m.o_proj.weight)
-        elif isinstance(m, TargetPredictionEngine):
-            m.pos_embed.zero_()
-        elif isinstance(m, EncoderModule):
-            m.reinit_q_cells()
 
-    root.apply(_post)
+@torch.no_grad()
+def reinit_missing_parameters(model: nn.Module, missing_keys) -> None:
+    """
+    Initialise only the parameters in `missing_keys` (state_dict keys of `model` that
+    were not in the loaded checkpoint), using the same constructor-equivalent rules as
+    reinit_parameters(). Parameters loaded from the checkpoint are not touched.
+
+    Typical case: continuing a forecast run from an autoencoder checkpoint trained with
+    fe_num_blocks=0. The forecast engine's weights are then all missing and get the
+    near-identity N(0, 0.001) init, which a per-Linear reset_parameters() would lose.
+    """
+    # remove_duplicate=False: aliased modules (e.g. forecast_engine ->
+    # _forecast_per_level[<finest>]) appear in missing_keys under both names
+    modules = dict(model.named_modules(remove_duplicate=False))
+    done: set = set()
+    done_params: set = set()
+    for key in sorted(missing_keys):
+        owner_path, pname = key.rsplit(".", 1) if "." in key else ("", key)
+        owner = modules.get(owner_path)
+        param = getattr(owner, pname, None) if owner is not None else None
+        if param is not None and id(param) in done_params:
+            continue  # same tensor already initialised under its other name
+        if not _reinit_parameter(modules, key, done):
+            logger.warning(f"reinit_missing_parameters: no parameter for missing key {key}")
+        elif param is not None:
+            done_params.add(id(param))
 
 
 class ModelOutput:

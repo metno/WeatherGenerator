@@ -28,7 +28,12 @@ from weathergen.model.attention import (
     MultiSelfAttentionHeadVarlen,
 )
 from weathergen.model.layers import MLP
-from weathergen.model.model import Model, ModelParams, ModelParamsPyramid, reinit_parameters
+from weathergen.model.model import (
+    Model,
+    ModelParams,
+    ModelParamsPyramid,
+    reinit_missing_parameters,
+)
 from weathergen.model.utils import apply_fct_to_blocks, freeze_weights
 from weathergen.utils.distributed import is_root
 from weathergen.utils.performance import register_nvtx_hooks
@@ -319,6 +324,47 @@ def init_model_and_shard(
     return model, model_params
 
 
+def _materialize_and_init_missing(model, mkeys, device="cuda") -> None:
+    """
+    Allocate and initialise the parameters of `model` listed in `mkeys` (state_dict keys
+    missing from a checkpoint loaded with assign=True onto a meta-device model), leaving
+    every loaded parameter and buffer untouched.
+
+    1. to_empty(recurse=False) on each module that owns a missing parameter, restoring
+       that module's own parameters/buffers that WERE loaded. (A recursive to_empty() on
+       the root new module, as before, also wiped loaded children and siblings.)
+    2. constructor-equivalent init of exactly the missing parameters via
+       reinit_missing_parameters(), done on the whole model so that initialisations that
+       depend on the ENCLOSING module are kept -- e.g. a forecast engine absent from an
+       autoencoder checkpoint (fe_num_blocks=0) gets its near-identity N(0, 0.001) init
+       instead of the default Linear init.
+    """
+    mset = set(mkeys)
+    # remove_duplicate=False: modules registered under two names (e.g. forecast_engine is
+    # an alias of _forecast_per_level[<finest>]) appear in state_dict -- and hence in mkeys
+    # -- under both names, but the default named_modules() lists only the first one
+    all_modules = dict(model.named_modules(remove_duplicate=False))
+    done_ids: set = set()
+    for path in sorted({key.rsplit(".", 1)[0] if "." in key else "" for key in mkeys}):
+        module_to_init = all_modules[path]
+        if id(module_to_init) in done_ids:  # alias of a module already materialised
+            continue
+        done_ids.add(id(module_to_init))
+        prefix = f"{path}." if path else ""
+        keep_p = {
+            n: p
+            for n, p in module_to_init.named_parameters(recurse=False)
+            if f"{prefix}{n}" not in mset and not p.is_meta
+        }
+        keep_b = {n: b for n, b in module_to_init.named_buffers(recurse=False) if not b.is_meta}
+        module_to_init.to_empty(device=device, recurse=False)
+        for n, p in keep_p.items():
+            setattr(module_to_init, n, p)
+        for n, b in keep_b.items():
+            module_to_init._buffers[n] = b
+    reinit_missing_parameters(model, mkeys)
+
+
 def load_model(cf, model, device, run_id: str, mini_epoch=-1):
     """Loads model state from checkpoint and checks for missing and unused keys.
     Args:
@@ -360,22 +406,16 @@ def load_model(cf, model, device, run_id: str, mini_epoch=-1):
             # Get the unique parent modules for the missing parameters
             new_modules_to_init = {key.rsplit(".", 1)[0] for key in mkeys}
 
-            # Find the highest-level "root" new modules to avoid redundant initializations
+            # Find the highest-level "root" new modules (used for logging only)
             root_new_modules = set()
             for path in sorted(list(new_modules_to_init)):
                 if not any(path.startswith(root + ".") for root in root_new_modules):
                     root_new_modules.add(path)
-
-            # Get all modules for quick lookup and initialize the new ones
-            all_modules = dict(model.named_modules())
-            for path in root_new_modules:
-                if is_root():
+            if is_root():
+                for path in sorted(root_new_modules):
                     logger.info(f"Initializing new module not found in checkpoint: {path}")
-                module_to_init = all_modules[path]
-                module_to_init.to_empty(device="cuda")
-                # constructor-equivalent init (most modules have no reset_parameters();
-                # see model.reinit_parameters)
-                reinit_parameters(module_to_init)
+
+            _materialize_and_init_missing(model, mkeys, device="cuda")
 
     else:
         # fix mismatch between state_dict keys that can occur between interactive/non-interactive
