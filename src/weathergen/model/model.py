@@ -39,7 +39,11 @@ from weathergen.model.engines import (
     TargetPredictionEngine,
     TargetPredictionEngineClassic,
 )
+from weathergen.model.blocks import CrossAttentionBlock, SelfAttentionBlock
+from weathergen.model.engines import EfficientBilinear
+from weathergen.model.latent_cascade import _CrossAttn, _PairOperator
 from weathergen.model.layers import MLP, NamedLinear
+from weathergen.model.norms import AdaLayerNorm, AdaLayerNormLayer, RMSNorm
 from weathergen.model.utils import get_num_parameters
 from weathergen.utils.distributed import is_root
 from weathergen.utils.utils import get_dtype, is_stream_forcing
@@ -49,6 +53,74 @@ from weathergen.datasets.domain_pyramid import build_domain_pyramid
 logger = logging.getLogger(__name__)
 
 type StreamName = str
+
+
+@torch.no_grad()
+def reinit_parameters(root: nn.Module) -> None:
+    """
+    Re-create the initialisation the module constructors apply, for every parameter in
+    `root`.
+
+    Needed when a model is built on the `meta` device (the FSDP path in
+    init_model_and_shard) or when new modules are added on top of a checkpoint: the
+    constructors' initialisation then only ever existed on `meta`, and to_empty()
+    allocates UNINITIALISED storage (zeros or garbage). Resetting only nn.Linear /
+    nn.LayerNorm, as before, left several parameters uninitialised and overwrote the
+    special initialisations below with the default Linear init.
+
+    Pass 1 (leaf defaults): nn.Linear / nn.LayerNorm / EfficientBilinear via their own
+    reset_parameters(); RMSNorm weight = 1.
+
+    Pass 2 (constructor overrides), children before parents exactly as in the
+    constructors (nn.Module.apply is post-order):
+      - AdaLayerNorm(zero_init=True): last aux Linear = 0      (DiT zero init)
+      - AdaLayerNormLayer: modulation Linear = 0
+      - SelfAttentionBlock / CrossAttentionBlock: xavier on all Linear, then their
+        AdaLayerNormLayer wrappers zeroed again (same order as their __init__)
+      - ForecastingEngine: all Linear ~ N(0, 0.001)            (near-identity start)
+      - LatentCascade operators: linear projections / attention out-proj = 0
+      - TargetPredictionEngine.pos_embed = 0
+      - EncoderModule: learnable query banks q_cells (all levels) via _build_q_cells
+
+    All operations are in-place torch.nn.init / fill / copy calls, which also work on
+    FSDP2 DTensor parameters.
+    """
+    # pass 1: leaf defaults
+    for m in root.modules():
+        if isinstance(m, nn.Linear | nn.LayerNorm | EfficientBilinear):
+            m.reset_parameters()
+        elif isinstance(m, RMSNorm):
+            m.weight.fill_(1.0)
+
+    # pass 2: constructor-specific initialisations
+    def _post(m: nn.Module) -> None:
+        if isinstance(m, AdaLayerNorm):
+            if getattr(m, "zero_init", False):
+                nn.init.zeros_(m.embed_aux[-1].weight)
+                nn.init.zeros_(m.embed_aux[-1].bias)
+        elif isinstance(m, AdaLayerNormLayer):
+            m.initialise_weights()
+        elif isinstance(m, SelfAttentionBlock | CrossAttentionBlock):
+            m.initialise_weights()
+            if m.with_adanorm:
+                for blk_name in ("mhsa_block", "cross_attn_block", "mlp_block"):
+                    blk = getattr(m, blk_name, None)
+                    if isinstance(blk, AdaLayerNormLayer):
+                        blk.initialise_weights()
+        elif isinstance(m, ForecastingEngine):
+            m.init_weights_final()
+        elif isinstance(m, _PairOperator):
+            if m.kind == "linear":
+                nn.init.zeros_(m.down_proj.weight)
+                nn.init.zeros_(m.up_proj.weight)
+        elif isinstance(m, _CrossAttn):
+            nn.init.zeros_(m.o_proj.weight)
+        elif isinstance(m, TargetPredictionEngine):
+            m.pos_embed.zero_()
+        elif isinstance(m, EncoderModule):
+            m.reinit_q_cells()
+
+    root.apply(_post)
 
 
 class ModelOutput:
@@ -768,13 +840,11 @@ class Model(torch.nn.Module):
         return self
 
     def reset_parameters(self):
-        def _reset_params(module):
-            if isinstance(module, nn.Linear | nn.LayerNorm):
-                module.reset_parameters()
-            else:
-                pass
-
-        self.apply(_reset_params)
+        """
+        Initialise all parameters as the constructors do. Called by init_model_and_shard
+        after a meta-device (FSDP) construction; see reinit_parameters().
+        """
+        reinit_parameters(self)
 
     def print_num_parameters(self) -> None:
         """Print number of parameters for entire model and each module used to build the model"""

@@ -28,7 +28,7 @@ from weathergen.model.attention import (
     MultiSelfAttentionHeadVarlen,
 )
 from weathergen.model.layers import MLP
-from weathergen.model.model import Model, ModelParams, ModelParamsPyramid
+from weathergen.model.model import Model, ModelParams, ModelParamsPyramid, reinit_parameters
 from weathergen.model.utils import apply_fct_to_blocks, freeze_weights
 from weathergen.utils.distributed import is_root
 from weathergen.utils.performance import register_nvtx_hooks
@@ -373,7 +373,9 @@ def load_model(cf, model, device, run_id: str, mini_epoch=-1):
                     logger.info(f"Initializing new module not found in checkpoint: {path}")
                 module_to_init = all_modules[path]
                 module_to_init.to_empty(device="cuda")
-                module_to_init.reset_parameters()
+                # constructor-equivalent init (most modules have no reset_parameters();
+                # see model.reinit_parameters)
+                reinit_parameters(module_to_init)
 
     else:
         # fix mismatch between state_dict keys that can occur between interactive/non-interactive

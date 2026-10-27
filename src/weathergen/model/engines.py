@@ -613,14 +613,25 @@ class ForecastingEngine(torch.nn.Module):
                         torch.nn.LayerNorm(self.cf.ae_global_dim_embed, elementwise_affine=False)
                     )
 
-        def init_weights_final(m):
+        self.init_weights_final()
+
+    @torch.no_grad()
+    def init_weights_final(self) -> None:
+        """
+        Near-identity initialisation: every Linear in the forecast blocks ~ N(0, 0.001), so
+        at the start of training each residual block adds almost nothing and the engine
+        approximately passes the latent through. Also called by model.reinit_parameters()
+        after a meta-device (FSDP) construction, where this constructor init is lost.
+        """
+
+        def _init(m):
             if isinstance(m, torch.nn.Linear):
                 torch.nn.init.normal_(m.weight, mean=0, std=0.001)
                 if m.bias is not None:
                     torch.nn.init.normal_(m.bias, mean=0, std=0.001)
 
         for block in self.fe_blocks:
-            block.apply(init_weights_final)
+            block.apply(_init)
 
     def forward(self, tokens, fstep, coords=None):
         if self.training:

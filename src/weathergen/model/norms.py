@@ -98,6 +98,9 @@ class AdaLayerNorm(torch.nn.Module):
         super().__init__()
 
         self.with_gate = with_gate
+        # kept so that model.reinit_parameters() can re-apply the zero init after a
+        # meta-device (FSDP) construction, where the constructor's init is lost
+        self.zero_init = zero_init
         n_out = 3 if with_gate else 2  # scale, shift (, gate)
 
         # simple 2-layer MLP for embedding auxiliary information

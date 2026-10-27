@@ -29,6 +29,18 @@ from weathergen.model.positional_encoding import positional_encoding_harmonic
 from weathergen.datasets.domain_pyramid import build_domain_pyramid
 from weathergen.model.latent_cascade import LatentCascade
 
+def _copy_full_into_(param: torch.Tensor, full: torch.Tensor) -> None:
+    """In-place copy of a full (unsharded) tensor into a plain or FSDP2 DTensor parameter."""
+    if hasattr(param, "device_mesh") and hasattr(param, "placements"):
+        from torch.distributed.tensor import distribute_tensor
+
+        local = param.to_local()
+        full = full.to(device=local.device, dtype=param.dtype)
+        param.copy_(distribute_tensor(full, param.device_mesh, param.placements))
+    else:
+        param.copy_(full.to(device=param.device, dtype=param.dtype))
+
+
 class EncoderModule(torch.nn.Module):
     name: "EncoderModule"
 
@@ -134,7 +146,12 @@ class EncoderModule(torch.nn.Module):
 
         # backward-compat aliases -> finest level == current single-latent stack.
         _finest = str(self.domain_pyramid.finest)
-        self.q_cells = self._q_cells_param_dict[_finest]
+        # NOTE: `q_cells` is a read-only property (see below), NOT a second registration of
+        # the finest-level parameter. A second registration (`self.q_cells = dict[...]`) is
+        # one tensor with two names in a normally-built model, but after a meta-device
+        # construction + to_empty() (the FSDP path) it becomes two SEPARATE parameters:
+        # the forward pass uses the dict entry, while `encoder.q_cells` is a dead copy that
+        # is never trained and is saved to every checkpoint uninitialised (often zeros).
         self.ae_aggregation_engine = self._ae_aggregation_per_level[_finest]
         self.ae_global_engine = self._ae_global_per_level[_finest]
 
@@ -208,6 +225,25 @@ class EncoderModule(torch.nn.Module):
             s = (1, cf.ae_local_num_queries, cf.ae_global_dim_embed)
             q_cells = torch.rand(s) / cf.ae_global_dim_embed
         return q_cells
+
+    @property
+    def q_cells(self) -> torch.nn.Parameter:
+        """Finest-level learnable query bank (backward-compatible alias, single parameter)."""
+        return self._q_cells_param_dict[str(self.domain_pyramid.finest)]
+
+    @torch.no_grad()
+    def reinit_q_cells(self) -> None:
+        """
+        Re-initialise the learnable query banks of all levels exactly as the constructor
+        does (_build_q_cells). Needed after a meta-device (FSDP) construction: there the
+        constructor's values only existed on `meta`, and to_empty() leaves the real
+        storage uninitialised (zeros or garbage). Works for plain and sharded (DTensor)
+        parameters.
+        """
+        for lvl in self.domain_pyramid.levels:
+            dom = self.domain_pyramid.domain(lvl)
+            full = self._build_q_cells(self.cf, len(dom), lvl, dom.active_cells)
+            _copy_full_into_(self._q_cells_param_dict[str(lvl)], full)
 
     def _maybe_checkpoint(self, fn, *args, **kwargs):
         """
