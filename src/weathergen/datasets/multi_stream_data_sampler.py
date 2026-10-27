@@ -128,13 +128,19 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         )
 
         # one masker + tokenizer PER configured level, each on that level's domain
+        # z-score normalization of the local relative target coords (lcoords);
+        # config `normalize_target_lcoords` (default True). Changes the decoder inputs,
+        # so checkpoints trained without it are not directly comparable.
+        normalize_lcoords = bool(cf.get("normalize_target_lcoords", True))
         self._maskers: dict[int, Masker] = {}
         self._tokenizers: dict[int, TokenizerMasking] = {}
         for lvl in self.domain_pyramid.levels:
             dom_l = self.domain_pyramid.domain(lvl)
             masker_l = Masker(lvl, stage, cf.streams, self.mode_cfg, domain=dom_l)
             self._maskers[lvl] = masker_l
-            self._tokenizers[lvl] = TokenizerMasking(lvl, masker_l, domain=dom_l)
+            self._tokenizers[lvl] = TokenizerMasking(
+                lvl, masker_l, domain=dom_l, normalize_lcoords=normalize_lcoords
+            )
 
         # backward-compat aliases: legacy single-tokenizer references resolve to
         # the finest level (== self.domain). New per-stream code uses self._tok().
@@ -740,12 +746,24 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
         return stream_data
 
-    def _get_data_windows(self, base_idx, num_forecast_steps, num_steps_input_max, stream_ds):
+    def _get_data_windows(
+        self, base_idx, num_forecast_steps, num_steps_input_max, stream_ds, stream_name=None
+    ):
         """
         Collect all data needed for current stream to potentially amortize costs by
         generating multiple samples
 
         """
+
+        # Spoofed points must lie in the domain of the level this stream is tokenized
+        # at (its ENCODE level), otherwise the tokenizer drops them and the window is
+        # empty again -- exactly what spoofing is meant to prevent. Using the finest
+        # domain breaks coarse streams whenever the fine domain is not nested inside
+        # the coarse one.
+        if stream_name is None:
+            stream_name = stream_ds[0].stream_info["name"]
+        spoof_level = self.stream_encode_level[stream_name]
+        spoof_domain = self.domain_pyramid.domain(spoof_level)
 
         # source data: iterate overall input steps
         input_data = []
@@ -759,11 +777,11 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 # create non-empty mean data instead of empty tensor
                 time_win = self.time_window_handler.window(idx)
                 rdata = spoof(
-                    self.healpix_level,
+                    spoof_level,
                     time_win.start,
                     stream_ds[0].get_geoinfo_size(),
                     len(stream_ds[0].mean[stream_ds[0].source_idx]),
-                    domain=self.domain
+                    domain=spoof_domain,
                 )
                 rdata.is_spoof = True
 
@@ -782,11 +800,11 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 # create non-empty mean data instead of empty tensor
                 time_win = self.time_window_handler.window(step_forecast_dt)
                 rdata = spoof(
-                    self.healpix_level,
+                    spoof_level,
                     time_win.start,
                     stream_ds[0].get_geoinfo_size(),
                     len(stream_ds[0].mean[stream_ds[0].target_idx]),
-                    domain=self.domain,
+                    domain=spoof_domain,
                 )
                 rdata.is_spoof = True
 
@@ -883,7 +901,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             # in source and target channels; overlap in one window when self.output_offset=0
             i_max = input_steps.max().item()
             (input_data, output_data) = self._get_data_windows(
-                idx, num_forecast_steps, i_max, stream_ds
+                idx, num_forecast_steps, i_max, stream_ds, stream_name=stream_name
             )
 
             # DEBUG: actual source/target times for the first few batches

@@ -22,6 +22,7 @@ from weathergen.datasets.data_reader_base import (
     TIndex,
     check_reader_data,
 )
+from weathergen.train.utils import Stage
 
 _logger = logging.getLogger(__name__)
 
@@ -34,10 +35,11 @@ class DataReaderSynop(DataReaderTimestep):
         tw_handler: TimeWindowHandler,
         filename: Path,
         stream_info: dict,
+        stage: Stage | None = None,
         domain=None,
     ) -> None:
         """
-        Construct data reader for anemoi dataset
+        Construct data reader for SYNOP station dataset (NetCDF)
 
         Parameters
         ----------
@@ -61,7 +63,7 @@ class DataReaderSynop(DataReaderTimestep):
             name = stream_info["name"]
             _logger.warning(f"{name} is not supported over data loader window. Stream is skipped.")
             super().__init__(tw_handler, stream_info, domain=domain)
-            self._init_empty()
+            self.init_empty()
             return
 
         if "frequency" in stream_info:
@@ -84,14 +86,21 @@ class DataReaderSynop(DataReaderTimestep):
         )
         # If there is no overlap with the time range, no need to keep the dataset.
         if tw_handler.t_start >= data_end_time or tw_handler.t_end <= data_start_time:
-            self._init_empty()
+            self.init_empty()
             return
         else:
             self.ds = ds
-            self.len = len(ds)
+            # number of time steps (len(ds) on an xarray Dataset is the number of
+            # data variables, not the length of the time axis)
+            self.len = int(ds.sizes["time"])
 
         self.offset_data_channels = 4
-        self.fillvalue = ds["air_temperature"][0, 0].values.item()
+        # Fill value for missing observations. Previously the FIRST DATA VALUE
+        # (ds["air_temperature"][0, 0]) was used, which turned every observation equal to
+        # it into NaN. xarray already decodes the CF `_FillValue` / `missing_value`
+        # attributes to NaN, so an explicit value is only needed for files that store a
+        # sentinel without declaring it: set `fill_value` in the stream config for those.
+        self.fillvalue = stream_info.get("fill_value", None)
         self.channels_file = [k for k in self.ds.keys()]
 
         # caches lats and lons
@@ -102,17 +111,20 @@ class DataReaderSynop(DataReaderTimestep):
 
         self.geoinfo_channels = stream_info.get("geoinfos", [])
         self.geoinfo_idx = [self.channels_file.index(ch) for ch in self.geoinfo_channels]
-        # cache geoinfos
-        self.geoinfo_data = np.stack([np.array(ds[ch], dtype=np32) for ch in self.geoinfo_channels])
-        self.geoinfo_data = self.geoinfo_data.transpose()    # now (n_stations, n_geo)
+        # cache geoinfos, shape (n_stations, n_geo); (n_stations, 0) if none are configured
+        if len(self.geoinfo_channels) > 0:
+            self.geoinfo_data = np.stack(
+                [np.array(ds[ch], dtype=np32) for ch in self.geoinfo_channels]
+            ).transpose()
+        else:
+            self.geoinfo_data = np.zeros((len(self.latitudes), 0), dtype=np32)
 
-        # ADD
+        # domain pre-filter on stations (static, so computed once)
         if domain is not None and not domain.is_global:
             self.domain_mask = domain.bbox_point_mask(self.latitudes, self.longitudes)
             self.latitudes = self.latitudes[self.domain_mask]
             self.longitudes = self.longitudes[self.domain_mask]
-            if self.geoinfo_data.shape[0] > 0:
-                self.geoinfo_data = self.geoinfo_data[self.domain_mask]
+            self.geoinfo_data = self.geoinfo_data[self.domain_mask]
             _logger.info(
                 "%s: domain pre-filter keeps %d of %d stations",
                 stream_info["name"], int(self.domain_mask.sum()), len(self.domain_mask),
@@ -147,8 +159,8 @@ class DataReaderSynop(DataReaderTimestep):
 
         for ch in self.channels_file:
             data = np.array(self.ds[ch], np.float64)
-            mask = data == self.fillvalue
-            data[mask] = np.nan
+            if self.fillvalue is not None:
+                data[data == self.fillvalue] = np.nan
             mean += [np.nanmean(data.flatten())]
             stdev += [np.nanstd(data.flatten())]
 
@@ -160,8 +172,8 @@ class DataReaderSynop(DataReaderTimestep):
         return mean, stdev
 
     @override
-    def _init_empty(self) -> None:
-        super()._init_empty()
+    def init_empty(self) -> None:
+        super().init_empty()
         self.ds = None
         self.len = 0
 
@@ -216,12 +228,12 @@ class DataReaderSynop(DataReaderTimestep):
         if self.domain_mask is not None:
             data = data[np.tile(self.domain_mask, len(t_idxs))]
 
-        print("ds[sel_channels].isel(time=slice(0,2)).to_array().dims")
-        print(ds[sel_channels].isel(time=slice(0,2)).to_array().dims)
-
-        # set invalid values to NaN
-        mask = data == self.fillvalue
-        data[mask] = np.nan
+        # set invalid values to NaN (compare against the fill value in the file's own
+        # dtype, before the float32 cast, so the match is exact)
+        mask = (data == self.fillvalue) if self.fillvalue is not None else None
+        data = data.astype(np.float32)
+        if mask is not None:
+            data[mask] = np.nan
 
         # construct lat/lon coords
         latlon = np.concatenate(
