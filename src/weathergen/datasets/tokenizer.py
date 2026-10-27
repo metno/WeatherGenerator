@@ -27,7 +27,7 @@ class Tokenizer:
     Base class for tokenizers.
     """
 
-    def __init__(self, healpix_level: int, domain=None):
+    def __init__(self, healpix_level: int, domain=None, normalize_lcoords: bool = True):
         ref = torch.tensor([1.0, 0.0, 0.0])
 
         if domain is None:
@@ -46,6 +46,9 @@ class Tokenizer:
 
         cells = domain.active_cells
 
+        ###########################################################################
+        # source
+        ###########################################################################
         verts00, verts00_rots = healpix_verts_rots(self.hl_source, 0.0, 0.0)
         verts10, verts10_rots = healpix_verts_rots(self.hl_source, 1.0, 0.0)
         verts11, verts11_rots = healpix_verts_rots(self.hl_source, 1.0, 1.0)
@@ -74,11 +77,70 @@ class Tokenizer:
             vertsmm_rots.to(torch.float32),
         ]
 
+        ###########################################################################
+        # target
+        ###########################################################################
+        # Vertices and rotations are first built on the FULL healpix grid so that the
+        # normalization statistics of the local relative coordinates are computed over
+        # all healpix cells (and therefore do not depend on the active domain). The
+        # tables are subset to the active cells afterwards.
         verts00, verts00_rots = healpix_verts_rots(self.hl_target, 0.0, 0.0)
         verts10, verts10_rots = healpix_verts_rots(self.hl_target, 1.0, 0.0)
         verts11, verts11_rots = healpix_verts_rots(self.hl_target, 1.0, 1.0)
         verts01, verts01_rots = healpix_verts_rots(self.hl_target, 0.0, 1.0)
         vertsmm, vertsmm_rots = healpix_verts_rots(self.hl_target, 0.5, 0.5)
+
+        # relative position of the cell vertices w.r.t. each reference vertex:
+        # rotate the reference vertex to `ref` and take ref - rotated(other vertices)
+        transforms = [
+            ([verts10, verts11, verts01, vertsmm], verts00_rots),
+            ([verts00, verts11, verts01, vertsmm], verts10_rots),
+            ([verts00, verts10, verts01, vertsmm], verts11_rots),
+            ([verts00, verts11, verts10, vertsmm], verts01_rots),
+            ([verts00, verts10, verts11, verts01], vertsmm_rots),
+        ]
+
+        # The full-grid table is never materialized as a whole (at hl8 it would be
+        # ~786k x 5 x 4 x 3 float64, several hundred MB per tokenizer, and one tokenizer
+        # is built per latent level): statistics are accumulated per transform in
+        # float64 and only the active-cell subset is kept.
+        cells_t = torch.from_numpy(cells)
+        stat_n = 0
+        stat_sum = torch.zeros(3, dtype=torch.float64)
+        stat_sumsq = torch.zeros(3, dtype=torch.float64)
+        verts_local = []
+        for _verts, rot in transforms:
+            # shape: <4, healpix, 3> -> <healpix, 4, 3>
+            verts = torch.stack(_verts).transpose(0, 1)
+            # Batch multiplication by the 3x3 rotation matrices.
+            # shape: <healpix, 3, 3> @ <healpix, 3, 4> -> <healpix, 3, 4> -> <healpix, 4, 3>
+            t1 = torch.bmm(rot, verts.transpose(-1, -2)).transpose(-2, -1)
+            # shape: <healpix, 4, 3>
+            t2 = (ref - t1).to(torch.float64)
+            t2_flat = t2.reshape(-1, 3)
+            stat_n += t2_flat.shape[0]
+            stat_sum += t2_flat.sum(0)
+            stat_sumsq += (t2_flat * t2_flat).sum(0)
+            # keep only active cells
+            verts_local.append(t2[cells_t].to(torch.float32))
+            del verts, t1, t2, t2_flat
+
+        # z-score normalization factors (per xyz component), computed over the relative
+        # positions of all vertices of all healpix cells, considering all rotations
+        mean = stat_sum / stat_n
+        var = (stat_sumsq / stat_n - mean * mean).clamp_min(0.0)
+        self.hpy_verts_diff_mean = mean.to(torch.float32)
+        self.hpy_verts_diff_std = var.sqrt().clamp_min(1e-12).to(torch.float32)
+        # passed to tokenize_apply_mask_target(); None disables the normalization
+        self.hpy_verts_diff_norm_factors = (
+            (self.hpy_verts_diff_mean, self.hpy_verts_diff_std) if normalize_lcoords else None
+        )
+
+        # shape: <healpix_active, 5 (reference vertex), 4 * 3>
+        # (the table is kept un-normalized; normalization is applied in
+        #  get_target_coords_local together with the other local coords)
+        self.hpy_verts_local_target = torch.stack(verts_local).transpose(0, 1).flatten(2, 3)
+        self.verts_local = list(self.hpy_verts_local_target.transpose(0, 1))
 
         # keep only active cells
         verts00, verts00_rots = _subset(verts00, cells), _subset(verts00_rots, cells)
@@ -101,29 +163,6 @@ class Tokenizer:
             verts01_rots.to(torch.float32),
             vertsmm_rots.to(torch.float32),
         ]
-
-        transforms = [
-            ([verts10, verts11, verts01, vertsmm], verts00_rots),
-            ([verts00, verts11, verts01, vertsmm], verts10_rots),
-            ([verts00, verts10, verts01, vertsmm], verts11_rots),
-            ([verts00, verts11, verts10, vertsmm], verts01_rots),
-            ([verts00, verts10, verts11, verts01], vertsmm_rots),
-        ]
-
-        self.verts_local = []
-        for _verts, rot in transforms:
-            # Compute local coordinates
-            verts = torch.stack(_verts)
-            # shape: <healpix, 4, 3>
-            verts = verts.transpose(0, 1)
-            # Batch multiplication by the 3x3 rotation matrices.
-            # shape: <healpix, 3, 3> @ <healpix, 4, 3> -> <healpix, 4, 3>
-            # Needs to transpose first to <healpix, 3, 4> then transpose back.
-            t1 = torch.bmm(rot, verts.transpose(-1, -2)).transpose(-2, -1)
-            t2 = ref - t1
-            self.verts_local.append(t2.flatten(1, 2))
-
-        self.hpy_verts_local_target = torch.stack(self.verts_local).transpose(0, 1)
 
         # add local coords wrt to center of neighboring cells
         # (since the neighbors are used in the prediction)

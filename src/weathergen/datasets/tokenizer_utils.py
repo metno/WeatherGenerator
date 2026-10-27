@@ -384,6 +384,7 @@ def tokenize_apply_mask_target(
     hpy_verts_local,
     hpy_nctrs,
     enc_time,
+    verts_diff_norm_factors=None,
 ):
     """
     Apply masking to the data.
@@ -392,6 +393,8 @@ def tokenize_apply_mask_target(
     the cols the channels. Thereby mask_tokens acts on the rows, grouped according to the tokens as
     specified in idxs_cells and mask_channels acts on the columns.
 
+    verts_diff_norm_factors : (mean, std), each of shape [3], used to z-score normalize the
+        local relative coords (Tokenizer.hpy_verts_diff_norm_factors). None = no normalization.
     """
 
     def return_empty(rdata, idxs_cells_lens):
@@ -450,6 +453,7 @@ def tokenize_apply_mask_target(
             hpy_verts_rots,
             hpy_verts_local,
             hpy_nctrs,
+            verts_diff_norm_factors,
         )
         coords_local.requires_grad = False
     else:
@@ -482,6 +486,22 @@ def get_source_coords_local(
     return vec_scaled
 
 
+def normalize_lcoords(lcoords: Tensor, verts_diff_norm_factors) -> Tensor:
+    """z-score normalize local relative coords.
+
+    lcoords : <..., 3 * k>, i.e. k consecutive xyz triplets (k=1 for a point w.r.t. a vertex,
+              k=4 for the cell vertices w.r.t. a vertex, k=8 for points w.r.t. neighbor centers)
+    verts_diff_norm_factors : (mean, std), each of shape [3]; None returns lcoords unchanged
+    """
+    if verts_diff_norm_factors is None:
+        return lcoords
+    mean, std = verts_diff_norm_factors
+    shape = lcoords.shape
+    lcoords = lcoords.reshape(*shape[:-1], -1, 3)
+    lcoords = (lcoords - mean.to(lcoords.dtype)) / std.to(lcoords.dtype)
+    return lcoords.reshape(shape)
+
+
 def get_target_coords_local(
     stream_id,
     hlc,
@@ -492,9 +512,19 @@ def get_target_coords_local(
     verts_rots,
     verts_local,
     nctrs,
+    verts_diff_norm_factors=None,
 ):
     """Generate local coordinates for target coords w.r.t healpix cell vertices and
     and for healpix cell vertices themselves
+
+    Local relative coords (lcoords) are computed by rotating the reference vertex of each
+    healpix cell to ref=[1,0,0] and taking ref - rotated(point). Three types are produced:
+      - relative position of the points inside each cell w.r.t. a vertex (3 per vertex)
+      - relative position of the other vertices of the cell w.r.t. a vertex (12 per vertex)
+      - relative position of the points w.r.t. the centers of the 8 neighboring cells (24)
+    for the vertices south (verts00), east (verts10), north (verts11), west (verts01) and
+    center (vertsmm). All of them are z-score normalized with verts_diff_norm_factors
+    (mean/std of the relative positions of all vertices of all cells, all rotations).
     """
 
     # target_coords_lens = [len(t) for t in target_coords]
@@ -507,7 +537,7 @@ def get_target_coords_local(
     # target_geoinfos = torch.cat(target_geoinfos)
     # target_times = torch.cat(target_times)
 
-    verts00_rots, verts10_rots, verts11_rots, verts01_rots, vertsmm_rots = verts_rots
+    assert len(verts_rots) == 5, "expected rotations for verts00, 10, 11, 01, mm"
 
     a = torch.zeros(
         [
@@ -545,49 +575,30 @@ def get_target_coords_local(
     )
     vls = vls.transpose(0, 1)
 
-    zi = 0
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + 3)] = ref - locs_to_cell_coords_ctrs(
-        verts00_rots, tcs
-    )
+    # local relative coords w.r.t. each vertex (south, east, north, west, center).
+    # Per vertex, 15 channels: 3 for the points inside the cell w.r.t. the vertex,
+    # followed by 12 (4 x xyz) for the other vertices of the cell w.r.t. the vertex.
+    # Channel layout is identical to the un-normalized version (zi = 0, 3, 15, 18, ...).
+    nvl = vls.shape[-1]
+    for iv, rots in enumerate(verts_rots):
+        zi = iv * (3 + nvl)
+        # points inside each cell w.r.t. the vertex
+        lcoord = ref - locs_to_cell_coords_ctrs(rots, tcs)
+        a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + 3)] = normalize_lcoords(
+            lcoord, verts_diff_norm_factors
+        )
+        # the other vertices of each cell w.r.t. the vertex
+        zi += 3
+        a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + nvl)] = normalize_lcoords(
+            vls[iv], verts_diff_norm_factors
+        )
 
-    zi = 3
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + vls.shape[-1])] = vls[0]
-
-    zi = 15
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + 3)] = ref - locs_to_cell_coords_ctrs(
-        verts10_rots, tcs
-    )
-
-    zi = 18
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + vls.shape[-1])] = vls[1]
-
-    zi = 30
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + 3)] = ref - locs_to_cell_coords_ctrs(
-        verts11_rots, tcs
-    )
-
-    zi = 33
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + vls.shape[-1])] = vls[2]
-
-    zi = 45
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + 3)] = ref - locs_to_cell_coords_ctrs(
-        verts01_rots, tcs
-    )
-
-    zi = 48
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + vls.shape[-1])] = vls[3]
-
-    zi = 60
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + 3)] = ref - locs_to_cell_coords_ctrs(
-        vertsmm_rots, tcs
-    )
-
-    zi = 63
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + vls.shape[-1])] = vls[4]
-
+    # points inside each cell w.r.t. the centers of the 8 neighboring cells
     tcs_ctrs = torch.cat([ref - torch.cat(locs_to_ctr_coords(c, tcs)) for c in nctrs], -1)
     zi = 75
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + (3 * 8))] = tcs_ctrs
+    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + (3 * 8))] = normalize_lcoords(
+        tcs_ctrs, verts_diff_norm_factors
+    )
 
     # smooth global position on the unit sphere (R3, no lon-wrap seam).
     # This replaces a dead assignment (`a[..., geoinfo_offset+99:] = target_coords[...,
@@ -618,8 +629,9 @@ def _debug_check_target_coords(a: Tensor, stream_id, geoinfo_offset: int) -> Non
       - non-finite values (NaN/Inf) and the channels they occur in
       - channels that are identically zero (catches dead/dropped writes such as
         the former no-op tail assignment)
-      - abs-max per geometry block (a healthy encoding stays O(1); blow-ups point
-        to broken rotation matrices)
+      - abs-max per geometry block (with z-score normalization of the local coords a
+        healthy encoding stays at a few units; blow-ups point to broken rotation
+        matrices or wrong normalization factors)
     """
     bad = ~torch.isfinite(a)
     if bad.any():
