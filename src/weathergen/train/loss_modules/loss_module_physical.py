@@ -742,8 +742,22 @@ class LossPhysical(LossModuleBase):
                             count += 1
                 reordered_losses[stream_name][loss_fct_name]["avg"] /= count
 
-        for sname, vals in _spread_acc.items():
-            stddev_all[sname]["stddev_avg"] = torch.stack(vals).mean()
+        # Ensemble spread per stream. The set of keys must be IDENTICAL on every DDP rank:
+        # prepare_losses_for_logging() runs one all_reduce per key, so a key present on one
+        # rank only (e.g. because its sample was spoofed) would deadlock the collectives.
+        # Hence the keys depend only on the config (streams with ens_size > 1), and a
+        # stream without a valid spread in this batch logs NaN (dropped later by nanmean).
+        for sname, sinfo in self.cf.streams.items():
+            ens_size = sinfo.get("pred_head", {}).get("ens_size", 1)
+            if ens_size is None or int(ens_size) <= 1:
+                continue
+            vals = _spread_acc.get(sname, [])
+            stddev_all[sname]["stddev_avg"] = (
+                torch.stack(vals).mean()
+                if len(vals) > 0
+                else torch.tensor(float("nan"), device=self.device)
+            )
 
         # Return all computed loss components encapsulated in a ModelLoss dataclass
-        return LossValues(loss=loss, losses_all=reordered_losses, stddev_all=None)
+        # (stddev_all was previously returned as None, so the spread was never logged)
+        return LossValues(loss=loss, losses_all=reordered_losses, stddev_all=stddev_all)

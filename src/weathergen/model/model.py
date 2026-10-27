@@ -858,24 +858,30 @@ class Model(torch.nn.Module):
 
     # ---------------------------------------------------------------- POU blend
     @staticmethod
-    @functools.lru_cache(maxsize=4)
-    def _pou_tables(healpix_level: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _pou_tables_compute(
+        healpix_level: int, active_cells: np.ndarray
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Precompute (once per healpix level, on CPU) the candidate table for the
-        partition-of-unity readout blend.
+        Candidate table for the partition-of-unity readout blend, for the ACTIVE
+        cells of one domain (global NESTED indices, in compact order).
 
-        Returns
+        Returns (both in GLOBAL nested indexing; rows are in COMPACT cell order)
         -------
-        cand : torch.LongTensor (num_cells, K)
-            Column 0..8: the 1-ring of each cell (self first, matching hp_nbours).
+        cand : torch.LongTensor (num_active, K)
+            Column 0..8: the 1-ring of each cell (self first, then
+            hp.neighbours order -- the same order as ModelParams.hp_nbours).
             Columns 9..: extra pixels that the HEALPix bilinear interpolation
             scheme can select for points inside the cell but that lie outside
-            the 1-ring (occurs only near polar / base-cell seams; at most 2 per
-            cell, determined by dense subsampling).  Unused columns are padded
-            with the cell itself (they receive zero weight and are skipped).
-        pools : torch.LongTensor (K, num_cells, 9)
+            the 1-ring (only near polar / base-cell seams; at most 2 per cell,
+            found by dense subsampling). Unused columns are padded with the cell
+            itself (they receive zero weight).
+        pools : torch.LongTensor (K, num_active, 9)
             pools[k, c] = the 1-ring of cand[c, k], i.e. the KV cell pool used
             when the readout is evaluated "as seen from" candidate k of cell c.
+
+        Only the active cells are subsampled, so the cost scales with the domain
+        rather than the sphere (the global version needed 12*4**hl*64 sub-points:
+        ~50M at hl8).
         """
         import astropy.units as _u
         from astropy.coordinates import Latitude as _Lat
@@ -883,42 +889,55 @@ class Model(torch.nn.Module):
         from astropy_healpix import bilinear_interpolation_weights as _bil
 
         hl = healpix_level
-        n = 12 * 4**hl
+        nside = 2**hl
+        active = np.asarray(active_cells, dtype=np.int64)
+        n = len(active)
 
-        with warnings.catch_warnings(action="ignore"):
-            nb = hp.neighbours(np.arange(n), 2**hl, order="nested").transpose()
-        for i, row in enumerate(nb):
-            nb[i][row == -1] = i
-        ring1 = np.hstack([np.arange(n).reshape(-1, 1), nb]).astype(np.int64)  # (n, 9)
+        def _ring(cells: np.ndarray) -> np.ndarray:
+            """(len(cells), 9): self + 8 neighbours; missing (-1) -> self."""
+            with warnings.catch_warnings(action="ignore"):
+                nb = hp.neighbours(cells, nside, order="nested").transpose().astype(np.int64)
+            nb = np.where(nb < 0, cells[:, None], nb)
+            return np.hstack([cells[:, None], nb])
 
-        # dense subsampling of every cell (children at level hl+3, 64 per cell)
-        # to discover which bilinear pixels can occur inside each cell
+        ring1 = _ring(active)  # (n, 9)
+
+        # dense subsampling of every active cell: its 4**sub NESTED children at
+        # level hl+sub (the containing cell is then exactly child // 4**sub)
         sub = 3
-        child = np.arange(n * 4**sub)
+        n_child = 4**sub
+        child = (active[:, None] * n_child + np.arange(n_child)[None, :]).reshape(-1)
+        containing = np.repeat(np.arange(n), n_child)  # compact index of parent
         lons, lats = hp.healpix_to_lonlat(child, 2 ** (hl + sub), dx=0.5, dy=0.5, order="nested")
         idx4, _ = _bil(
-            _Lon(lons.rad, unit=_u.rad), _Lat(lats.rad, unit=_u.rad), nside=2**hl, order="nested"
+            _Lon(lons.rad, unit=_u.rad), _Lat(lats.rad, unit=_u.rad), nside=nside, order="nested"
         )
         idx4 = idx4.T.astype(np.int64)  # (num_children, 4)
-        containing = astropy_healpix.healpy.ang2pix(
-            2**hl, np.pi / 2 - lats.rad, lons.rad, nest=True
-        ).astype(np.int64)
 
         max_extra = 2
         cand = np.concatenate(
-            [ring1, np.repeat(np.arange(n).reshape(-1, 1), max_extra, axis=1)], axis=1
+            [ring1, np.repeat(active.reshape(-1, 1), max_extra, axis=1)], axis=1
         )  # (n, 9 + max_extra), padded with self
         n_extra = np.zeros(n, dtype=np.int64)
         in_ring = (idx4[:, :, None] == ring1[containing][:, None, :]).any(-1)  # (children, 4)
-        for c, pix in zip(containing[~in_ring.all(-1)], idx4[~in_ring.all(-1)]):
+        sel = ~in_ring.all(-1)
+        for c, pix in zip(containing[sel], idx4[sel], strict=True):
             for p in pix:
                 if p not in cand[c, : 9 + n_extra[c]] and n_extra[c] < max_extra:
                     cand[c, 9 + n_extra[c]] = p
                     n_extra[c] += 1
 
-        cand_t = torch.from_numpy(cand)                       # (n, K)
-        pools = torch.from_numpy(ring1)[cand_t.T]             # (K, n, 9)
-        return cand_t, pools
+        K = cand.shape[1]
+        pools = _ring(cand.T.reshape(-1)).reshape(K, n, 9)  # ring of every candidate
+        return torch.from_numpy(cand), torch.from_numpy(pools)
+
+    def _pou_tables(self, domain) -> tuple[torch.Tensor, torch.Tensor]:
+        """Cached per (level, active cell set) wrapper of _pou_tables_compute."""
+        cache = self.__dict__.setdefault("_pou_tables_cache", {})
+        key = (domain.healpix_level, len(domain), hash(domain.active_cells.tobytes()))
+        if key not in cache:
+            cache[key] = self._pou_tables_compute(domain.healpix_level, domain.active_cells)
+        return cache[key]
 
     def _pou_predict(
         self,
@@ -929,6 +948,7 @@ class Model(torch.nn.Module):
         tokens: torch.Tensor,
         s: list[int],
         batch_size: int,
+        domain=None,
     ) -> torch.Tensor:
         """
         Partition-of-unity readout blend removing healpix grid-imprint artifacts.
@@ -942,36 +962,35 @@ class Model(torch.nn.Module):
         ------------
         The HEALPix bilinear interpolation scheme assigns to every point p four
         pixels b_1..b_4(p) with weights lambda_1..lambda_4(p) >= 0 summing to 1
-        that are CONTINUOUS functions of position over the whole sphere (this is
-        the standard scheme used for HEALPix map interpolation).  We reuse these
-        weights as the partition of unity:
+        that are CONTINUOUS functions of position over the whole sphere. We reuse
+        these weights as the partition of unity:
 
             f(p) = sum_k  lambda_k(p) * f_{b_k(p)}(p)
 
         where f_j(p) is the existing readout evaluated with the KV pool centered
-        on cell j (i.e. the 1-ring of j) instead of c(p).  Because the (pixel,
-        weight) pairs vary continuously with p and do not reference c(p), the
-        pool contribution to f(p) is continuous across every cell boundary by
-        construction — the exiting pool's weight reaches zero exactly at the
-        switch.  There is no tunable parameter.
+        on cell j (i.e. the 1-ring of j) instead of c(p). The pool contribution
+        to f(p) is therefore continuous across every cell boundary.
+
+        Regional domains
+        ----------------
+        Cells are addressed by COMPACT index (tokens, tcs_lens); the HEALPix
+        tables are in GLOBAL index and are mapped through the domain:
+          * a bilinear pixel that lies OUTSIDE the domain has no latent, so its
+            weight is dropped and the remaining weights are renormalized
+            (continuity is lost only along the domain edge);
+          * a pool neighbour outside the domain is replaced by the pool's centre,
+            the same convention as Domain.neighbours_compact() / hp_nbours.
+        For the global domain both mappings are the identity.
 
         Implementation notes
         --------------------
-        * The per-cell varlen attention structure of the standard readout is
-          preserved exactly: for each candidate column k of the table from
-          _pou_tables, one engine call is made whose KV gather mirrors the
-          original tokens_nbors construction, with identical lens tensors.
-          Columns whose weights are all zero in this batch are skipped
-          (the 2 seam-extra columns are inactive unless the batch contains
-          points in polar-seam cells).
-        * The bilinear weights are computed on CPU via astropy_healpix from the
-          smooth unit-sphere position stored in the last 3 channels of
-          t_coords (requires the smooth-tail tokenizer patch; validated below).
-        * Residual caveat: the coordinate features conditioning the decoder
-          (the 99 cell-relative channels of t_coords) still switch with c(p).
-          The ablation experiment showed these do not cause the artifacts, but
-          for a fully boundary-free pipeline combine pou_blend with
-          WEATHERGEN_ABLATE_CELL_COORDS=1 or a smooth coordinate encoding.
+        * One readout call per active candidate column k; the KV gather for
+          column k mirrors the standard tokens_nbors construction, including the
+          per-sample offset into the flattened (batch * cells) latent.
+        * The bilinear weights are computed on CPU from the smooth unit-sphere
+          position stored in the last 3 channels of t_coords.
+        * Residual caveat: the cell-relative coordinate channels of t_coords
+          still switch with c(p).
 
         Config:  pou_blend: true   (default false; no other parameters)
         Cost:    <= 9 (+2 near seams) readout calls instead of 1.
@@ -981,9 +1000,15 @@ class Model(torch.nn.Module):
         from astropy.coordinates import Longitude as _Lon
         from astropy_healpix import bilinear_interpolation_weights as _bil
 
-        n = self.num_healpix_cells
+        if domain is None:
+            domain = self.domain_pyramid.domain(self.domain_pyramid.finest)
+        n = len(domain)
         num_cells_total = batch_size * n
         dev = tc_tokens.device
+        assert s[0] == batch_size and s[1] == n, (
+            f"pou_blend: latent layout {s} does not match batch_size={batch_size}, "
+            f"num_cells={n}"
+        )
 
         # ---- smooth unit-sphere position of every target point -------------
         p_r3 = t_coords[..., -3:].to(torch.float32)
@@ -995,27 +1020,42 @@ class Model(torch.nn.Module):
                 "NUM_GLOBAL_COORD_CHANNELS). Found non-unit vectors instead."
             )
 
-        # ---- containing cell of every point (from the packed varlen lens) --
+        # ---- containing COMPACT cell of every point (from the packed lens) --
         cell_of_point = torch.repeat_interleave(
             torch.arange(num_cells_total, device=dev), tcs_lens[1:].to(dev)
         )
-        hp_cell = (cell_of_point % n).cpu()
+        hp_cell = (cell_of_point % n).cpu()  # compact index within the domain
 
-        # ---- bilinear pixels and weights (CPU, vectorized) ------------------
+        # ---- bilinear pixels and weights (CPU, vectorized; GLOBAL indices) --
+        # p_r3 is in the tokenizer's frame (phi = lon + 180 deg), which is the
+        # frame ang2pix was called in, so atan2 gives the healpix longitude directly
         p_np = p_r3.detach().cpu().numpy()
         lon = np.arctan2(p_np[:, 1], p_np[:, 0])
         lat = np.arcsin(np.clip(p_np[:, 2], -1.0, 1.0))
         idx4, w4 = _bil(
-            _Lon(lon, unit=_u.rad), _Lat(lat, unit=_u.rad), nside=2**self.healpix_level,
+            _Lon(lon, unit=_u.rad), _Lat(lat, unit=_u.rad), nside=2**domain.healpix_level,
             order="nested",
         )
         idx4 = torch.from_numpy(idx4.T.astype(np.int64))       # (N_pts, 4)
         w4 = torch.from_numpy(w4.T.astype(np.float32))         # (N_pts, 4)
 
-        # ---- map bilinear pixels onto candidate-table columns ---------------
-        cand, pools = self._pou_tables(self.healpix_level)     # (n,K), (K,n,9)
+        # ---- candidate table (rows in compact order, entries global) --------
+        cand, pools = self._pou_tables(domain)                 # (n,K), (K,n,9)
         K = cand.shape[1]
-        cand_rows = cand[hp_cell]                              # (N_pts, K)
+
+        # global -> compact; -1 where the cell is outside the domain
+        cand_c = torch.from_numpy(domain.to_compact_safe(cand.numpy()))     # (n, K)
+        pools_c = torch.from_numpy(domain.to_compact_safe(pools.numpy()))   # (K, n, 9)
+        # pool neighbours outside the domain -> pool centre (hp_nbours convention);
+        # pools whose centre is itself outside the domain get zero weight below
+        # and only need SOME valid index, so they fall back to the cell itself.
+        own = torch.arange(n).view(n, 1).expand(n, 9)
+        centre = pools_c[:, :, :1].expand(-1, -1, 9)                        # (K, n, 9)
+        pools_c = torch.where(pools_c >= 0, pools_c, centre)
+        pools_c = torch.where(pools_c >= 0, pools_c, own.unsqueeze(0))
+
+        # ---- map bilinear pixels onto candidate-table columns ---------------
+        cand_rows = cand[hp_cell]                              # (N_pts, K) global
         match = idx4.unsqueeze(-1) == cand_rows.unsqueeze(1)   # (N_pts, 4, K)
         found = match.any(-1)                                  # (N_pts, 4)
         col = match.to(torch.int64).argmax(-1)                 # (N_pts, 4)
@@ -1024,12 +1064,12 @@ class Model(torch.nn.Module):
         lam.scatter_add_(1, col, torch.where(found, w4, torch.zeros_like(w4)))
         n_missed = int((~found & (w4 > 1e-9)).sum())
         if n_missed > 0:
-            # sampling gap in the candidate table: renormalize the matched mass
-            # (continuity is broken only for these points; expected count: 0)
             logger.warning(
                 f"pou_blend: {n_missed} bilinear pixel(s) missing from candidate "
                 "table; weights renormalized for the affected points."
             )
+        # drop candidates outside the domain (no latent there)
+        lam = lam * (cand_c[hp_cell] >= 0).to(lam.dtype)
         lam = lam / lam.sum(dim=-1, keepdim=True).clamp(min=1e-12)
         lam = lam.to(dev)
 
@@ -1039,22 +1079,22 @@ class Model(torch.nn.Module):
             (num_cells_total + 1,), fill_value=9, dtype=torch.int32, device=dev
         )
         lens[0] = 0
+        # per-sample offset into the flattened (B*n) latent rows
+        b_off = (torch.arange(batch_size, device=dev) * n).view(batch_size, 1, 1)
 
         pred_blend = None
         for k in range(K):
             lam_k = lam[:, k]
             if not (lam_k > 0).any():
                 continue
-            # KV pool gather for column k, mirroring the original tokens_nbors
-            # construction (incl. its per-batch index handling).
-            idxs_k = pools[k].to(dev).unsqueeze(0).repeat((batch_size, 1, 1)).flatten(0, 1)
+            # (B*n, 9) rows into tokens_flat; was missing b_off, so every sample
+            # read sample 0's latent when batch_size > 1
+            idxs_k = (pools_c[k].to(dev).unsqueeze(0) + b_off).flatten(0, 1)
 
             def _slot_forward(tokens_flat_, tc_tokens_, t_coords_, idxs_flat_):
                 # The gather is INSIDE the checkpoint so the large KV tensor
                 # (same size as tokens_nbors) is freed after this slot's forward
-                # and recomputed at backward. Without this, all K gathers plus
-                # per-slot activations stay resident simultaneously (~K x the
-                # readout memory), which OOMs on GPUs running near capacity.
+                # and recomputed at backward.
                 toks_k_ = tokens_flat_[idxs_flat_].flatten(0, 1)
                 out_k_ = self.target_token_engines[stream_name](
                     latent=toks_k_,
@@ -1065,14 +1105,8 @@ class Model(torch.nn.Module):
                 )
                 return self.pred_heads[stream_name](out_k_)
 
-            # Memory/compat trade-off: wrapping the slot in torch.utils.checkpoint
-            # frees the large gathered KV between slots (recomputed at backward),
-            # but under FSDP2 the backward-time recomputation runs outside the
-            # FSDP hooks that unshard the DTensor parameters, producing
-            # "got mixed torch.Tensor and DTensor" (nested non-reentrant
-            # checkpointing + FSDP2 is not supported). So: checkpoint only when
-            # the model is not FSDP-sharded; under FSDP2 call directly and rely
-            # on the engine's internal per-layer checkpoints.
+            # Under FSDP2 nested non-reentrant checkpointing is not supported
+            # ("mixed torch.Tensor and DTensor"), so only checkpoint without FSDP.
             if self.cf.get("with_fsdp", False) and self.cf.get("with_ddp", False):
                 pred_k = _slot_forward(tokens_flat, tc_tokens, t_coords, idxs_k.flatten())
             else:
@@ -1344,10 +1378,34 @@ class Model(torch.nn.Module):
                 )
                 tcs_lens = torch.cat([torch.zeros(1, dtype=torch.int32, device=tcls.device), tcls])
 
+                # Target cells of this stream live at its ENCODE level (that is the
+                # level it was tokenized at, so tcs_lens has one entry per cell of
+                # that level). `s` is the latent layout at that level; it was
+                # previously referenced here without ever being defined (NameError
+                # for decoder_type "Linear" and for pou_blend).
+                enc_lvl = getattr(self.encoder, "stream_encode_level", {}).get(
+                    stream_name, _finest
+                )
+                toks_enc = (
+                    tokens
+                    if enc_lvl == _finest
+                    else tokens_lvl[enc_lvl][:, self.num_aux_tokens :]
+                )
+                ncells_enc = len(self.domain_pyramid.domain(enc_lvl))
+                s = [batch_size, ncells_enc, self.cf.ae_local_num_queries, toks_enc.shape[-1]]
+
                 if self.cf.decoder_type == "Linear":
+                    # one latent row per target cell (BilinearDecoder repeats row i
+                    # tcs_lens[i+1] times)
+                    lin_latent = toks_enc.reshape(-1, s[-1])  # collapse batch and token dims
+                    assert lin_latent.shape[0] == batch_size * ncells_enc, (
+                        "decoder_type 'Linear' needs one latent token per cell "
+                        f"(ae_local_num_queries == 1); got {lin_latent.shape[0]} rows for "
+                        f"{batch_size * ncells_enc} cells"
+                    )
                     pred = self.target_token_engines[stream_name](
                         tc_tokens,
-                        tokens.reshape(-1, s[-1]),  # collapse the batch and token dimensions
+                        lin_latent,
                         tcs_lens,
                     ).unsqueeze(0)  # add ensemble dim: shape is then [1, preds_per_coord, channels]
 
@@ -1360,14 +1418,22 @@ class Model(torch.nn.Module):
                     # by the hard 9-cell pool switch at cell edges.
                     # Config: pou_blend: true  (no other parameters, no
                     # retraining required -- architecture is unchanged).
+                    # pou_blend blends single-level 1-ring pools; a stream that also
+                    # reads coarser levels would silently lose that context here.
+                    if len(dec_levels) != 1:
+                        raise NotImplementedError(
+                            f"pou_blend: stream {stream_name!r} decodes from levels "
+                            f"{dec_levels}; only single-level decoding is supported."
+                        )
                     pred = self._pou_predict(
                         stream_name=stream_name,
                         tc_tokens=tc_tokens,
                         t_coords=t_coords,
                         tcs_lens=tcs_lens,
-                        tokens=tokens,
+                        tokens=toks_enc,
                         s=s,
                         batch_size=batch_size,
+                        domain=self.domain_pyramid.domain(enc_lvl),
                     )
 
                 else:

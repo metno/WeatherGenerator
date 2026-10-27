@@ -7,6 +7,7 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+import numpy as np
 import torch
 from astropy_healpix import healpy
 from torch.utils.checkpoint import checkpoint
@@ -124,7 +125,9 @@ class EncoderModule(torch.nn.Module):
         self._ae_global_per_level = torch.nn.ModuleDict()
         for lvl in self.domain_pyramid.levels:
             n_cells_l = len(self.domain_pyramid.domain(lvl))
-            q_l = self._build_q_cells(cf, n_cells_l, lvl)
+            q_l = self._build_q_cells(
+                cf, n_cells_l, lvl, self.domain_pyramid.domain(lvl).active_cells
+            )
             self._q_cells_param_dict[str(lvl)] = torch.nn.Parameter(q_l, requires_grad=True)
             self._ae_aggregation_per_level[str(lvl)] = QueryAggregationEngine(cf, n_cells_l)
             self._ae_global_per_level[str(lvl)] = GlobalAssimilationEngine(cf, n_cells_l)
@@ -160,10 +163,16 @@ class EncoderModule(torch.nn.Module):
             num_cycles=_casc_cfg.get("num_cycles", 0),
             operator=_casc_cfg.get("operator", "none"),
         )
-    def _build_q_cells(self, cf, num_cells: int, healpix_level: int) -> torch.Tensor:
+    def _build_q_cells(
+        self, cf, num_cells: int, healpix_level: int, active_cells=None
+    ) -> torch.Tensor:
         """
-        Learnable query bank for one level. Byte-identical to the old inline
-        construction when called with (num_healpix_cells, cf.healpix_level).
+        Learnable query bank for one level.
+
+        active_cells : global NESTED indices of the level's active cells (compact
+            order). Required for correct per-cell position features on a regional
+            domain, where compact index c is NOT healpix pixel c. None -> global
+            domain (active cells are 0..num_cells-1).
         """
         if cf.ae_local_queries_per_cell:
             s = (num_cells, cf.ae_local_num_queries, cf.ae_global_dim_embed)
@@ -173,7 +182,20 @@ class EncoderModule(torch.nn.Module):
                 .unsqueeze(1).unsqueeze(1)
                 .repeat((1, cf.ae_local_num_queries, 2))
             )
-            theta, phi = healpy.pix2ang(nside=2**healpix_level, ipix=torch.arange(num_cells))
+            # Position of each cell. Three fixes vs. the previous version:
+            #  - use the GLOBAL index of each compact cell (regional domains),
+            #  - nest=True: the codebase uses NESTED ordering everywhere (pix2ang
+            #    defaults to RING, which gave the angles of unrelated pixels),
+            #  - numpy in / torch out: pix2ang does not accept torch tensors.
+            ipix = (
+                np.arange(num_cells, dtype=np.int64)
+                if active_cells is None
+                else np.asarray(active_cells, dtype=np.int64)
+            )
+            assert len(ipix) == num_cells, "active_cells must have one entry per cell"
+            theta, phi = healpy.pix2ang(nside=2**healpix_level, ipix=ipix, nest=True)
+            theta = torch.from_numpy(np.asarray(theta, dtype=np.float32))
+            phi = torch.from_numpy(np.asarray(phi, dtype=np.float32))
             q_cells[:, :, -6:-3] = (
                 torch.cos(theta).unsqueeze(1).unsqueeze(1).repeat((1, cf.ae_local_num_queries, 3))
             )
@@ -271,8 +293,10 @@ class EncoderModule(torch.nn.Module):
         """
 
         if self.cf.latent_noise_kl_weight > 0.0:
+            # sample from the posterior during training, use its mean at eval
+            # (was `sampling=self.stage`: attribute never set -> AttributeError)
             tokens, posteriors = self.interpolator_latents.interpolate_with_noise(
-                tokens, sampling=self.stage
+                tokens, sampling=self.training
             )
         else:
             posteriors = torch.zeros((1,), device=tokens.device)

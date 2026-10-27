@@ -297,7 +297,11 @@ def prepare_losses_for_logging(
 
     for d in stddev_unweighted_hist:
         for key, value in flatten_dict(d).items():
-            if value:
+            # `is not None` rather than truthiness: a spread of exactly 0.0 (collapsed
+            # ensemble) must still be reduced, otherwise this rank skips a collective
+            # the other ranks run and DDP deadlocks
+            if value is not None:
+                value = value if torch.is_tensor(value) else torch.tensor(value, device="cuda")
                 stddev_all[key].append(ddp_average(value).item())
 
     return real_loss, losses_all, stddev_all
