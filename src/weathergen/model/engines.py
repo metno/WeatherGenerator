@@ -65,6 +65,7 @@ class EmbeddingEngine(torch.nn.Module):
                     num_blocks=si["embed"]["num_blocks"],
                     num_heads=si["embed"]["num_heads"],
                     dropout_rate=self.cf.embed_dropout_rate,
+                    dropout_final_rate=self.cf.get("embed_final_dropout_rate", 0.1),
                     norm_type=self.cf.norm_type,
                     unembed_mode=self.cf.embed_unembed_mode,
                     stream_name=stream_name,
@@ -757,6 +758,7 @@ class TargetPredictionEngineClassic(nn.Module):
         self.softcap = softcap
         self.tte = torch.nn.ModuleList()
         dim_latent = dim_latent or self.cf.ae_global_dim_embed
+        pred_dropout_rate = self.cf.get("pred_dropout_rate", 0.1)
 
         for i in range(len(self.dims_embed) - 1):
             # Multi-Cross Attention Head
@@ -768,7 +770,7 @@ class TargetPredictionEngineClassic(nn.Module):
                     dim_head_proj=self.tr_dim_head_proj,
                     with_residual=True,
                     with_qk_lnorm=True,
-                    dropout_rate=0.1,  # Assuming dropout_rate is 0.1
+                    dropout_rate=pred_dropout_rate,
                     with_flash=self.cf.with_flash_attention,
                     norm_type=self.cf.norm_type,
                     qk_norm_type=self.cf.get("qk_norm_type", self.cf.norm_type),
@@ -785,7 +787,7 @@ class TargetPredictionEngineClassic(nn.Module):
                     MultiSelfAttentionHeadVarlen(
                         dim_embed=self.dims_embed[i],
                         num_heads=stream_config["target_readout"]["num_heads"],
-                        dropout_rate=0.1,  # Assuming dropout_rate is 0.1
+                        dropout_rate=pred_dropout_rate,
                         with_qk_lnorm=True,
                         with_flash=self.cf.with_flash_attention,
                         norm_type=self.cf.norm_type,
@@ -803,7 +805,7 @@ class TargetPredictionEngineClassic(nn.Module):
                     self.dims_embed[i + 1],
                     with_residual=True,
                     hidden_factor=self.tr_mlp_hidden_factor,
-                    dropout_rate=0.1,  # Assuming dropout_rate is 0.1
+                    dropout_rate=pred_dropout_rate,
                     norm_type=self.cf.norm_type,
                     dim_aux=(self.dim_coord_in if self.cf.pred_mlp_adaln else None),
                     norm_eps=self.cf.mlp_norm_eps,
