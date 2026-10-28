@@ -7,6 +7,7 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+import numpy as np
 import torch
 from astropy_healpix import healpy
 from torch.utils.checkpoint import checkpoint
@@ -175,7 +176,15 @@ class EncoderModule(torch.nn.Module):
                 .unsqueeze(1)
                 .repeat((1, cf.ae_local_num_queries, 2))
             )
-            theta, phi = healpy.pix2ang(nside=2**domain.healpix_level, ipix=cell_ids)
+            # healpy.pix2ang needs numpy input and nest=True (the codebase uses NESTED
+            # ordering everywhere; the default RING gives the angles of unrelated pixels)
+            theta, phi = healpy.pix2ang(
+                nside=2**domain.healpix_level,
+                ipix=np.asarray(domain.active_cells, dtype=np.int64),
+                nest=True,
+            )
+            theta = torch.from_numpy(np.asarray(theta, dtype=np.float32))
+            phi = torch.from_numpy(np.asarray(phi, dtype=np.float32))
             q_cells[:, :, -6:-3] = (
                 torch.cos(theta).unsqueeze(1).unsqueeze(1).repeat((1, cf.ae_local_num_queries, 3))
             )
@@ -355,7 +364,10 @@ class EncoderModule(torch.nn.Module):
 
         if self.cf.latent_noise_kl_weight > 0.0:
             tokens, posteriors = self.interpolator_latents.interpolate_with_noise(
-                tokens, sampling=self.stage
+                # sample from the posterior during training, use its mean at eval
+                # (`self.stage` is never set on the encoder -> AttributeError)
+                tokens,
+                sampling=self.training,
             )
         else:
             posteriors = torch.zeros((1,), device=tokens.device)

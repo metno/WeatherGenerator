@@ -886,6 +886,7 @@ class TargetPredictionEngine(nn.Module):
         self.tr_dim_head_proj = tr_dim_head_proj
         self.tr_mlp_hidden_factor = tr_mlp_hidden_factor
         self.softcap = softcap
+        pred_dropout_rate = cf.get("pred_dropout_rate", 0.1)
 
         # For backwards compatibility
 
@@ -895,7 +896,7 @@ class TargetPredictionEngine(nn.Module):
 
         attention_kwargs = {
             "with_qk_lnorm": True,
-            "dropout_rate": 0.1,  # Assuming dropout_rate is 0.1
+            "dropout_rate": pred_dropout_rate,
             "with_flash": self.cf.with_flash_attention,
             "norm_type": self.cf.norm_type,
             "qk_norm_type": self.cf.qk_norm_type,
@@ -936,7 +937,7 @@ class TargetPredictionEngine(nn.Module):
                         num_heads=target_readout_num_heads,
                         attention_kwargs=attention_kwargs,
                         with_adanorm=True,
-                        dropout_rate=0.1,
+                        dropout_rate=pred_dropout_rate,
                     )
                 )
             elif self.cf.decoder_type == "CrossAttentionConditioning":
@@ -949,7 +950,7 @@ class TargetPredictionEngine(nn.Module):
                         with_self_attn=True,
                         with_adanorm=False,
                         with_mlp=True,
-                        dropout_rate=0.1,
+                        dropout_rate=pred_dropout_rate,
                         attention_kwargs=attention_kwargs,
                     )
                 )
@@ -963,7 +964,7 @@ class TargetPredictionEngine(nn.Module):
                         with_self_attn=True,
                         with_adanorm=True,
                         with_mlp=True,
-                        dropout_rate=0.1,
+                        dropout_rate=pred_dropout_rate,
                         attention_kwargs=attention_kwargs,
                     )
                 )

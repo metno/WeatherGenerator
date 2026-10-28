@@ -36,6 +36,7 @@ from weathergen.model.engines import (
     TargetPredictionEngine,
     TargetPredictionEngineClassic,
 )
+from weathergen.model.init_utils import reinit_parameters
 from weathergen.model.latent_cascade import LatentCascade
 from weathergen.model.layers import MLP, NamedLinear
 from weathergen.model.utils import get_num_parameters
@@ -700,22 +701,17 @@ class Model(torch.nn.Module):
         return self
 
     def reset_parameters(self):
-        def _reset_params(module):
-            if isinstance(module, nn.Linear | nn.LayerNorm):
-                module.reset_parameters()
-            else:
-                pass
+        """
+        Initialise all parameters as the module constructors do. Called after a meta-device
+        (FSDP) construction, where to_empty() leaves uninitialised storage.
+        """
+        # every Linear / LayerNorm / norm, with the overrides of the enclosing modules
+        # (forecast-engine near-identity init, zero-initialised cascade branches, ...)
+        reinit_parameters(self)
 
-        self.apply(_reset_params)
-
-        # learnable cell queries are plain Parameters (one bank per latent level), not
-        # covered by the line above: re-draw them (uninitialised memory after to_empty)
+        # learnable cell queries are plain Parameters (one bank per latent level): re-draw
+        # them with the constructor's initialisation
         self.encoder.reset_q_cells()
-
-        # multi-resolution latent: the line above resets every Linear, including the
-        # zero-initialised last projections of the cascade blocks; re-apply those
-        for cascade in self.latent_cascades():
-            cascade.init_residual_branches()
 
     def latent_cascades(self) -> list[LatentCascade]:
         """The latent cascades of a multi-resolution latent (empty for one level)."""

@@ -878,7 +878,8 @@ def plot_train(args=None):
 
     runs_ids = args.fd if args.fd is not None else args.fy
 
-    if args.delete == "True":
+    # args.delete is a store_true flag (bool); `== "True"` was never true
+    if args.delete:
         clean_plot_folder(out_dir)
 
     # collect all physical streams from all run_ids if requested
@@ -1018,19 +1019,20 @@ def plot_train(args=None):
                 legend_num_columns=args.legend_num_columns,
                 legend_max_label_len=args.legend_max_label_len,
             )
-        plot_loss_per_run(
-            ["val"],
-            run_id,
-            runs_ids[run_id],
-            run_data,
-            get_stream_names(run_id, model_path=model_base_dir),  # limit to available streams
-            channels=args.channels,
-            plot_dir=out_dir,
-            legend_outside=args.legend_outside,
-            legend_font_size=args.legend_font_size,
-            legend_num_columns=args.legend_num_columns,
-            legend_max_label_len=args.legend_max_label_len,
-        )
+            # val-only plot, per run (was dedented out of the loop -> last run only)
+            plot_loss_per_run(
+                ["val"],
+                run_id,
+                runs_ids[run_id],
+                run_data,
+                get_stream_names(run_id, model_path=model_base_dir),  # limit to available streams
+                channels=args.channels,
+                plot_dir=out_dir,
+                legend_outside=args.legend_outside,
+                legend_font_size=args.legend_font_size,
+                legend_num_columns=args.legend_num_columns,
+                legend_max_label_len=args.legend_max_label_len,
+            )
 
 
 if __name__ == "__main__":

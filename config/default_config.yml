@@ -49,6 +49,11 @@ pred_adapter_kv: False
 pred_self_attention: True
 pred_dyadic_dims: False
 pred_mlp_adaln: True
+# z-score normalisation of the decoder's local relative target coordinates (cell-relative
+# positions of the target points); without it they are tiny at fine levels (hl8 std ~1e-5..1e-3).
+# Changes the decoder inputs. Runs whose saved config has no such key (trained before it existed)
+# keep it off when continued or used for inference.
+normalize_target_lcoords: True
 
 # number of steps offset applied to first target window; if set to zero and forecast_steps=0 then
 # one is training an auto-encoder

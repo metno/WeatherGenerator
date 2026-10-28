@@ -27,7 +27,7 @@ from weathergen.model.attention import (
     MultiSelfAttentionHeadLocal,
     MultiSelfAttentionHeadVarlen,
 )
-from weathergen.model.latent_cascade import CascadeBlock, _PairOperator
+from weathergen.model.init_utils import materialize_and_init_missing
 from weathergen.model.layers import MLP
 from weathergen.model.model import Model, build_model_params
 from weathergen.model.utils import apply_fct_to_blocks, freeze_weights
@@ -214,24 +214,6 @@ def init_model_and_shard(
     return model, model_params
 
 
-def _reset_linear_and_norm(module) -> None:
-    if isinstance(module, torch.nn.Linear | torch.nn.LayerNorm):
-        module.reset_parameters()
-
-
-def reinit_new_cascade_blocks(model, missing_keys) -> None:
-    """
-    Re-apply the zero initialisation of latent-cascade blocks that were not in the loaded
-    checkpoint (e.g. a cascade added when fine-tuning a pretrained model): re-initialising
-    the missing modules resets their Linear layers to random values. Blocks that were loaded
-    from the checkpoint are left untouched.
-    """
-    for name, module in model.named_modules():
-        is_cascade_op = isinstance(module, CascadeBlock | _PairOperator)
-        if is_cascade_op and any(k.startswith(name + ".") for k in missing_keys):
-            module.init_residual_branches()
-
-
 def load_model(cf, model, device, run_id: str, mini_epoch=-1):
     """Loads model state from checkpoint and checks for missing and unused keys.
     Args:
@@ -291,24 +273,19 @@ def load_model(cf, model, device, run_id: str, mini_epoch=-1):
             # Get the unique parent modules for the missing parameters
             new_modules_to_init = {key.rsplit(".", 1)[0] for key in mkeys}
 
-            # Find the highest-level "root" new modules to avoid redundant initializations
+            # Find the highest-level "root" new modules (for logging)
             root_new_modules = set()
             for path in sorted(list(new_modules_to_init)):
                 if not any(path.startswith(root + ".") for root in root_new_modules):
                     root_new_modules.add(path)
 
-            # Get all modules for quick lookup and initialize the new ones
-            all_modules = dict(model.named_modules())
-            for path in root_new_modules:
-                if is_root():
+            if is_root():
+                for path in sorted(root_new_modules):
                     logger.info(f"Initializing new module not found in checkpoint: {path}")
-                module_to_init = all_modules[path]
-                module_to_init.to_empty(device="cuda")
-                # reset every Linear / LayerNorm below the new module (as in
-                # Model.reset_parameters); the module itself may be a container without
-                # reset_parameters()
-                module_to_init.apply(_reset_linear_and_norm)
-            reinit_new_cascade_blocks(model, mkeys)
+            # allocate only the missing parameters and give them their constructor init
+            # (incl. the overrides of enclosing modules, e.g. the forecast engine's
+            # near-identity init when continuing from an autoencoder checkpoint)
+            materialize_and_init_missing(model, mkeys, device="cuda")
 
     else:
         # fix mismatch between state_dict keys that can occur between interactive/non-interactive

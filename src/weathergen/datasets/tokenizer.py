@@ -16,12 +16,53 @@ from weathergen.datasets.utils import (
 )
 
 
+def _local_transforms(verts: list, rots: list) -> list:
+    """(other vertices, rotation of the reference vertex) for the 5 reference vertices
+    (verts00, verts10, verts11, verts01, vertsmm), in the tokenizer's channel order."""
+    v00, v10, v11, v01, vmm = verts
+    r00, r10, r11, r01, rmm = rots
+    return [
+        ([v10, v11, v01, vmm], r00),
+        ([v00, v11, v01, vmm], r10),
+        ([v00, v10, v01, vmm], r11),
+        ([v00, v11, v10, vmm], r01),
+        ([v00, v10, v11, v01], rmm),
+    ]
+
+
+def _lcoords_norm_factors(ref: torch.Tensor, verts: list, rots: list):
+    """
+    (mean, std), each of shape [3], of the relative positions `ref - R v` of all cell
+    vertices w.r.t. every reference vertex of every cell (per xyz component).
+
+    At fine levels these local coords are tiny (hl8: std ~5e-6 for x, ~3e-3 for y/z), so
+    the decoder hardly sees them; z-scoring brings them to O(1). Statistics are
+    accumulated per transform in float64 without materialising the full table.
+    From cristianl/metno-develop-20261027 e6dd75f.
+    """
+    n = 0
+    s1 = torch.zeros(3, dtype=torch.float64)
+    s2 = torch.zeros(3, dtype=torch.float64)
+    for _verts, rot in _local_transforms(verts, rots):
+        v = torch.stack(_verts).transpose(0, 1)
+        t = (ref - torch.bmm(rot, v.transpose(-1, -2)).transpose(-2, -1)).to(torch.float64)
+        t = t.reshape(-1, 3)
+        n += t.shape[0]
+        s1 += t.sum(0)
+        s2 += (t * t).sum(0)
+    mean = s1 / n
+    var = (s2 / n - mean * mean).clamp_min(0.0)
+    return mean.to(torch.float32), var.sqrt().clamp_min(1e-12).to(torch.float32)
+
+
 class Tokenizer:
     """
     Base class for tokenizers.
     """
 
-    def __init__(self, healpix_level: int, domain: Domain | None = None):
+    def __init__(
+        self, healpix_level: int, domain: Domain | None = None, normalize_lcoords: bool = True
+    ):
         ref = torch.tensor([1.0, 0.0, 0.0])
 
         # cells that exist for this run; global unless a regional domain is configured
@@ -67,6 +108,17 @@ class Tokenizer:
         verts11, verts11_rots = healpix_verts_rots(self.hl_target, 1.0, 1.0)
         verts01, verts01_rots = healpix_verts_rots(self.hl_target, 0.0, 1.0)
         vertsmm, vertsmm_rots = healpix_verts_rots(self.hl_target, 0.5, 0.5)
+        # z-score factors of the local relative target coords (decoder inputs), computed on
+        # the FULL healpix grid so they do not depend on the domain; None = no normalisation
+        self.hpy_verts_diff_norm_factors = (
+            _lcoords_norm_factors(
+                ref,
+                [verts00, verts10, verts11, verts01, vertsmm],
+                [verts00_rots, verts10_rots, verts11_rots, verts01_rots, vertsmm_rots],
+            )
+            if normalize_lcoords
+            else None
+        )
         # keep only the active cells of the domain (no-op for a global domain)
         verts00, verts00_rots = self._subset(verts00), self._subset(verts00_rots)
         verts10, verts10_rots = self._subset(verts10), self._subset(verts10_rots)

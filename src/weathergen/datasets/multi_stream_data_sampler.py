@@ -129,13 +129,20 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self.domain = self.domain_pyramid.domain(self.healpix_level)
         self.num_healpix_cells = len(self.domain)
 
+        # z-score normalisation of the local relative target coords (decoder inputs);
+        # changes the decoder inputs, so a model must be trained and run with one setting.
+        # On for new runs via default_config.yml; the code fallback is False so that runs
+        # whose saved config predates the key (continue / inference) keep their inputs.
+        normalize_lcoords = bool(cf.get("normalize_target_lcoords", False))
         # one masker + tokenizer per latent level, each on that level's domain
         self._maskers: dict[int, Masker] = {}
         self._tokenizers: dict[int, TokenizerMasking] = {}
         for lvl in self.domain_pyramid.levels:
             dom_l = self.domain_pyramid.domain(lvl)
             self._maskers[lvl] = Masker(lvl, stage, cf.streams, self.mode_cfg, domain=dom_l)
-            self._tokenizers[lvl] = TokenizerMasking(lvl, self._maskers[lvl], domain=dom_l)
+            self._tokenizers[lvl] = TokenizerMasking(
+                lvl, self._maskers[lvl], domain=dom_l, normalize_lcoords=normalize_lcoords
+            )
         self.masker = self._maskers[self.healpix_level]
         self.tokenizer = self._tokenizers[self.healpix_level]
         if self.multi_level and is_root():

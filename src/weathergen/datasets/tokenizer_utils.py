@@ -346,6 +346,7 @@ def tokenize_apply_mask_target(
     hpy_verts_local,
     hpy_nctrs,
     enc_time,
+    verts_diff_norm_factors=None,
 ):
     """
     Apply masking to the data.
@@ -412,6 +413,7 @@ def tokenize_apply_mask_target(
             hpy_verts_rots,
             hpy_verts_local,
             hpy_nctrs,
+            verts_diff_norm_factors,
         )
         coords_local.requires_grad = False
     else:
@@ -444,6 +446,18 @@ def get_source_coords_local(
     return vec_scaled
 
 
+def normalize_lcoords(lcoords: torch.Tensor, verts_diff_norm_factors) -> torch.Tensor:
+    """z-score consecutive xyz triplets of local relative coords (shape <..., 3k>) with
+    (mean, std) of shape [3]; returned unchanged if verts_diff_norm_factors is None."""
+    if verts_diff_norm_factors is None:
+        return lcoords
+    mean, std = verts_diff_norm_factors
+    shape = lcoords.shape
+    lcoords = lcoords.reshape(*shape[:-1], -1, 3)
+    lcoords = (lcoords - mean.to(lcoords.dtype)) / std.to(lcoords.dtype)
+    return lcoords.reshape(shape)
+
+
 def get_target_coords_local(
     stream_id,
     hlc,
@@ -454,9 +468,13 @@ def get_target_coords_local(
     verts_rots,
     verts_local,
     nctrs,
+    verts_diff_norm_factors=None,
 ):
     """Generate local coordinates for target coords w.r.t healpix cell vertices and
     and for healpix cell vertices themselves
+
+    verts_diff_norm_factors : (mean, std), each of shape [3], to z-score the local relative
+        coords (channels 0..98 after the geoinfos); None leaves them unnormalised.
     """
 
     # target_coords_lens = [len(t) for t in target_coords]
@@ -469,7 +487,7 @@ def get_target_coords_local(
     # target_geoinfos = torch.cat(target_geoinfos)
     # target_times = torch.cat(target_times)
 
-    verts00_rots, verts10_rots, verts11_rots, verts01_rots, vertsmm_rots = verts_rots
+    assert len(verts_rots) == 5, "expected rotations for verts00, 10, 11, 01, mm"
 
     a = torch.zeros(
         [
@@ -499,49 +517,25 @@ def get_target_coords_local(
     )
     vls = vls.transpose(0, 1)
 
-    zi = 0
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + 3)] = ref - locs_to_cell_coords_ctrs(
-        verts00_rots, tcs
-    )
+    # per reference vertex (south, east, north, west, centre) 15 channels: 3 for the points
+    # w.r.t. the vertex, then 12 for the other 4 vertices of the cell w.r.t. the vertex
+    nvl = vls.shape[-1]
+    for iv, rots in enumerate(verts_rots):
+        zi = iv * (3 + nvl)
+        a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + 3)] = normalize_lcoords(
+            ref - locs_to_cell_coords_ctrs(rots, tcs), verts_diff_norm_factors
+        )
+        zi += 3
+        a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + nvl)] = normalize_lcoords(
+            vls[iv], verts_diff_norm_factors
+        )
 
-    zi = 3
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + vls.shape[-1])] = vls[0]
-
-    zi = 15
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + 3)] = ref - locs_to_cell_coords_ctrs(
-        verts10_rots, tcs
-    )
-
-    zi = 18
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + vls.shape[-1])] = vls[1]
-
-    zi = 30
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + 3)] = ref - locs_to_cell_coords_ctrs(
-        verts11_rots, tcs
-    )
-
-    zi = 33
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + vls.shape[-1])] = vls[2]
-
-    zi = 45
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + 3)] = ref - locs_to_cell_coords_ctrs(
-        verts01_rots, tcs
-    )
-
-    zi = 48
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + vls.shape[-1])] = vls[3]
-
-    zi = 60
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + 3)] = ref - locs_to_cell_coords_ctrs(
-        vertsmm_rots, tcs
-    )
-
-    zi = 63
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + vls.shape[-1])] = vls[4]
-
+    # points w.r.t. the centres of the 8 neighbouring cells
     tcs_ctrs = torch.cat([ref - torch.cat(locs_to_ctr_coords(c, tcs)) for c in nctrs], -1)
     zi = 75
-    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + (3 * 8))] = tcs_ctrs
+    a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + (3 * 8))] = normalize_lcoords(
+        tcs_ctrs, verts_diff_norm_factors
+    )
 
     # remaining geoinfos (zenith angle etc)
     zi = 99
