@@ -26,6 +26,7 @@ from weathergen.common.config import Config
 from weathergen.datasets.batch import ModelBatch
 from weathergen.datasets.utils import healpix_verts_rots, r3tos2
 from weathergen.model.encoder import EncoderModule
+from weathergen.model.forecast_diag import ForecastLatentDiag
 from weathergen.model.latent_cascade import LatentCascade
 from weathergen.model.engines import (
     BilinearDecoder,
@@ -1296,10 +1297,23 @@ class Model(torch.nn.Module):
         # Allow for pushforward trick
         p_fwd = self.cf.training_config.get("forecast", {}).get("pushforward", False)
 
+        # opt-in diagnostics, evaluation only (see weathergen/model/forecast_diag.py):
+        #   forecast_diag: True          -> log latent statistics before/after the forecast engine
+        #   forecast_bypass_eval: True   -> skip the forecast engine and cascade in evaluation,
+        #                                   i.e. decode the un-advanced latent (persistence baseline)
+        fc_diag_on = (not self.training) and self.cf.get("forecast_diag", False)
+        fc_bypass = (not self.training) and self.cf.get("forecast_bypass_eval", False)
+        if self.training:
+            self._fc_diag = None  # fresh statistics for the next validation epoch
+        elif fc_diag_on and getattr(self, "_fc_diag", None) is None:
+            self._fc_diag = ForecastLatentDiag(log=is_root())
+
         def _forecast_all(tlvl, step):
             # advance each level's latent through ITS OWN forecast engine, then
             # couple levels with the forecast cascade. Single level + inert cascade
             # -> identical to the previous finest-only roll-out.
+            if fc_bypass:
+                return tlvl
             out = {}
             for lvl, t in tlvl.items():
                 if self._forecast_per_level is not None:
@@ -1310,7 +1324,19 @@ class Model(torch.nn.Module):
                     eng = self.forecast_engine
                     rope = model_params.rope_coords
                 out[lvl] = eng(t, step, rope)
-            return self.forecast_cascade(out)
+            out_c = self.forecast_cascade(out)
+            if fc_diag_on:
+                for lvl, t in tlvl.items():
+                    mp_l = (model_params.params_for(lvl)
+                            if hasattr(model_params, "params_for") else model_params)
+                    eng = (self._forecast_per_level[str(lvl)]
+                           if self._forecast_per_level is not None else self.forecast_engine)
+                    self._fc_diag.update(
+                        f"lvl{lvl}/step{step}", t, out_c[lvl], self.num_aux_tokens,
+                        len(self.domain_pyramid.domain(lvl)), self.cf.ae_local_num_queries,
+                        mp_l.hp_nbours, block_rel=getattr(eng, "last_block_rel", None),
+                    )
+            return out_c
 
         # roll-out in latent space, iterate and generate output over requested output steps
         for step in batch.get_output_idxs():

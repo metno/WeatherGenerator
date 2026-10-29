@@ -640,12 +640,21 @@ class ForecastingEngine(torch.nn.Module):
             if noise_std > 0.0:
                 tokens = tokens + torch.randn_like(tokens) * torch.norm(tokens) * noise_std
 
+        # opt-in diagnostics (config forecast_diag): relative change made by each block
+        diag = (not self.training) and self.cf.get("forecast_diag", False)
+        self.last_block_rel = [] if diag else None
+
         aux_info = None
         for _b_idx, block in enumerate(self.fe_blocks):
+            tokens_prev = tokens if diag else None
             if isinstance(block, torch.nn.modules.normalization.LayerNorm):
                 tokens = checkpoint(block, tokens, use_reentrant=False)
             else:
                 tokens = checkpoint(block, tokens, coords, aux_info, use_reentrant=False)
+            if diag:
+                with torch.no_grad():
+                    rel = (tokens - tokens_prev).float().norm() / tokens_prev.float().norm()
+                self.last_block_rel.append((type(block).__name__, rel.item()))
         return tokens
 
 
