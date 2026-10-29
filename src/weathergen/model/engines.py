@@ -29,6 +29,11 @@ from weathergen.model.embeddings import (
     StreamEmbedTransformer,
 )
 from weathergen.model.layers import MLP
+from weathergen.model.noise import (
+    NoiseInjector,
+    get_noise_injection_config,
+    zero_init_noise_conditioning,
+)
 from weathergen.model.utils import ActivationFactory
 from weathergen.utils.utils import get_dtype
 
@@ -555,6 +560,18 @@ class ForecastingEngine(torch.nn.Module):
         self.num_healpix_cells = num_healpix_cells
         self.fe_blocks = torch.nn.ModuleList()
 
+        self.noise_injector = None
+        noise_cfg = get_noise_injection_config(cf)
+        if noise_cfg is not None:
+            if dim_aux is not None:
+                raise ValueError("Noise injection cannot be combined with another dim_aux input.")
+            self.noise_injector = NoiseInjector(
+                noise_cfg["noise_channels"],
+                noise_cfg["noise_mlp_hidden_dim"],
+                noise_cfg["noise_std"],
+            )
+            dim_aux = self.noise_injector.dim_embed
+
         global_rate = int(1 / self.cf.forecast_att_dense_rate)
         if mode_cfg.get("forecast", {}).get("policy") is not None:
             for i in range(self.cf.fe_num_blocks):
@@ -620,6 +637,17 @@ class ForecastingEngine(torch.nn.Module):
         for block in self.fe_blocks:
             block.apply(init_weights_final)
 
+        if self.noise_injector is not None and len(self.fe_blocks) == 0:
+            raise ValueError("Noise injection requires forecasting engine blocks.")
+        self.reset_noise_conditioning()
+
+    def reset_noise_conditioning(self):
+        """(Re-)initialise noise conditioning; also needed after a global reset_parameters()."""
+        if self.noise_injector is None:
+            return
+        self.noise_injector.reset_parameters()
+        zero_init_noise_conditioning(self.fe_blocks)
+
     def forward(self, tokens, fstep, coords=None):
         if self.training:
             # Impute noise to the latent state
@@ -627,7 +655,8 @@ class ForecastingEngine(torch.nn.Module):
             if noise_std > 0.0:
                 tokens = tokens + torch.randn_like(tokens) * torch.norm(tokens) * noise_std
 
-        aux_info = None
+        # fresh noise for every member and every forecast step (members are stacked in the batch)
+        aux_info = self.noise_injector(tokens) if self.noise_injector is not None else None
         for _b_idx, block in enumerate(self.fe_blocks):
             if isinstance(block, torch.nn.modules.normalization.LayerNorm):
                 tokens = checkpoint(block, tokens, use_reentrant=False)

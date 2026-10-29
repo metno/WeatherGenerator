@@ -58,6 +58,16 @@ fe_dropout_rate: 0.1
 fe_with_qk_lnorm: True
 fe_layer_norm_after_blocks: []  # Index starts at 0. Thus, [3] adds a LayerNorm after the fourth layer
 fe_impute_latent_noise_std: 0.0  # 1e-4
+# AIFS-CRPS-style noise injection: per member and forecast step, Gaussian noise per latent token is
+# embedded and conditions all layer norms of the forecasting engine (zero-initialised). Requires
+# fe_num_blocks > 0, pred_head.ens_size: 1 for all streams and an ensemble loss (e.g. kernel_crps
+# with alpha ~0.95). num_members can be raised at inference via --options.
+fe_noise_injection:
+  enabled: False
+  num_members: 2
+  noise_channels: 4
+  noise_mlp_hidden_dim: 32
+  noise_std: 1.0
 # currently fixed to 1.0 (due to limitations with flex_attention and triton)
 forecast_att_dense_rate: 1.0
 
