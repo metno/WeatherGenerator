@@ -556,6 +556,10 @@ class ForecastingEngine(torch.nn.Module):
         self.fe_blocks = torch.nn.ModuleList()
 
         global_rate = int(1 / self.cf.forecast_att_dense_rate)
+        # fe_rope_2D (if set) overrides rope_2D for the forecast engine only; the forecast
+        # roll-out then passes cell-unit coordinates (ModelParams.rope_coords_fe)
+        fe_rope = self.cf.get("fe_rope_2D", None)
+        fe_rope = self.cf.get("rope_2D", False) if fe_rope is None else bool(fe_rope)
         if mode_cfg.get("forecast", {}).get("policy") is not None:
             for i in range(self.cf.fe_num_blocks):
                 # Alternate between global and local attention
@@ -573,7 +577,7 @@ class ForecastingEngine(torch.nn.Module):
                             dim_aux=dim_aux,
                             norm_eps=self.cf.norm_eps,
                             attention_dtype=get_dtype(self.cf.attention_dtype),
-                            with_2d_rope=self.cf.get("rope_2D", False),
+                            with_2d_rope=fe_rope,
                         )
                     )
                 else:
@@ -592,7 +596,7 @@ class ForecastingEngine(torch.nn.Module):
                             dim_aux=dim_aux,
                             norm_eps=self.cf.norm_eps,
                             attention_dtype=get_dtype(self.cf.attention_dtype),
-                            with_2d_rope=self.cf.get("rope_2D", False),
+                            with_2d_rope=fe_rope,
                         )
                     )
                 # Add MLP block

@@ -53,6 +53,30 @@ from weathergen.datasets.domain_pyramid import build_domain_pyramid
 
 logger = logging.getLogger(__name__)
 
+
+def fe_rope_coords(healpix_level: int, active_cells) -> torch.Tensor:
+    """Cell-centre coordinates for the forecast engine's 2D RoPE, shape (ncells, 2) = (y, x).
+
+    The rotary code uses angular frequencies from 1 down to 1e-4 per unit of position. With
+    positions in radians, neighbouring cells (~0.004 rad apart at level 8) would differ by a
+    rotation of ~0.2 degree and be indistinguishable. Here positions are in units of the cell
+    size, so neighbours differ by ~1 rad at the fastest frequency and the slowest still span
+    thousands of cells. Longitude is taken relative to the domain centre and wrapped to
+    (-pi, pi], so there is no seam at 0E, and scaled by cos(centre latitude) so that east-west
+    and north-south distances are comparable (equirectangular projection about the centre).
+    """
+    verts, _ = healpix_verts_rots(healpix_level, 0.5, 0.5)
+    verts = verts[torch.from_numpy(np.asarray(active_cells))].to(torch.float64)
+    ll = r3tos2(verts)
+    lat, lon = ll[:, 0], ll[:, 1]
+    lon_c = torch.atan2(torch.sin(lon).mean(), torch.cos(lon).mean())
+    dlon = torch.remainder(lon - lon_c + torch.pi, 2 * torch.pi) - torch.pi
+    lat_c = 0.5 * (lat.max() + lat.min())
+    cell = math.sqrt(4.0 * math.pi / (12 * 4**healpix_level))  # mean cell size [rad]
+    y = (lat - lat_c) / cell
+    x = dlon * torch.cos(lat_c) / cell
+    return torch.stack([y, x], dim=-1).to(torch.float32)
+
 type StreamName = str
 
 
@@ -294,6 +318,19 @@ class ModelParams(torch.nn.Module):
             self.rope_coords = None
             self.rope_cell_coords = None
 
+        # RoPE coordinates for the FORECAST ENGINE only (config fe_rope_2D: True), in units of
+        # cells, relative to the domain centre (see fe_rope_coords). Kept in float32: in bf16
+        # (attention_dtype) a coordinate of ~50 cells would only be resolved to ~0.25 cell.
+        self.fe_rope_2D = bool(cf.get("fe_rope_2D", False))
+        if self.fe_rope_2D:
+            n_extra = cf.num_register_tokens + cf.num_class_tokens
+            total_tokens_fe = (self.num_healpix_cells + n_extra) * cf.ae_local_num_queries
+            self.register_buffer(
+                "rope_coords_fe", torch.zeros(1, total_tokens_fe, 2, dtype=torch.float32)
+            )
+        else:
+            self.rope_coords_fe = None
+
         # HEALPix neighbours, in compact (domain-local) indexing.
         # Out-of-domain neighbours fall back to self, exactly as healpix-corner
         # cells with no 8th neighbour already do.
@@ -478,6 +515,13 @@ class ModelParams(torch.nn.Module):
         self.pe_global.data += (
             pe_geo.to(self.pe_global.dtype).unsqueeze(1).repeat((1, cf.ae_local_num_queries, 1))
         )
+
+        if self.fe_rope_2D:
+            c = fe_rope_coords(self.healpix_level, self.domain.active_cells)  # (ncells, 2)
+            c = c.to(self.rope_coords_fe.device).unsqueeze(1).repeat(1, cf.ae_local_num_queries, 1)
+            offset = (cf.num_register_tokens + cf.num_class_tokens) * cf.ae_local_num_queries
+            self.rope_coords_fe.fill_(0.0)
+            self.rope_coords_fe[:, offset : offset + c.shape[0] * c.shape[1], :] = c.flatten(0, 1)
 
         # healpix neighborhood structure (compact indexing, see __init__)
         temp = self.domain.neighbours_compact()
@@ -1318,11 +1362,13 @@ class Model(torch.nn.Module):
             for lvl, t in tlvl.items():
                 if self._forecast_per_level is not None:
                     eng = self._forecast_per_level[str(lvl)]
-                    rope = (model_params.params_for(lvl).rope_coords
-                            if hasattr(model_params, "params_for") else model_params.rope_coords)
+                    mp_l = (model_params.params_for(lvl)
+                            if hasattr(model_params, "params_for") else model_params)
                 else:
                     eng = self.forecast_engine
-                    rope = model_params.rope_coords
+                    mp_l = model_params
+                # fe_rope_2D: forecast-engine-only RoPE in cell units (see fe_rope_coords)
+                rope = mp_l.rope_coords_fe if getattr(mp_l, "fe_rope_2D", False) else mp_l.rope_coords
                 out[lvl] = eng(t, step, rope)
             out_c = self.forecast_cascade(out)
             if fc_diag_on:
