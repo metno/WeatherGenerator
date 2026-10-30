@@ -1351,6 +1351,11 @@ class Model(torch.nn.Module):
             self._fc_diag = None  # fresh statistics for the next validation epoch
         elif fc_diag_on and getattr(self, "_fc_diag", None) is None:
             self._fc_diag = ForecastLatentDiag(log=is_root())
+            if is_root():
+                print("[fcdiag] forecast_diag active (evaluation)", flush=True)
+        if fc_bypass and is_root() and not getattr(self, "_fc_bypass_announced", False):
+            print("[fcdiag] forecast_bypass_eval active: forecast engine skipped", flush=True)
+            self._fc_bypass_announced = True
 
         def _forecast_all(tlvl, step):
             # advance each level's latent through ITS OWN forecast engine, then

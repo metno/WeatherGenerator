@@ -108,7 +108,8 @@ class ForecastLatentDiag:
                 a["blk"][i] += v
 
         if self.log and a["calls"] % self.log_every == 0:
-            logger.info(self.summary(key))
+            # print, not logger: independent of the logging configuration of the run
+            print(self.summary(key), flush=True)
 
     def stats(self, key) -> dict:
         a = self.acc[key]
