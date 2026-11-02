@@ -649,7 +649,22 @@ class ForecastingEngine(torch.nn.Module):
             # Impute noise to the latent state
             noise_std = self.cf.get("fe_impute_latent_noise_std", 0.0)
             if noise_std > 0.0:
-                tokens = tokens + torch.randn_like(tokens) * torch.norm(tokens) * noise_std
+                # fe_impute_latent_noise_scaling:
+                #   "norm" (default, original): scale = norm of the WHOLE tensor
+                #          = sqrt(numel) * RMS, so the effective noise depends on the
+                #          tensor size (batch, cells, dim); 1e-4 can mean ~30-50% of RMS.
+                #   "rms": scale = per-element RMS of the latent (detached), so noise_std
+                #          is a fraction of the latent RMS, independent of tensor size.
+                scaling = self.cf.get("fe_impute_latent_noise_scaling", "norm")
+                if scaling == "rms":
+                    scale = tokens.detach().float().pow(2).mean().sqrt().to(tokens.dtype)
+                elif scaling == "norm":
+                    scale = torch.norm(tokens)
+                else:
+                    raise ValueError(
+                        f"fe_impute_latent_noise_scaling must be 'norm' or 'rms', got {scaling}"
+                    )
+                tokens = tokens + torch.randn_like(tokens) * scale * noise_std
 
         # opt-in diagnostics (config forecast_diag): relative change made by each block
         diag = (not self.training) and self.cf.get("forecast_diag", False)
