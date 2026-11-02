@@ -54,6 +54,7 @@ from weathergen.datasets.domain_pyramid import build_domain_pyramid
 logger = logging.getLogger(__name__)
 
 
+
 def fe_rope_coords(healpix_level: int, active_cells) -> torch.Tensor:
     """Cell-centre coordinates for the forecast engine's 2D RoPE, shape (ncells, 2) = (y, x).
 
@@ -154,9 +155,13 @@ def _reinit_parameter(modules: dict[str, nn.Module], key: str, done_owners: set)
                         nn.init.zeros_(owner.bias)
         elif isinstance(anc, ForecastingEngine):
             if owner_path.startswith(apath + ".fe_blocks." if apath else "fe_blocks."):
-                nn.init.normal_(owner.weight, mean=0, std=0.001)
-                if owner.bias is not None:
-                    nn.init.normal_(owner.bias, mean=0, std=0.001)
+                if anc.cf.get("fe_init", "near_identity") == "default":
+                    # PyTorch default Linear init (as ecmwf/develop ends up with under FSDP)
+                    owner.reset_parameters()
+                else:
+                    nn.init.normal_(owner.weight, mean=0, std=0.001)
+                    if owner.bias is not None:
+                        nn.init.normal_(owner.bias, mean=0, std=0.001)
         elif isinstance(anc, _PairOperator):
             if anc.kind == "linear" and (owner is anc.down_proj or owner is anc.up_proj):
                 nn.init.zeros_(owner.weight)

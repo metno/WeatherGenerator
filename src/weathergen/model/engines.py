@@ -628,6 +628,13 @@ class ForecastingEngine(torch.nn.Module):
         after a meta-device (FSDP) construction, where this constructor init is lost.
         """
 
+        # fe_init: "default" keeps PyTorch's default Linear init (std ~ 1/sqrt(3 fan_in),
+        # ~0.013 at width 2048). This is what ecmwf/develop ends up with under FSDP, where
+        # load_model() calls reset_parameters() on forecast-engine modules missing from the
+        # checkpoint. Default here: near-identity N(0, 0.001).
+        if self.cf.get("fe_init", "near_identity") == "default":
+            return
+
         def _init(m):
             if isinstance(m, torch.nn.Linear):
                 torch.nn.init.normal_(m.weight, mean=0, std=0.001)
