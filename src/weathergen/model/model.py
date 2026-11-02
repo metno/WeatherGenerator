@@ -297,6 +297,13 @@ class ModelParams(torch.nn.Module):
 
         # RoPE coordinates
         self.rope_2D = cf.get("rope_2D", False)
+        # rope_2D_coords: "radians" (original: lat/lon in radians, attention dtype) or
+        # "cell" (same coordinates as fe_rope_2D: cell units, domain-centred, float32).
+        self.rope_2D_coords = cf.get("rope_2D_coords", "radians")
+        assert self.rope_2D_coords in ("radians", "cell"), (
+            f"rope_2D_coords must be 'radians' or 'cell', got {self.rope_2D_coords}"
+        )
+        rope_dtype = torch.float32 if self.rope_2D_coords == "cell" else self.dtype
         if self.rope_2D:
             self.num_extra_tokens = cf.num_register_tokens + cf.num_class_tokens
             total_tokens = (
@@ -308,7 +315,7 @@ class ModelParams(torch.nn.Module):
                     1,
                     total_tokens,
                     2,
-                    dtype=self.dtype,
+                    dtype=rope_dtype,
                 ),
             )
             self.register_buffer(
@@ -316,7 +323,7 @@ class ModelParams(torch.nn.Module):
                 torch.zeros(
                     self.num_healpix_cells,
                     2,
-                    dtype=self.dtype,
+                    dtype=rope_dtype,
                 ),
             )
         else:
@@ -407,8 +414,14 @@ class ModelParams(torch.nn.Module):
 #            print(f"UTILS FROM: {_u.__file__}", flush=True)
             verts = verts[torch.from_numpy(self.domain.active_cells)]
 #            print(f"B verts sub:  {tuple(verts.shape)}", flush=True)
-            coords = r3tos2(verts.to(self.rope_coords.device)).to(self.rope_coords.dtype)
-            coords[:, 1] = torch.remainder(coords[:, 1], 2 * torch.pi)
+            if self.rope_2D_coords == "cell":
+                # same coordinates as fe_rope_2D (cell units, domain-centred, float32)
+                coords = fe_rope_coords(self.healpix_level, self.domain.active_cells).to(
+                    self.rope_coords.device
+                )
+            else:
+                coords = r3tos2(verts.to(self.rope_coords.device)).to(self.rope_coords.dtype)
+                coords[:, 1] = torch.remainder(coords[:, 1], 2 * torch.pi)
 #            _lo = torch.rad2deg(coords[:, 1].float())
 #            print(f"C coords:     {tuple(coords.shape)} lon=[{_lo.min():.1f}, {_lo.max():.1f}]", flush=True)
             # Per-cell coords for QueryAggregationEngine (no query expansion)
