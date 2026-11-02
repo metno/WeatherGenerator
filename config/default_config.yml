@@ -54,6 +54,10 @@ pred_mlp_adaln: True
 # Changes the decoder inputs. Runs whose saved config has no such key (trained before it existed)
 # keep it off when continued or used for inference.
 normalize_target_lcoords: True
+# append each target point's unit-sphere position (x, y, z) to the decoder coordinates
+# (3 channels, continuous across cell edges). Changes the decoder input size; runs whose saved
+# config has no such key keep it off.
+decoder_global_coords: True
 
 # number of steps offset applied to first target window; if set to zero and forecast_steps=0 then
 # one is training an auto-encoder
@@ -70,6 +74,11 @@ num_class_tokens: 0
 num_register_tokens: 0
 
 healpix_level: 5
+# position code of the latent cells, added to the cell queries before global assimilation:
+#   geographic : multi-scale sin/cos of the cell centre's lat/lon (needs latent size % 4 == 0)
+#   index      : upstream code from the compact cell index (repeats every latent-size cells)
+# Runs whose saved config has no such key keep "index".
+pe_global_type: geographic
 
 # Use 2D RoPE instead of traditional global positional encoding
 # When True: uses 2D RoPE based on healpix cell coordinates (lat/lon)

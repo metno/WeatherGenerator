@@ -17,10 +17,16 @@ from weathergen.datasets.batch import BatchSamples
 
 
 ####################################################################################################
-def vecs_to_rots(vecs):
+def vecs_to_rots(vecs, eps: float = 1e-12):
     """
     Convert vectors to rotations that align with (1,0,0) ie coordinate origin in geophysical
-    spherical coordinates. A variant of Rodrigues formula is used
+    spherical coordinates. A variant of Rodrigues formula is used.
+
+    The formula divides by s = c2^2 + c3^2, which vanishes for vectors at (+-1, 0, 0)
+    (lat 0 at lon 0 / 180 in the tokenizer's convention). HEALPix has vertices there and
+    rounding leaves s ~ 1e-33, which gives bounded but wrong matrices, so those rows are set
+    to the exact limit: identity for c1 -> +1, rotation by pi (diag(-1, -1, 1)) for c1 -> -1.
+    All other rows are unchanged. From cristianl/metno-develop (272694d).
     """
 
     rots = torch.zeros((vecs.shape[0], 3, 3), dtype=torch.float64)
@@ -28,15 +34,27 @@ def vecs_to_rots(vecs):
     c2 = vecs[:, 1]
     c3 = vecs[:, 2]
     s = torch.square(c2) + torch.square(c3)
+
+    # safe denominator where s ~ 0; those rows are overwritten below
+    singular = s < eps
+    s_safe = torch.where(singular, torch.ones_like(s), s)
+
     rots[:, 0, 0] = c1
     rots[:, 0, 1] = c2
     rots[:, 0, 2] = c3
     rots[:, 1, 0] = -c2
-    rots[:, 1, 1] = (c1 * torch.square(c2) + torch.square(c3)) / s
-    rots[:, 1, 2] = (-1.0 + c1) * c2 * c3 / s
+    rots[:, 1, 1] = (c1 * torch.square(c2) + torch.square(c3)) / s_safe
+    rots[:, 1, 2] = (-1.0 + c1) * c2 * c3 / s_safe
     rots[:, 2, 0] = -c3
-    rots[:, 2, 1] = (-1.0 + c1) * c2 * c3 / s
-    rots[:, 2, 2] = (torch.square(c2) + c1 * torch.square(c3)) / s
+    rots[:, 2, 1] = (-1.0 + c1) * c2 * c3 / s_safe
+    rots[:, 2, 2] = (torch.square(c2) + c1 * torch.square(c3)) / s_safe
+
+    if singular.any():
+        sgn = torch.sign(c1[singular]).to(rots.dtype)
+        rots[singular] = 0.0
+        rots[singular, 0, 0] = sgn
+        rots[singular, 1, 1] = sgn
+        rots[singular, 2, 2] = 1.0
 
     return rots
 

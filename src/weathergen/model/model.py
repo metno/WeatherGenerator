@@ -88,6 +88,38 @@ def latent_level_name(level: int) -> str:
     return f"latent_state_hl{level}"
 
 
+def _geographic_cell_code(healpix_level: int, active_cells, dim_embed: int, device) -> torch.Tensor:
+    """
+    Geographic position code of the active cells of one latent level, (num_cells, dim_embed).
+
+    [sin, cos] x [lat, lon] of the cell centre at dim_embed/4 frequencies on a geometric
+    ladder from 1 cycle per globe to 4 cycles per HEALPix cell of this level. Coordinates
+    are normalised globally (lat to [0, 1], lon to [0, 1) from 0 deg), so a code means the
+    same place for regional and global domains. From cristianl/metno-develop (3cea053).
+    """
+    assert dim_embed % 4 == 0, (
+        f"pe_global_type 'geographic' needs a latent size divisible by 4, got {dim_embed}"
+    )
+    verts, _ = healpix_verts_rots(healpix_level, 0.5, 0.5)
+    verts = verts[torch.from_numpy(np.asarray(active_cells, dtype=np.int64))]
+    coords = r3tos2(verts.to(device)).to(torch.float32)
+    lat = coords[:, 0]
+    # r3tos2 gives the azimuth in (-pi, pi]; unwrap to [0, 2pi)
+    lon = torch.remainder(coords[:, 1], 2 * torch.pi)
+    u_lat = (lat + torch.pi / 2) / torch.pi
+    u_lon = lon / (2 * torch.pi)
+
+    n_freq = dim_embed // 4
+    cell_frac = (58.6 / (2**healpix_level)) / 360.0  # cell size as a fraction of 360 deg
+    max_freq = 4.0 / cell_frac
+    freqs = torch.exp(torch.linspace(0.0, float(np.log(max_freq)), n_freq, device=device))
+    ang_lat = 2 * torch.pi * torch.outer(u_lat, freqs)
+    ang_lon = 2 * torch.pi * torch.outer(u_lon, freqs)
+    return torch.cat(
+        [torch.sin(ang_lat), torch.cos(ang_lat), torch.sin(ang_lon), torch.cos(ang_lon)], dim=-1
+    )
+
+
 class ModelParams(torch.nn.Module):
     """Creation of query and embedding parameters of the model."""
 
@@ -124,7 +156,9 @@ class ModelParams(torch.nn.Module):
         )
         self.pe_global = torch.nn.Parameter(pe, requires_grad=False)
 
-        # RoPE coordinates
+        # RoPE coordinates, in radians. Kept in float32: in bf16 (attention_dtype) neighbouring
+        # cells at fine levels round to the same coordinates (hl8: 10,407 MEPS cells -> 3,896
+        # distinct positions). cos/sin are cast to the query dtype in apply_rotary_pos_emb.
         self.rope_2D = cf.get("rope_2D", False)
         if self.rope_2D:
             self.num_extra_tokens = cf.num_register_tokens + cf.num_class_tokens
@@ -137,7 +171,7 @@ class ModelParams(torch.nn.Module):
                     1,
                     total_tokens,
                     2,
-                    dtype=self.dtype,
+                    dtype=torch.float32,
                 ),
             )
             self.register_buffer(
@@ -145,7 +179,7 @@ class ModelParams(torch.nn.Module):
                 torch.zeros(
                     self.num_healpix_cells,
                     2,
-                    dtype=self.dtype,
+                    dtype=torch.float32,
                 ),
             )
         else:
@@ -220,12 +254,12 @@ class ModelParams(torch.nn.Module):
             if not self.domain.is_global:
                 verts = verts[torch.from_numpy(self.domain.active_cells)]
             coords = r3tos2(verts.to(self.rope_coords.device)).to(self.rope_coords.dtype)
-            if not self.domain.is_global:
-                # r3tos2 returns the healpix azimuth in (-pi, pi]. Because of the +180 deg
-                # shift in theta_phi_to_standard_coords, that seam lies on the Greenwich
-                # meridian; move it to 180 deg geographic so that a regional domain
-                # crossing 0 deg (e.g. Scandinavia) has continuous RoPE coordinates.
-                coords[:, 1] = torch.remainder(coords[:, 1], 2 * torch.pi)
+            # r3tos2 returns the healpix azimuth in (-pi, pi]. Because of the +180 deg shift in
+            # theta_phi_to_standard_coords, that seam lies on the Greenwich meridian; move it
+            # to 180 deg geographic for every level (also global ones, as in
+            # cristianl/metno-develop) so that cells on both sides of 0 deg, e.g. over the
+            # North Sea, get continuous RoPE coordinates.
+            coords[:, 1] = torch.remainder(coords[:, 1], 2 * torch.pi)
             # Per-cell coords for QueryAggregationEngine (no query expansion)
             self.rope_cell_coords.data.copy_(coords)
             coords = coords.unsqueeze(1).repeat(1, cf.ae_local_num_queries, 1)
@@ -240,26 +274,44 @@ class ModelParams(torch.nn.Module):
         # teacher representation (evaluated without dropout) collapses to low rank.
         self.pe_global.data.fill_(0.0)
         xs = 2.0 * np.pi * torch.arange(0, dim_embed, 2, device=self.pe_global.device) / dim_embed
+        # query-identity term (a constant with ae_local_num_queries == 1)
         self.pe_global.data[..., 0::2] = 0.5 * torch.sin(
             torch.outer(8 * torch.arange(cf.ae_local_num_queries, device=self.pe_global.device), xs)
-        )
-        self.pe_global.data[..., 0::2] += (
-            torch.sin(
-                torch.outer(torch.arange(self.num_healpix_cells, device=self.pe_global.device), xs)
-            )
-            .unsqueeze(1)
-            .repeat((1, cf.ae_local_num_queries, 1))
         )
         self.pe_global.data[..., 1::2] = 0.5 * torch.cos(
             torch.outer(8 * torch.arange(cf.ae_local_num_queries, device=self.pe_global.device), xs)
         )
-        self.pe_global.data[..., 1::2] += (
-            torch.cos(
-                torch.outer(torch.arange(self.num_healpix_cells, device=self.pe_global.device), xs)
+
+        # cell-identity term. "geographic" (from cristianl/metno-develop, 3cea053): multi-scale
+        # sin/cos of the cell centre's lat/lon. "index" (upstream): sin/cos of the compact
+        # cell index, which repeats every dim_embed cells (cells i and i + dim_embed get the
+        # same code), gives unrelated codes to neighbouring cells and shows blocks aligned
+        # with coarse parents. Fallback "index" keeps runs whose saved config predates the
+        # key unchanged; default_config.yml sets "geographic" for new runs.
+        pe_type = cf.get("pe_global_type", "index")
+        if pe_type == "geographic":
+            pe_cells = _geographic_cell_code(
+                self.healpix_level, self.domain.active_cells, dim_embed, self.pe_global.device
             )
-            .unsqueeze(1)
-            .repeat((1, cf.ae_local_num_queries, 1))
-        )
+            self.pe_global.data += (
+                pe_cells.to(self.pe_global.dtype)
+                .unsqueeze(1)
+                .repeat((1, cf.ae_local_num_queries, 1))
+            )
+        elif pe_type == "index":
+            cell_idx = torch.arange(self.num_healpix_cells, device=self.pe_global.device)
+            self.pe_global.data[..., 0::2] += (
+                torch.sin(torch.outer(cell_idx, xs))
+                .unsqueeze(1)
+                .repeat((1, cf.ae_local_num_queries, 1))
+            )
+            self.pe_global.data[..., 1::2] += (
+                torch.cos(torch.outer(cell_idx, xs))
+                .unsqueeze(1)
+                .repeat((1, cf.ae_local_num_queries, 1))
+            )
+        else:
+            raise ValueError(f"pe_global_type must be 'geographic' or 'index', got {pe_type!r}")
 
         # healpix neighborhood structure (compact indexing, see __init__)
         temp = self.domain.neighbours_compact()

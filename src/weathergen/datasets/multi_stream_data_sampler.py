@@ -32,6 +32,7 @@ from weathergen.datasets.masking import Masker
 from weathergen.datasets.stream_data import StreamData, spoof
 from weathergen.datasets.stream_levels import assign_stream_levels
 from weathergen.datasets.tokenizer_masking import TokenizerMasking
+from weathergen.datasets.tokenizer_utils import NUM_GLOBAL_COORD_CHANNELS
 from weathergen.datasets.utils import (
     get_tokens_lens,
 )
@@ -134,6 +135,10 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         # On for new runs via default_config.yml; the code fallback is False so that runs
         # whose saved config predates the key (continue / inference) keep their inputs.
         normalize_lcoords = bool(cf.get("normalize_target_lcoords", False))
+        # unit-sphere position of each target point as 3 extra decoder coordinate channels.
+        # Changes the decoder's input size: fallback False keeps runs whose saved config
+        # predates the key loadable; default_config.yml turns it on for new runs.
+        self.decoder_global_coords = bool(cf.get("decoder_global_coords", False))
         # one masker + tokenizer per latent level, each on that level's domain
         self._maskers: dict[int, Masker] = {}
         self._tokenizers: dict[int, TokenizerMasking] = {}
@@ -141,7 +146,11 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             dom_l = self.domain_pyramid.domain(lvl)
             self._maskers[lvl] = Masker(lvl, stage, cf.streams, self.mode_cfg, domain=dom_l)
             self._tokenizers[lvl] = TokenizerMasking(
-                lvl, self._maskers[lvl], domain=dom_l, normalize_lcoords=normalize_lcoords
+                lvl,
+                self._maskers[lvl],
+                domain=dom_l,
+                normalize_lcoords=normalize_lcoords,
+                global_coords=self.decoder_global_coords,
             )
         self.masker = self._maskers[self.healpix_level]
         self.tokenizer = self._tokenizers[self.healpix_level]
@@ -431,7 +440,13 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         # TODO: avoid hard coding magic values
         # +6 at the end for stream_id and time encoding
         return [
-            (ds.readers[0].get_geoinfo_size() + (5 * (3 * 5)) + 3 * 8) + 6
+            (
+                ds.readers[0].get_geoinfo_size()
+                + (5 * (3 * 5))
+                + 3 * 8
+                + (NUM_GLOBAL_COORD_CHANNELS if self.decoder_global_coords else 0)
+            )
+            + 6
             for ds in self.streams_datasets.values()
         ]
 

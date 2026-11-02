@@ -12,6 +12,11 @@ from weathergen.datasets.utils import (
     s2tor3,
 )
 
+# smooth global position of a target point on the unit sphere (x, y, z), appended after the
+# 99 cell-relative channels when `decoder_global_coords` is on (cristianl/metno-develop 272694d).
+# Must stay in sync with MultiStreamDataSampler.get_targets_coords_size().
+NUM_GLOBAL_COORD_CHANNELS = 3
+
 # on some clusters our numpy version is pinned to be 1.x.x where the np.argsort does not
 # the stable=True argument
 numpy_argsort_args = {"stable": True} if int(np.__version__.split(".")[0]) >= 2 else {}
@@ -347,6 +352,7 @@ def tokenize_apply_mask_target(
     hpy_nctrs,
     enc_time,
     verts_diff_norm_factors=None,
+    global_coords: bool = False,
 ):
     """
     Apply masking to the data.
@@ -414,6 +420,7 @@ def tokenize_apply_mask_target(
             hpy_verts_local,
             hpy_nctrs,
             verts_diff_norm_factors,
+            global_coords=global_coords,
         )
         coords_local.requires_grad = False
     else:
@@ -469,12 +476,15 @@ def get_target_coords_local(
     verts_local,
     nctrs,
     verts_diff_norm_factors=None,
+    global_coords: bool = False,
 ):
     """Generate local coordinates for target coords w.r.t healpix cell vertices and
     and for healpix cell vertices themselves
 
     verts_diff_norm_factors : (mean, std), each of shape [3], to z-score the local relative
         coords (channels 0..98 after the geoinfos); None leaves them unnormalised.
+    global_coords : append the point's unit-sphere position (x, y, z) as channels 99..101;
+        these are the only geometry channels that are continuous across cell boundaries.
     """
 
     # target_coords_lens = [len(t) for t in target_coords]
@@ -492,7 +502,12 @@ def get_target_coords_local(
     a = torch.zeros(
         [
             *target_coords.shape[:-1],
-            1 + target_geoinfos.shape[1] + target_times.shape[1] + 5 * (3 * 5) + 3 * 8,
+            1
+            + target_geoinfos.shape[1]
+            + target_times.shape[1]
+            + 5 * (3 * 5)
+            + 3 * 8
+            + (NUM_GLOBAL_COORD_CHANNELS if global_coords else 0),
         ]
     )
     a[..., 0] = stream_id
@@ -537,8 +552,13 @@ def get_target_coords_local(
         tcs_ctrs, verts_diff_norm_factors
     )
 
-    # remaining geoinfos (zenith angle etc)
-    zi = 99
-    a[..., (geoinfo_offset + zi) :] = target_coords[..., (geoinfo_offset + 2) :]
+    # smooth global position on the unit sphere (replaces a former assignment whose both
+    # sides were empty slices: `a` ended at channel geoinfo_offset + 99 and target_coords
+    # has only 3 channels)
+    if global_coords:
+        zi = 99
+        a[..., (geoinfo_offset + zi) : (geoinfo_offset + zi + NUM_GLOBAL_COORD_CHANNELS)] = (
+            target_coords
+        )
 
     return a

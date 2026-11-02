@@ -41,9 +41,16 @@ def readerdata_to_torch(rdata: IOReaderData) -> IOReaderData:
 
 class TokenizerMasking(Tokenizer):
     def __init__(
-        self, healpix_level: int, masker: Masker, domain=None, normalize_lcoords: bool = True
+        self,
+        healpix_level: int,
+        masker: Masker,
+        domain=None,
+        normalize_lcoords: bool = True,
+        global_coords: bool = False,
     ):
         super().__init__(healpix_level, domain, normalize_lcoords=normalize_lcoords)
+        # append the unit-sphere position to the decoder coordinates (see tokenizer_utils)
+        self.global_coords = global_coords
         self.masker = masker
         self.rng = None
         self.token_size = None
@@ -182,6 +189,7 @@ class TokenizerMasking(Tokenizer):
             self.hpy_nctrs_target,
             encode_times_target,
             verts_diff_norm_factors=self.hpy_verts_diff_norm_factors,
+            global_coords=self.global_coords,
         )
 
         return (coords_local, coords_per_cell)
@@ -215,6 +223,7 @@ class TokenizerMasking(Tokenizer):
             self.hpy_nctrs_target,
             encode_times_target,
             verts_diff_norm_factors=self.hpy_verts_diff_norm_factors,
+            global_coords=self.global_coords,
         )
 
         idxs_ord_inv = None
