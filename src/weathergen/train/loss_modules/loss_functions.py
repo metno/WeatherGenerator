@@ -2387,6 +2387,68 @@ def _load_haar_template(owner, template_path: str, stream_name: str, tag: str):
     return None, None
 
 
+def _haar_energy_term(t_b, p_b, m, field_var, eps_rel, eps_field_rel, eps_abs,
+                      ensemble_mode, window, min_valid_frac):
+    """
+    Squared log energy ratio for one Haar level, averaged over the 3 bands.
+
+    t_b : (C,3,h,w) target detail coefficients (detached)
+    p_b : (E,C,3,h,w) predicted detail coefficients
+    m   : (C,1,h,w) validity mask (float)
+    window : 0 -> one domain-mean energy per (channel, band) (original behaviour);
+             w > 1 -> energies in non-overlapping w x w coefficient windows, one log ratio
+             per window, averaged over windows weighted by their number of valid
+             coefficients. Windows with < min_valid_frac * w^2 valid coefficients are skipped.
+    Returns term (C,3) and has (C,) [channel has at least one usable window].
+    """
+    if window <= 1:
+        n = m.sum((-2, -1)).squeeze(1)                                     # (C,)
+        n_safe = n.clamp(min=1)[:, None]
+        E_t = (t_b**2 * m).sum((-2, -1)) / n_safe                          # (C,3)
+        E_p = (p_b**2 * m).sum((-2, -1)) / n_safe                          # (E,C,3)
+        eps = torch.maximum(eps_rel * E_t, (eps_field_rel * field_var)[:, None]).clamp(min=eps_abs)
+        log_t = torch.log(E_t + eps)
+        if ensemble_mode == "per_member":
+            term = ((torch.log(E_p + eps) - log_t) ** 2).mean(0)
+        else:
+            term = (torch.log(E_p.mean(0) + eps) - log_t) ** 2
+        return term, n > 0
+
+    C, _, h, w = t_b.shape
+    E = p_b.shape[0]
+    ph, pw = (-h) % window, (-w) % window
+    if ph or pw:
+        t_b = F.pad(t_b, (0, pw, 0, ph))
+        p_b = F.pad(p_b, (0, pw, 0, ph))
+        m = F.pad(m, (0, pw, 0, ph))
+    hp, wp = t_b.shape[-2:]
+    k = window * window
+
+    def wsum(x):  # sum over non-overlapping windows; (..., hp, wp) -> (..., H, W)
+        lead = x.shape[:-2]
+        y = F.avg_pool2d(x.reshape(-1, 1, hp, wp), window, stride=window) * k
+        return y.reshape(*lead, hp // window, wp // window)
+
+    N = wsum(m)                                                            # (C,1,H,W)
+    S_t = wsum(t_b**2 * m)                                                 # (C,3,H,W)
+    S_p = wsum(p_b**2 * m.unsqueeze(0))                                    # (E,C,3,H,W)
+    wv = (N >= min_valid_frac * k).float()                                 # (C,1,H,W)
+    N_safe = N.clamp(min=1)
+    E_t = S_t / N_safe
+    E_p = S_p / N_safe
+    eps = torch.maximum(eps_rel * E_t, (eps_field_rel * field_var)[:, None, None, None])
+    eps = eps.clamp(min=eps_abs)
+    log_t = torch.log(E_t + eps)
+    if ensemble_mode == "per_member":
+        term_w = ((torch.log(E_p + eps) - log_t) ** 2).mean(0)             # (C,3,H,W)
+    else:
+        term_w = (torch.log(E_p.mean(0) + eps) - log_t) ** 2
+    wt = N * wv                                                            # (C,1,H,W)
+    den = wt.sum((-2, -1))                                                 # (C,1)
+    term = (term_w * wt).sum((-2, -1)) / den.clamp(min=1)                  # (C,3)
+    return term, den.squeeze(1) > 0
+
+
 def global_haar_energy_reshape(
     target: torch.Tensor,
     pred: torch.Tensor,
@@ -2404,6 +2466,8 @@ def global_haar_energy_reshape(
     regrid_method: str = "nearest",
     monitor_every_n: int = 0,
     stream_name: str = "",
+    energy_window: int = 0,
+    energy_window_min_valid: float = 0.5,
 ):
     """
     Haar detail-energy matching loss. Meant as an ADDITIONAL term next to an
@@ -2451,6 +2515,17 @@ def global_haar_energy_reshape(
         "mean_energy" : member energies averaged first, then compared
                         (constrains the ensemble only on average)
     With ens_size == 1 both are identical.
+
+    Local energy (energy_window > 0). By default the energies are domain means, so the
+    term constrains only HOW MUCH detail each scale carries, not WHERE: the model can meet
+    it with texture or spikes in places where the target has none. With energy_window = W
+    (in template cells at full resolution) the energies are computed in non-overlapping
+    windows of about W x W template cells (W / 2^(l+1) coefficients at level l, at least 2)
+    and the log ratio is taken per window, then averaged over windows (weighted by their
+    number of valid coefficients). Detail must then appear where the target has detail;
+    texture in calm windows is penalised. Windows with fewer than
+    energy_window_min_valid x (window size) valid coefficients are skipped. The monitored
+    ratios (log10ratio_L*) stay domain-wide, so they are comparable with energy_window = 0.
 
     Masking. Template cells with no nearby data point (regional crop),
     padding cells, and cells where the target is NaN are excluded. A detail
@@ -2577,27 +2652,26 @@ def global_haar_energy_reshape(
         if lvl >= level_start:
             m = v_c.float().unsqueeze(1)                                   # (C,1,h,w)
             n = m.sum((-2, -1)).squeeze(1)                                 # (C,)
-            has = n > 0
             n_safe = n.clamp(min=1)[:, None]                               # (C,1)
 
             t_b = torch.stack([t_LH, t_HL, t_HH], dim=1).detach()          # (C,3,h,w)
             p_b = torch.stack([p_LH, p_HL, p_HH], dim=2)                   # (E,C,3,h,w)
-            E_t = (t_b**2 * m).sum((-2, -1)) / n_safe                      # (C,3)
-            E_p = (p_b**2 * m).sum((-2, -1)) / n_safe                      # (E,C,3)
 
-            eps = torch.maximum(eps_rel * E_t, (eps_field_rel * field_var)[:, None])
-            eps = eps.clamp(min=eps_abs)                                   # (C,3)
-            log_t = torch.log(E_t + eps)
-            if ensemble_mode == "per_member":
-                term = ((torch.log(E_p + eps) - log_t) ** 2).mean(0)       # (C,3)
-            else:
-                term = (torch.log(E_p.mean(0) + eps) - log_t) ** 2         # (C,3)
+            # window size in coefficients at this level (0 = domain-wide, original)
+            win = max(2, energy_window // 2 ** (lvl + 1)) if energy_window > 0 else 0
+            term, has = _haar_energy_term(
+                t_b, p_b, m, field_var, eps_rel, eps_field_rel, eps_abs,
+                ensemble_mode, win, energy_window_min_valid,
+            )                                                              # (C,3), (C,)
 
             use = has & chan_active
             loss_acc = loss_acc + torch.where(use, term.mean(1), torch.zeros_like(n))
             n_used = n_used + use.float()
 
             with torch.no_grad():
+                # monitoring stays domain-wide (comparable with energy_window = 0)
+                E_t = (t_b**2 * m).sum((-2, -1)) / n_safe                  # (C,3)
+                E_p = (p_b**2 * m).sum((-2, -1)) / n_safe                  # (E,C,3)
                 r = E_p.mean(0) / E_t.clamp(min=eps_abs)
                 ratios[lvl] = torch.where(use[:, None], r, torch.full_like(r, float("nan")))
 
