@@ -339,6 +339,7 @@ class LossPhysical(LossModuleBase):
         eps_rel=0.01, eps_field_rel=1e-4, eps_abs=1e-8,
         min_field_var=1e-8, ensemble_mode="per_member",
         regrid_method="nearest", monitor_every_n=0,
+        energy_window=0, energy_window_min_valid=0.5,
     ):
         if target.shape[0] == 0:
             return (
@@ -355,6 +356,7 @@ class LossPhysical(LossModuleBase):
             min_field_var=min_field_var, ensemble_mode=ensemble_mode,
             regrid_method=regrid_method, monitor_every_n=monitor_every_n,
             stream_name=stream_name,
+            energy_window=energy_window, energy_window_min_valid=energy_window_min_valid,
         )
 
     @staticmethod
