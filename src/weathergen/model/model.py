@@ -1295,8 +1295,11 @@ class Model(torch.nn.Module):
         (the earlier version kept the channels of c(p), an input combination the
         decoder never saw, which made the edge jumps worse).
 
-        Config:  pou_blend: true   (default false; no other parameters)
-        Cost:    <= 9 (+2 near seams) readout calls instead of 1.
+        Config:  pou_blend: true   (default false)
+                 pou_blend_sharpness: p  (default 1 = bilinear weights; p > 1 narrows
+                                          the blending to bands along cell edges)
+                 pou_blend_mode: "own"   (diagnostic: must equal pou_blend: false)
+        Cost:    <= 9 (+2 near seams) readout calls instead of 1 ("own": 1).
         """
         import astropy.units as _u
         from astropy.coordinates import Latitude as _Lat
@@ -1374,6 +1377,22 @@ class Model(torch.nn.Module):
         # drop candidates outside the domain (no latent there)
         lam = lam * (cand_c[hp_cell] >= 0).to(lam.dtype)
         lam = lam / lam.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+
+        # pou_blend_mode: "blend" (default) or "own" (diagnostic: all weight on the
+        # containing cell = candidate column 0; must reproduce pou_blend: false exactly)
+        mode = self.cf.get("pou_blend_mode", "blend")
+        if mode == "own":
+            lam = torch.zeros_like(lam)
+            lam[:, 0] = 1.0
+        elif mode != "blend":
+            raise ValueError(f"pou_blend_mode must be 'blend' or 'own', got {mode!r}")
+        # pou_blend_sharpness p: lam^p, renormalized. Weights stay continuous (no jumps),
+        # but blending is confined to a narrow band along cell edges, where a neighbour
+        # cell's decoding barely extrapolates (the point is on its edge). p = 1: bilinear.
+        sharp = float(self.cf.get("pou_blend_sharpness", 1.0))
+        if mode == "blend" and sharp != 1.0:
+            lam = lam.clamp(min=0.0) ** sharp
+            lam = lam / lam.sum(dim=-1, keepdim=True).clamp(min=1e-12)
         lam = lam.to(dev)
 
         # ---- one readout call per active candidate column --------------------
