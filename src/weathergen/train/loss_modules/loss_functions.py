@@ -12,7 +12,6 @@ import hashlib
 import logging
 import math
 from collections import OrderedDict
-
 from functools import lru_cache
 
 import numpy as np
