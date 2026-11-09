@@ -53,6 +53,9 @@ from weathergen.datasets.domain_pyramid import build_domain_pyramid
 
 logger = logging.getLogger(__name__)
 
+# R3 tail of the target coordinates (tokenizer_utils.NUM_GLOBAL_COORD_CHANNELS)
+NUM_GLOBAL_COORD_CHANNELS_POU = 3
+
 
 
 def fe_rope_coords(healpix_level: int, active_cells) -> torch.Tensor:
@@ -1139,6 +1142,61 @@ class Model(torch.nn.Module):
             cache[key] = self._pou_tables_compute(domain.healpix_level, domain.active_cells)
         return cache[key]
 
+    def _pou_geometry(self, domain):
+        """
+        Per-cell tables to recompute the 99 cell-relative target-coordinate channels of a
+        point w.r.t. ANY cell of `domain` -- exactly as tokenizer_utils.get_target_coords_local
+        does w.r.t. the containing cell. Built from the same Tokenizer tables (and the same
+        z-score factors) as the data pipeline; cached per domain.
+
+        Returns dict: rots (5, n, 3, 3), vls (n, 5, 12) [already normalized],
+        nrots (8, n, 3, 3), factors (mean, std) or None.
+        """
+        cache = self.__dict__.setdefault("_pou_geometry_cache", {})
+        key = (domain.healpix_level, len(domain), hash(domain.active_cells.tobytes()))
+        if key not in cache:
+            from weathergen.datasets.tokenizer import Tokenizer
+            from weathergen.datasets.tokenizer_utils import normalize_lcoords
+            from weathergen.datasets.utils import vecs_to_rots
+
+            norm = bool(self.cf.get("normalize_target_lcoords", True))
+            tok = Tokenizer(domain.healpix_level, domain, normalize_lcoords=norm)
+            factors = tok.hpy_verts_diff_norm_factors
+            rots = torch.stack([r.to(torch.float32) for r in tok.hpy_verts_rots_target])
+            vls = normalize_lcoords(tok.hpy_verts_local_target.to(torch.float32), factors)
+            nctrs = tok.hpy_nctrs_target.to(torch.float32)              # (8, n, 3)
+            nrots = vecs_to_rots(nctrs.reshape(-1, 3)).to(torch.float32).reshape(
+                nctrs.shape[0], nctrs.shape[1], 3, 3
+            )
+            cache[key] = dict(rots=rots, vls=vls, nrots=nrots, factors=factors)
+        return cache[key]
+
+    @staticmethod
+    def _pou_local_channels(p_r3, cells, geo):
+        """
+        The 99 cell-relative channels (layout of get_target_coords_local, zi = 0..98) of
+        points p_r3 (N, 3) w.r.t. cells (N,) (compact indices). All tensors on one device.
+        """
+        from weathergen.datasets.tokenizer_utils import normalize_lcoords
+
+        ref = torch.tensor([1.0, 0.0, 0.0], device=p_r3.device, dtype=p_r3.dtype)
+        fac = geo["factors"]
+        if fac is not None:
+            fac = (fac[0].to(p_r3.device), fac[1].to(p_r3.device))
+        out = torch.zeros(p_r3.shape[0], 99, device=p_r3.device, dtype=p_r3.dtype)
+        pv = p_r3.unsqueeze(-1)
+        for iv in range(5):
+            R = geo["rots"][iv][cells]                                   # (N, 3, 3)
+            lc = ref - torch.bmm(R, pv).squeeze(-1)
+            zi = iv * 15
+            out[:, zi : zi + 3] = normalize_lcoords(lc, fac)
+            out[:, zi + 3 : zi + 15] = geo["vls"][cells, iv]
+        for ic in range(geo["nrots"].shape[0]):
+            R = geo["nrots"][ic][cells]
+            lc = ref - torch.bmm(R, pv).squeeze(-1)
+            out[:, 75 + 3 * ic : 78 + 3 * ic] = normalize_lcoords(lc, fac)
+        return out
+
     @staticmethod
     def _pou_build_kv(tokens_flat, idxs_flat, coarse_args, num_cells_total):
         """
@@ -1170,6 +1228,7 @@ class Model(torch.nn.Module):
         batch_size: int,
         domain=None,
         coarse: list | None = None,
+        nbours_fine: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Partition-of-unity readout blend removing healpix grid-imprint artifacts.
@@ -1224,6 +1283,18 @@ class Model(torch.nn.Module):
         order) of dicts: tokens (B*nc, D), nbours (nc, 9) compact, poc (n,) compact
         parent of every fine cell (-1 = none), nc. Requires ae_local_num_queries == 1.
 
+        Consistent candidate decoding (current design)
+        -----------------------------------------------
+        Each candidate j is decoded EXACTLY as the model decodes a point that belongs
+        to cell j: KV pool = hp_nbours[j] (the same fine 1-ring table as the standard
+        readout) + the coarse 1-ring of parent(j) for multi-level streams, AND the 99
+        cell-relative coordinate channels of the point recomputed w.r.t. cell j (same
+        tables and z-score factors as tokenizer_utils.get_target_coords_local). For
+        j = c(p) the input is bit-identical to the standard readout, so every candidate
+        output is a valid model prediction and the blend is continuous across cell edges
+        (the earlier version kept the channels of c(p), an input combination the
+        decoder never saw, which made the edge jumps worse).
+
         Config:  pou_blend: true   (default false; no other parameters)
         Cost:    <= 9 (+2 near seams) readout calls instead of 1.
         """
@@ -1236,7 +1307,7 @@ class Model(torch.nn.Module):
             domain = self.domain_pyramid.domain(self.domain_pyramid.finest)
         n = len(domain)
         num_cells_total = batch_size * n
-        dev = tc_tokens.device
+        dev = t_coords.device
         assert s[0] == batch_size and s[1] == n, (
             f"pou_blend: latent layout {s} does not match batch_size={batch_size}, "
             f"num_cells={n}"
@@ -1333,30 +1404,48 @@ class Model(torch.nn.Module):
         # per-sample offset into the flattened (B*n) latent rows
         b_off = (torch.arange(batch_size, device=dev) * n).view(batch_size, 1, 1)
 
+        # consistent candidate decoding: fine ring of j from the SAME table as the
+        # standard readout, coordinates recomputed w.r.t. j (see docstring)
+        geo = self._pou_geometry(domain)
+        geo = {k_: (v_.to(dev) if torch.is_tensor(v_) else v_) for k_, v_ in geo.items()}
+        from weathergen.datasets.tokenizer_utils import _ABLATE_CELL_COORDS
+
+        own_cells = torch.arange(n, device=dev)
+        cand_c_dev = cand_c.to(dev)                                       # (n, K) compact
+        cell_c_pt = (cell_of_point % n).to(dev)                           # (N_pts,) compact c(p)
+        p_r3_dev = p_r3.to(dev)
+        n_loc = 99 + NUM_GLOBAL_COORD_CHANNELS_POU                        # local + R3 tail
+        if t_coords.shape[-1] < n_loc:
+            raise ValueError("pou_blend: target coordinates too short for the 99 local channels")
+        embed = self.embed_target_coords[stream_name]
+
         pred_blend = None
         for k in range(K):
             lam_k = lam[:, k]
             if not (lam_k > 0).any():
                 continue
-            # (B*n, 9) rows into tokens_flat; was missing b_off, so every sample
-            # read sample 0's latent when batch_size > 1
-            idxs_k = (pools_c[k].to(dev).unsqueeze(0) + b_off).flatten(0, 1)
+            # candidate cell j of every target cell c (outside-domain -> c, weight is 0)
+            j_k = torch.where(cand_c_dev[:, k] >= 0, cand_c_dev[:, k], own_cells)   # (n,)
+            ring_k = nbours_fine[j_k] if nbours_fine is not None else pools_c[k].to(dev)
+            idxs_k = (ring_k.to(dev).long().unsqueeze(0) + b_off).flatten(0, 1)    # (B*n, 9)
 
-            # coarse context of candidate j = centre of pool k: ring of parent(j)
             coarse_args = []
-            if coarse_dev:
-                centre_k = pools_c[k][:, 0].to(dev)                # (n,) compact fine cell
-                for cd in coarse_dev:
-                    par = cd["poc"][centre_k]                       # (n,) -1 = no parent
-                    valid = (par >= 0).repeat(batch_size).view(-1, 1, 1)
-                    rows = (cd["nbours"][par.clamp(min=0)].unsqueeze(0) + cd["b_off"]).flatten(0, 1)
-                    coarse_args += [cd["tokens"], rows, valid]
+            for cd in coarse_dev:
+                par = cd["poc"][j_k]                                         # parent(j)
+                valid = (par >= 0).repeat(batch_size).view(-1, 1, 1)
+                rows = (cd["nbours"][par.clamp(min=0)].unsqueeze(0) + cd["b_off"]).flatten(0, 1)
+                coarse_args += [cd["tokens"], rows, valid]
 
-            def _slot_forward(tokens_flat_, tc_tokens_, t_coords_, idxs_flat_, *coarse_args_):
-                # The gather is INSIDE the checkpoint so the large KV tensor
-                # (same size as tokens_nbors) is freed after this slot's forward
-                # and recomputed at backward.
+            # target coordinates of every point w.r.t. its candidate cell j
+            t_coords_k = t_coords.clone()
+            if not _ABLATE_CELL_COORDS:
+                loc = self._pou_local_channels(p_r3_dev, j_k[cell_c_pt], geo)
+                t_coords_k[..., -n_loc : -NUM_GLOBAL_COORD_CHANNELS_POU] = loc.to(t_coords.dtype)
+
+            def _slot_forward(tokens_flat_, t_coords_, idxs_flat_, *coarse_args_):
+                # gather and query embedding INSIDE the checkpoint (recomputed at backward)
                 toks_k_ = self._pou_build_kv(tokens_flat_, idxs_flat_, coarse_args_, num_cells_total)
+                tc_tokens_ = embed(t_coords_)
                 out_k_ = self.target_token_engines[stream_name](
                     latent=toks_k_,
                     output=tc_tokens_,
@@ -1369,15 +1458,12 @@ class Model(torch.nn.Module):
             # Under FSDP2 nested non-reentrant checkpointing is not supported
             # ("mixed torch.Tensor and DTensor"), so only checkpoint without FSDP.
             if self.cf.get("with_fsdp", False) and self.cf.get("with_ddp", False):
-                pred_k = _slot_forward(
-                    tokens_flat, tc_tokens, t_coords, idxs_k.flatten(), *coarse_args
-                )
+                pred_k = _slot_forward(tokens_flat, t_coords_k, idxs_k.flatten(), *coarse_args)
             else:
                 pred_k = checkpoint(
                     _slot_forward,
                     tokens_flat,
-                    tc_tokens,
-                    t_coords,
+                    t_coords_k,
                     idxs_k.flatten(),
                     *coarse_args,
                     use_reentrant=False,
@@ -1752,6 +1838,9 @@ class Model(torch.nn.Module):
                         batch_size=batch_size,
                         domain=self.domain_pyramid.domain(enc_lvl),
                         coarse=coarse,
+                        nbours_fine=(model_params.params_for(enc_lvl)
+                                     if hasattr(model_params, "params_for")
+                                     else model_params).hp_nbours.long(),
                     )
 
                 else:
