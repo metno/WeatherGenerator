@@ -72,7 +72,7 @@ def test_physical_loss_configures_alpha_and_stream_scoping():
         "alpha": 0.99,
         "grid_mode": "structured_projected",
     }
-    kernel = next(fn for fn, _, name in loss_module.loss_fcts if name == "kernel_crps")
+    kernel = next(fn for fn, _, name, *_ in loss_module.loss_fcts if name == "kernel_crps")
     loss, _ = kernel(torch.tensor([[0.0]]), torch.tensor([[[0.0]], [[2.0]]]), None, None)
     assert torch.allclose(loss, torch.tensor(0.005), atol=1e-7)
 
