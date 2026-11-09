@@ -2388,7 +2388,7 @@ def _load_haar_template(owner, template_path: str, stream_name: str, tag: str):
 
 
 def _haar_energy_term(t_b, p_b, m, field_var, eps_rel, eps_field_rel, eps_abs,
-                      ensemble_mode, window, min_valid_frac):
+                      ensemble_mode, window, min_valid_frac, stride=0, shift=(0, 0)):
     """
     Squared log energy ratio for one Haar level, averaged over the 3 bands.
 
@@ -2399,6 +2399,9 @@ def _haar_energy_term(t_b, p_b, m, field_var, eps_rel, eps_field_rel, eps_abs,
              w > 1 -> energies in non-overlapping w x w coefficient windows, one log ratio
              per window, averaged over windows weighted by their number of valid
              coefficients. Windows with < min_valid_frac * w^2 valid coefficients are skipped.
+    stride : step between windows in coefficients (0 -> = window, non-overlapping);
+             stride < window gives overlapping windows (no fixed window boundaries).
+    shift  : (dy, dx) offset of the window grid in coefficients (random shift in training).
     Returns term (C,3) and has (C,) [channel has at least one usable window].
     """
     if window <= 1:
@@ -2416,18 +2419,25 @@ def _haar_energy_term(t_b, p_b, m, field_var, eps_rel, eps_field_rel, eps_abs,
 
     C, _, h, w = t_b.shape
     E = p_b.shape[0]
-    ph, pw = (-h) % window, (-w) % window
-    if ph or pw:
-        t_b = F.pad(t_b, (0, pw, 0, ph))
-        p_b = F.pad(p_b, (0, pw, 0, ph))
-        m = F.pad(m, (0, pw, 0, ph))
+    stride = window if stride <= 0 else min(stride, window)
+    sy, sx = shift
+    # pad: shift offset at top/left (invalid cells), then enough at bottom/right so that
+    # the windows tile the padded grid exactly: (size - window) % stride == 0
+    hh, ww = h + sy, w + sx
+    ph = (window - hh) if hh < window else (-(hh - window)) % stride
+    pw = (window - ww) if ww < window else (-(ww - window)) % stride
+    if sy or sx or ph or pw:
+        pad4 = (sx, pw, sy, ph)
+        t_b = F.pad(t_b, pad4)
+        p_b = F.pad(p_b, pad4)
+        m = F.pad(m, pad4)
     hp, wp = t_b.shape[-2:]
     k = window * window
 
-    def wsum(x):  # sum over non-overlapping windows; (..., hp, wp) -> (..., H, W)
+    def wsum(x):  # sum over (possibly overlapping) windows; (..., hp, wp) -> (..., H, W)
         lead = x.shape[:-2]
-        y = F.avg_pool2d(x.reshape(-1, 1, hp, wp), window, stride=window) * k
-        return y.reshape(*lead, hp // window, wp // window)
+        y = F.avg_pool2d(x.reshape(-1, 1, hp, wp), window, stride=stride) * k
+        return y.reshape(*lead, y.shape[-2], y.shape[-1])
 
     N = wsum(m)                                                            # (C,1,H,W)
     S_t = wsum(t_b**2 * m)                                                 # (C,3,H,W)
@@ -2468,6 +2478,8 @@ def global_haar_energy_reshape(
     stream_name: str = "",
     energy_window: int = 0,
     energy_window_min_valid: float = 0.5,
+    energy_window_stride: int = 0,
+    energy_window_random_shift: bool = False,
 ):
     """
     Haar detail-energy matching loss. Meant as an ADDITIONAL term next to an
@@ -2526,6 +2538,12 @@ def global_haar_energy_reshape(
     texture in calm windows is penalised. Windows with fewer than
     energy_window_min_valid x (window size) valid coefficients are skipped. The monitored
     ratios (log10ratio_L*) stay domain-wide, so they are comparable with energy_window = 0.
+    Fixed, non-overlapping windows can imprint the window grid on the prediction (seams /
+    blocks of window size). energy_window_stride = S (template cells; 0 = W) makes the
+    windows overlap (S = W/2: every point lies in 4 windows); energy_window_random_shift =
+    True shifts the window grid by a random offset at every call while gradients are
+    enabled (training), so remaining window edges move and average out; validation
+    (no grad) always uses the unshifted grid and stays reproducible.
 
     Masking. Template cells with no nearby data point (regional crop),
     padding cells, and cells where the target is NaN are excluded. A detail
@@ -2659,9 +2677,16 @@ def global_haar_energy_reshape(
 
             # window size in coefficients at this level (0 = domain-wide, original)
             win = max(2, energy_window // 2 ** (lvl + 1)) if energy_window > 0 else 0
+            stv, shift = 0, (0, 0)
+            if win > 0:
+                if energy_window_stride > 0:
+                    stv = max(1, min(win, energy_window_stride // 2 ** (lvl + 1)))
+                step = stv if stv > 0 else win
+                if energy_window_random_shift and torch.is_grad_enabled():
+                    shift = tuple(int(v) for v in torch.randint(0, step, (2,)))
             term, has = _haar_energy_term(
                 t_b, p_b, m, field_var, eps_rel, eps_field_rel, eps_abs,
-                ensemble_mode, win, energy_window_min_valid,
+                ensemble_mode, win, energy_window_min_valid, stride=stv, shift=shift,
             )                                                              # (C,3), (C,)
 
             use = has & chan_active
