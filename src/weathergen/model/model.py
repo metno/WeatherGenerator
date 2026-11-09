@@ -1139,6 +1139,26 @@ class Model(torch.nn.Module):
             cache[key] = self._pou_tables_compute(domain.healpix_level, domain.active_cells)
         return cache[key]
 
+    @staticmethod
+    def _pou_build_kv(tokens_flat, idxs_flat, coarse_args, num_cells_total):
+        """
+        KV pool for one pou candidate column: fine 1-ring (gathered with idxs_flat),
+        followed, for every coarser decode level, by the 1-ring of the candidate's
+        parent (coarse_args = [tokens_c (B*nc, D), rows (B*n, 9), valid (B*n,1,1)]*L),
+        zeroed where there is no parent -- the same layout as the standard
+        multi-level tokens_nbors. Returns (B*n*ring_total, D).
+        """
+        toks = tokens_flat[idxs_flat].flatten(0, 1)                 # (B*n*9*nq, D)
+        if not coarse_args:
+            return toks
+        D = toks.shape[-1]
+        parts = [toks.reshape(num_cells_total, -1, D)]              # (B*n, 9, D)
+        for i in range(0, len(coarse_args), 3):
+            tok_c, rows, valid = coarse_args[i], coarse_args[i + 1], coarse_args[i + 2]
+            ring_c = tok_c[rows]                                     # (B*n, 9, D)
+            parts.append(ring_c * valid.to(ring_c.dtype))
+        return torch.cat(parts, dim=1).reshape(-1, D)
+
     def _pou_predict(
         self,
         stream_name: str,
@@ -1149,6 +1169,7 @@ class Model(torch.nn.Module):
         s: list[int],
         batch_size: int,
         domain=None,
+        coarse: list | None = None,
     ) -> torch.Tensor:
         """
         Partition-of-unity readout blend removing healpix grid-imprint artifacts.
@@ -1191,6 +1212,17 @@ class Model(torch.nn.Module):
           position stored in the last 3 channels of t_coords.
         * Residual caveat: the cell-relative coordinate channels of t_coords
           still switch with c(p).
+
+        Multi-level decoding (coarse != None)
+        -------------------------------------
+        For a stream that decodes from several levels, the standard readout uses, per
+        fine cell c, the fine 1-ring of c followed by the 1-ring of c's parent at every
+        coarser level (zeroed where c has no parent). Here every candidate j is
+        evaluated "as seen from j": fine 1-ring of j + coarse 1-ring of parent(j), in
+        the same order and with the same zeroing. For j = c this is exactly the
+        standard KV pool. `coarse` is a list (one entry per coarser level, in decode
+        order) of dicts: tokens (B*nc, D), nbours (nc, 9) compact, poc (n,) compact
+        parent of every fine cell (-1 = none), nc. Requires ae_local_num_queries == 1.
 
         Config:  pou_blend: true   (default false; no other parameters)
         Cost:    <= 9 (+2 near seams) readout calls instead of 1.
@@ -1275,10 +1307,29 @@ class Model(torch.nn.Module):
 
         # ---- one readout call per active candidate column --------------------
         tokens_flat = tokens.reshape(s).flatten(0, 1)          # (B*n, nq, D)
+        coarse = coarse or []
+        nq = s[2]
+        if coarse and nq != 1:
+            raise NotImplementedError(
+                "pou_blend with multi-level decoding requires ae_local_num_queries == 1"
+            )
+        ring_total = 9 * nq + 9 * len(coarse)
         lens = torch.full(
-            (num_cells_total + 1,), fill_value=9, dtype=torch.int32, device=dev
+            (num_cells_total + 1,), fill_value=ring_total, dtype=torch.int32, device=dev
         )
         lens[0] = 0
+        # coarse levels: per-sample row offsets and parent tables on device
+        coarse_dev = []
+        for cl in coarse:
+            nc = int(cl["nc"])
+            coarse_dev.append(
+                dict(
+                    tokens=cl["tokens"],
+                    nbours=cl["nbours"].to(dev).long(),
+                    poc=cl["poc"].to(dev).long(),
+                    b_off=(torch.arange(batch_size, device=dev) * nc).view(batch_size, 1, 1),
+                )
+            )
         # per-sample offset into the flattened (B*n) latent rows
         b_off = (torch.arange(batch_size, device=dev) * n).view(batch_size, 1, 1)
 
@@ -1291,11 +1342,21 @@ class Model(torch.nn.Module):
             # read sample 0's latent when batch_size > 1
             idxs_k = (pools_c[k].to(dev).unsqueeze(0) + b_off).flatten(0, 1)
 
-            def _slot_forward(tokens_flat_, tc_tokens_, t_coords_, idxs_flat_):
+            # coarse context of candidate j = centre of pool k: ring of parent(j)
+            coarse_args = []
+            if coarse_dev:
+                centre_k = pools_c[k][:, 0].to(dev)                # (n,) compact fine cell
+                for cd in coarse_dev:
+                    par = cd["poc"][centre_k]                       # (n,) -1 = no parent
+                    valid = (par >= 0).repeat(batch_size).view(-1, 1, 1)
+                    rows = (cd["nbours"][par.clamp(min=0)].unsqueeze(0) + cd["b_off"]).flatten(0, 1)
+                    coarse_args += [cd["tokens"], rows, valid]
+
+            def _slot_forward(tokens_flat_, tc_tokens_, t_coords_, idxs_flat_, *coarse_args_):
                 # The gather is INSIDE the checkpoint so the large KV tensor
                 # (same size as tokens_nbors) is freed after this slot's forward
                 # and recomputed at backward.
-                toks_k_ = tokens_flat_[idxs_flat_].flatten(0, 1)
+                toks_k_ = self._pou_build_kv(tokens_flat_, idxs_flat_, coarse_args_, num_cells_total)
                 out_k_ = self.target_token_engines[stream_name](
                     latent=toks_k_,
                     output=tc_tokens_,
@@ -1308,7 +1369,9 @@ class Model(torch.nn.Module):
             # Under FSDP2 nested non-reentrant checkpointing is not supported
             # ("mixed torch.Tensor and DTensor"), so only checkpoint without FSDP.
             if self.cf.get("with_fsdp", False) and self.cf.get("with_ddp", False):
-                pred_k = _slot_forward(tokens_flat, tc_tokens, t_coords, idxs_k.flatten())
+                pred_k = _slot_forward(
+                    tokens_flat, tc_tokens, t_coords, idxs_k.flatten(), *coarse_args
+                )
             else:
                 pred_k = checkpoint(
                     _slot_forward,
@@ -1316,6 +1379,7 @@ class Model(torch.nn.Module):
                     tc_tokens,
                     t_coords,
                     idxs_k.flatten(),
+                    *coarse_args,
                     use_reentrant=False,
                 )                                               # (ens, N_pts, C)
 
@@ -1652,11 +1716,32 @@ class Model(torch.nn.Module):
                     # retraining required -- architecture is unchanged).
                     # pou_blend blends single-level 1-ring pools; a stream that also
                     # reads coarser levels would silently lose that context here.
+                    coarse = []
                     if len(dec_levels) != 1:
-                        raise NotImplementedError(
-                            f"pou_blend: stream {stream_name!r} decodes from levels "
-                            f"{dec_levels}; only single-level decoding is supported."
-                        )
+                        # multi-level: each candidate cell also sees its parent's
+                        # coarse 1-ring, as in the standard multi-level readout
+                        if enc_lvl != _finest:
+                            raise NotImplementedError(
+                                f"pou_blend: stream {stream_name!r} encodes at level "
+                                f"{enc_lvl} but decodes from {dec_levels}; multi-level "
+                                "pou_blend needs the stream's target cells at the finest level."
+                            )
+                        for lvl in dec_levels:
+                            if lvl == _finest:
+                                continue
+                            mp_c = (model_params.params_for(lvl)
+                                    if hasattr(model_params, "params_for") else model_params)
+                            nc = len(self.domain_pyramid.domain(lvl))
+                            toks_c = tokens_lvl[lvl][:, self.num_aux_tokens :]
+                            coarse.append(dict(
+                                tokens=toks_c.reshape(batch_size * nc, toks_c.shape[-1]),
+                                nbours=mp_c.hp_nbours,
+                                poc=torch.as_tensor(
+                                    self.domain_pyramid.parent_of_child(lvl, _finest),
+                                    dtype=torch.long,
+                                ),
+                                nc=nc,
+                            ))
                     pred = self._pou_predict(
                         stream_name=stream_name,
                         tc_tokens=tc_tokens,
@@ -1666,6 +1751,7 @@ class Model(torch.nn.Module):
                         s=s,
                         batch_size=batch_size,
                         domain=self.domain_pyramid.domain(enc_lvl),
+                        coarse=coarse,
                     )
 
                 else:
