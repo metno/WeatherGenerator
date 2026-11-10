@@ -1197,6 +1197,67 @@ class Model(torch.nn.Module):
             out[:, 75 + 3 * ic : 78 + 3 * ic] = normalize_lcoords(lc, fac)
         return out
 
+    def _pou_decode_pairs(
+        self, stream_name, pt_idx, k_idx, row_of_point, cand_c_dev, n, K, nbours_fine,
+        coarse_dev, tokens_flat, t_coords, p_r3_dev, geo, n_loc, ring_total, embed, dev,
+    ):
+        """
+        Decode (point, candidate column) pairs in ONE decoder pass. Pairs are grouped by
+        (latent row of the point's cell, candidate column); every group gets the KV pool of
+        its candidate cell j (fine ring of j + parent ring of j) and its points get their
+        cell-relative coordinates recomputed w.r.t. j. Returns (ens, P, C) in pair order.
+        """
+        from weathergen.datasets.tokenizer_utils import _ABLATE_CELL_COORDS
+
+        row_p = row_of_point[pt_idx]                                       # (P,) in [0, B*n)
+        c_p = row_p % n
+        j_p = cand_c_dev[c_p, k_idx]
+        j_p = torch.where(j_p >= 0, j_p, c_p)
+        key = row_p * K + k_idx
+        key_s, order = torch.sort(key, stable=True)
+        inv = torch.empty_like(order)
+        inv[order] = torch.arange(order.numel(), device=dev)
+        uniq, counts = torch.unique_consecutive(key_s, return_counts=True)
+        G = uniq.numel()
+        row_g, k_g = uniq // K, uniq % K
+        c_g, b_g = row_g % n, row_g // n
+        j_g = cand_c_dev[c_g, k_g]
+        j_g = torch.where(j_g >= 0, j_g, c_g)
+        idxs_g = (nbours_fine[j_g].to(dev).long() + (b_g * n).view(-1, 1)).flatten()
+        coarse_args_g = []
+        for cd in coarse_dev:
+            par = cd["poc"][j_g]
+            valid = (par >= 0).view(-1, 1, 1)
+            rows = cd["nbours"][par.clamp(min=0)] + (b_g * cd["nc"]).view(-1, 1)
+            coarse_args_g += [cd["tokens"], rows, valid]
+        pt_s = pt_idx[order]
+        t_s = t_coords[pt_s].clone()
+        if not _ABLATE_CELL_COORDS:
+            loc = self._pou_local_channels(p_r3_dev[pt_s], j_p[order], geo)
+            t_s[..., -n_loc:-NUM_GLOBAL_COORD_CHANNELS_POU] = loc.to(t_s.dtype)
+        lens_g = torch.full((G + 1,), fill_value=ring_total, dtype=torch.int32, device=dev)
+        lens_g[0] = 0
+        out_lens_g = torch.cat(
+            [torch.zeros(1, dtype=torch.int32, device=dev), counts.to(torch.int32)]
+        )
+
+        def _fwd(tokens_flat_, t_, idxs_, *ca_):
+            toks_ = self._pou_build_kv(tokens_flat_, idxs_, ca_, G)
+            out_ = self.target_token_engines[stream_name](
+                latent=toks_,
+                output=embed(t_),
+                latent_lens=lens_g,
+                output_lens=out_lens_g,
+                coordinates=t_,
+            )
+            return self.pred_heads[stream_name](out_)
+
+        if self.cf.get("with_fsdp", False) and self.cf.get("with_ddp", False):
+            pred_s = _fwd(tokens_flat, t_s, idxs_g, *coarse_args_g)
+        else:
+            pred_s = checkpoint(_fwd, tokens_flat, t_s, idxs_g, *coarse_args_g, use_reentrant=False)
+        return pred_s[:, inv]
+
     @staticmethod
     def _pou_build_kv(tokens_flat, idxs_flat, coarse_args, num_cells_total):
         """
@@ -1299,9 +1360,10 @@ class Model(torch.nn.Module):
                  pou_blend_sharpness: p  (default 1 = bilinear weights; p > 1 narrows
                                           the blending to bands along cell edges)
                  pou_blend_mode: "own"   (diagnostic: must equal pou_blend: false)
-                 pou_blend_train: "stochastic" (training only: one decoder pass, each point
-                                          decoded from one candidate drawn with prob. lam;
-                                          default "blend" = full blend also in training)
+                 pou_blend_train: "blend" (default: full blend also in training, ~K passes)
+                                  | "stochastic" (one candidate per point, drawn with prob. lam)
+                                  | "sparse" (all pairs with lam >= pou_blend_min_weight,
+                                    default 0.05, one pass, blended)  -- training only
         Cost:    <= 9 (+2 near seams) readout calls instead of 1 ("own": 1).
         """
         import astropy.units as _u
@@ -1442,67 +1504,51 @@ class Model(torch.nn.Module):
             raise ValueError("pou_blend: target coordinates too short for the 99 local channels")
         embed = self.embed_target_coords[stream_name]
 
-        # ---- stochastic training (pou_blend_train: "stochastic") --------------------
-        # One decoder pass: every point is decoded from ONE candidate cell j drawn with
-        # probability lam(p, j), with fully consistent inputs (ring of j, parent ring of j,
-        # coordinates w.r.t. j). Trains every candidate decoding in proportion to its
-        # weight in the blend; validation / inference (no training) use the full blend.
+        # ---- single-pass training modes ----------------------------------------------
+        # pou_blend_train:
+        #   "blend"      (default) full blend also in training: one decoder pass per
+        #                candidate column over ALL points (memory ~K x the standard readout)
+        #   "stochastic" every point decoded from ONE candidate drawn with probability lam
+        #   "sparse"     every (point, candidate) pair with lam >= pou_blend_min_weight
+        #                (weights renormalized; the largest is always kept), all pairs in
+        #                ONE decoder pass, then blended per point: the blended objective at
+        #                ~1.5-2.5x the standard readout cost
+        # Every pair is decoded with fully consistent inputs (ring of j, parent ring of j,
+        # coordinates w.r.t. j). Validation / inference (not training) use the full blend.
         train_mode = self.cf.get("pou_blend_train", "blend")
-        if train_mode not in ("blend", "stochastic"):
-            raise ValueError(f"pou_blend_train must be 'blend' or 'stochastic', got {train_mode!r}")
-        if self.training and train_mode == "stochastic":
-            assert nbours_fine is not None, "pou_blend_train 'stochastic' needs nbours_fine"
-            row_pt = cell_of_point.to(dev)                                   # (N,) in [0, B*n)
-            c_pt = row_pt % n
-            k_pt = torch.multinomial(lam, 1).squeeze(1)                      # (N,)
-            j_pt = cand_c_dev[c_pt, k_pt]
-            j_pt = torch.where(j_pt >= 0, j_pt, c_pt)
-            # group points by (row, sampled candidate); one KV pool per group
-            key = row_pt * K + k_pt
-            key_s, order = torch.sort(key, stable=True)
-            inv = torch.empty_like(order)
-            inv[order] = torch.arange(order.numel(), device=dev)
-            uniq, counts = torch.unique_consecutive(key_s, return_counts=True)
-            G = uniq.numel()
-            row_g, k_g = uniq // K, uniq % K
-            c_g, b_g = row_g % n, row_g // n
-            j_g = cand_c_dev[c_g, k_g]
-            j_g = torch.where(j_g >= 0, j_g, c_g)
-            idxs_g = (nbours_fine[j_g].to(dev).long() + (b_g * n).view(-1, 1)).flatten()
-            coarse_args_g = []
-            for cd in coarse_dev:
-                par = cd["poc"][j_g]
-                valid = (par >= 0).view(-1, 1, 1)
-                rows = cd["nbours"][par.clamp(min=0)] + (b_g * cd["nc"]).view(-1, 1)
-                coarse_args_g += [cd["tokens"], rows, valid]
-            t_s = t_coords[order].clone()
-            if not _ABLATE_CELL_COORDS:
-                loc = self._pou_local_channels(p_r3_dev[order], j_pt[order], geo)
-                t_s[..., -n_loc:-NUM_GLOBAL_COORD_CHANNELS_POU] = loc.to(t_s.dtype)
-            lens_g = torch.full((G + 1,), fill_value=ring_total, dtype=torch.int32, device=dev)
-            lens_g[0] = 0
-            out_lens_g = torch.cat(
-                [torch.zeros(1, dtype=torch.int32, device=dev), counts.to(torch.int32)]
+        if train_mode not in ("blend", "stochastic", "sparse"):
+            raise ValueError(
+                f"pou_blend_train must be 'blend', 'stochastic' or 'sparse', got {train_mode!r}"
             )
-
-            def _stoch_forward(tokens_flat_, t_, idxs_, *ca_):
-                toks_ = self._pou_build_kv(tokens_flat_, idxs_, ca_, G)
-                out_ = self.target_token_engines[stream_name](
-                    latent=toks_,
-                    output=embed(t_),
-                    latent_lens=lens_g,
-                    output_lens=out_lens_g,
-                    coordinates=t_,
-                )
-                return self.pred_heads[stream_name](out_)
-
-            if self.cf.get("with_fsdp", False) and self.cf.get("with_ddp", False):
-                pred_s = _stoch_forward(tokens_flat, t_s, idxs_g, *coarse_args_g)
+        if self.training and train_mode in ("stochastic", "sparse"):
+            assert nbours_fine is not None, f"pou_blend_train {train_mode!r} needs nbours_fine"
+            N_pts = lam.shape[0]
+            pt_all = torch.arange(N_pts, device=dev)
+            if train_mode == "stochastic":
+                pt_idx = pt_all
+                k_idx = torch.multinomial(lam, 1).squeeze(1)
+                w_pair = None
             else:
-                pred_s = checkpoint(
-                    _stoch_forward, tokens_flat, t_s, idxs_g, *coarse_args_g, use_reentrant=False
-                )
-            return pred_s[:, inv]                                           # original point order
+                tau = float(self.cf.get("pou_blend_min_weight", 0.05))
+                keep = lam >= tau
+                keep[pt_all, lam.argmax(dim=1)] = True                       # never empty
+                lam_s = lam * keep
+                lam_s = lam_s / lam_s.sum(dim=1, keepdim=True).clamp(min=1e-12)
+                pt_idx, k_idx = keep.nonzero(as_tuple=True)                   # (P,), (P,)
+                w_pair = lam_s[pt_idx, k_idx]
+            pred_pairs = self._pou_decode_pairs(
+                stream_name, pt_idx, k_idx, cell_of_point.to(dev), cand_c_dev, n, K,
+                nbours_fine, coarse_dev, tokens_flat, t_coords, p_r3_dev, geo, n_loc,
+                ring_total, embed, dev,
+            )                                                                 # (ens, P, C)
+            if w_pair is None:
+                return pred_pairs                                             # P == N, in order
+            out = torch.zeros(
+                pred_pairs.shape[0], N_pts, pred_pairs.shape[2],
+                device=dev, dtype=pred_pairs.dtype,
+            )
+            out.index_add_(1, pt_idx, pred_pairs * w_pair.view(1, -1, 1).to(pred_pairs.dtype))
+            return out
 
         pred_blend = None
         for k in range(K):
