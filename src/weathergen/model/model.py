@@ -1046,10 +1046,10 @@ class Model(torch.nn.Module):
 
         # pair with tokens from assimilation engine to obtain target tokens
         for stream_name in self.streams.keys():
-	    # forcing streams are input-only and have no decoder / prediction head
-	    if stream_name not in self.pred_heads:
+            # forcing streams are input-only and have no decoder / prediction head
+            if stream_name not in self.pred_heads:
                 continue
-	    
+
             # multi-resolution latent: key/value pool of this stream's decoder
             if tokens_lvl is not None:
                 tokens_nbors, tokens_nbors_lens, tokens_flat = self.predict_decoders_kv_multi_level(
