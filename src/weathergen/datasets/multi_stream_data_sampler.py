@@ -9,6 +9,7 @@
 
 import dataclasses
 import logging
+import os
 import pathlib
 from collections.abc import Sequence
 
@@ -46,6 +47,18 @@ type AnyDataReader = DataReaderBase | DataReaderAnemoi | DataReaderObs
 type StreamName = str
 
 logger = logging.getLogger(__name__)
+
+# Per-sample debug lines (source/target time ranges of the first batches of every worker
+# and mini-epoch) are off by default: set WEATHERGEN_DEBUG_SAMPLES=1 to print them.
+_DEBUG_SAMPLES = os.environ.get("WEATHERGEN_DEBUG_SAMPLES", "0") == "1"
+# messages that are identical for every worker / mini-epoch are logged once per process
+_LOGGED_ONCE: set = set()
+
+
+def _log_once(level, key, msg, *args):
+    if key not in _LOGGED_ONCE:
+        _LOGGED_ONCE.add(key)
+        logger.log(level, msg, *args)
 
 FORECAST_DEFAULTS = {
     "offset": 0,
@@ -154,9 +167,11 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         steps = np.array(forecast_cfg["num_steps"], dtype=np.int32).reshape(-1)
         self.list_num_forecast_steps = np.array(steps, dtype=np.int32)
 
-        # DEBUG: effective forecast settings for this stage
-        logger.warning(
-            f"DEBUG [{stage}] forecast: offset={self.output_offset} "
+        # effective forecast settings for this stage (once per process and stage)
+        _log_once(
+            logging.INFO,
+            ("forecast_settings", stage),
+            f"[{stage}] forecast: offset={self.output_offset} "
             f"time_step={self.time_step} policy={self.forecast_policy} "
             f"num_steps={self.list_num_forecast_steps} "
             f"window_len={mode_cfg.time_window_len} window_step={mode_cfg.time_window_step}"
@@ -313,7 +328,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 )
                 self.samples_per_mini_epoch = max(available_samples - 1, 1)
             else:
-                logger.info("Sufficient available samples in the time range specified")
+                logger.debug("Sufficient available samples in the time range specified")
         else:
             logger.info("Samples will be repeated within the time range")
 
@@ -363,7 +378,9 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
         keep = np.array([i for i in perms if not _bad(i)], dtype=perms.dtype)
         if len(keep) < len(perms):
-            logger.warning(
+            _log_once(
+                logging.WARNING,
+                ("dropping_windows", len(perms) - len(keep), len(perms)),
                 "Dropping %d of %d windows containing missing dates",
                 len(perms) - len(keep), len(perms),
             )
@@ -505,7 +522,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             fsm = self.list_num_forecast_steps.max()
 
         if fsm > 0:
-            logger.info(f"forecast_steps : {fsm}")
+            logger.debug(f"forecast_steps : {fsm}")
         return fsm
 
     def advance(self):
@@ -904,8 +921,8 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 idx, num_forecast_steps, i_max, stream_ds, stream_name=stream_name
             )
 
-            # DEBUG: actual source/target times for the first few batches
-            if self._debug_n < 3:
+            # DEBUG (WEATHERGEN_DEBUG_SAMPLES=1): source/target times of the first batches
+            if _DEBUG_SAMPLES and self._debug_n < 3:
                 def _trange(rd):
                     if rd.is_empty():
                         return "empty"
@@ -989,7 +1006,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             batch of data
         """
         iter_start, iter_end = self.worker_workset()
-        logger.info(f"iter_start={iter_start}, iter_end={iter_end}, len={self.len}")
+        logger.debug(f"iter_start={iter_start}, iter_end={iter_end}, len={self.len}")
 
         # create new shuffeling
         perms, perms_num_forecast_steps = self.reset()
@@ -1063,7 +1080,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             iter_end = iter_start + per_worker
             if worker_info.id + 1 == worker_info.num_workers:
                 iter_end = local_end
-            logger.info(
+            logger.debug(
                 f"{self.rank}::{worker_info.id}"
                 + f" : dataset [{local_start},{local_end}) : [{iter_start},{iter_end})"
             )

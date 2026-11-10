@@ -1434,10 +1434,13 @@ class Model(torch.nn.Module):
         lam = torch.zeros(len(hp_cell), K, dtype=torch.float32)
         lam.scatter_add_(1, col, torch.where(found, w4, torch.zeros_like(w4)))
         n_missed = int((~found & (w4 > 1e-9)).sum())
-        if n_missed > 0:
+        warned = self.__dict__.setdefault("_pou_warned", set())
+        if n_missed > 0 and stream_name not in warned:
+            warned.add(stream_name)
             logger.warning(
                 f"pou_blend: {n_missed} bilinear pixel(s) missing from candidate "
-                "table; weights renormalized for the affected points."
+                "table (domain edge); weights renormalized for the affected points. "
+                "Reported once per stream."
             )
         # drop candidates outside the domain (no latent there)
         lam = lam * (cand_c[hp_cell] >= 0).to(lam.dtype)

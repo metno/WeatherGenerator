@@ -7,6 +7,7 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+import os
 import math
 
 import numpy as np
@@ -908,7 +909,9 @@ def global_fft_mse(
 # ---------------------------------------------------------------------------
 REGRID_CACHE_ENABLE = True
 REGRID_CACHE_MAX_ENTRIES = 4      # LRU entries (per process, all streams)
-REGRID_CACHE_REPORT_EVERY = 500   # print hit statistics every N lookups (0 = never)
+# print regrid-cache hit statistics every N lookups (0 = never; default off).
+# Set WEATHERGEN_REGRID_CACHE_REPORT_EVERY=500 to see them.
+REGRID_CACHE_REPORT_EVERY = int(os.environ.get("WEATHERGEN_REGRID_CACHE_REPORT_EVERY", "0"))
 
 _REGRID_CACHE: "OrderedDict[tuple, dict]" = None  # created lazily
 _REGRID_STATS = {"lookups": 0, "hits": 0, "miss_time": 0.0, "misses": 0}
