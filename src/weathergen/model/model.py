@@ -1142,6 +1142,59 @@ class Model(torch.nn.Module):
             cache[key] = self._pou_tables_compute(domain.healpix_level, domain.active_cells)
         return cache[key]
 
+    @torch.no_grad()
+    def _cell_pattern_diag(self, stream_name, pred, t_coords, tcs_lens, nbins: int = 6):
+        """
+        Diagnostic (config cell_pattern_diag: true, evaluation only): how much of the
+        within-cell variability of the prediction is a FIXED pattern of the position inside
+        the cell, i.e. the same in every cell (a grid imprint)?
+
+        For every channel: d = prediction - mean of the prediction over its cell. The points
+        are binned by their position inside the cell (local coordinates w.r.t. the cell
+        centre, nbins x nbins bins); M_b = mean of d over ALL cells in bin b.
+            pattern_fraction = var explained by M_b / var(d)
+            pattern_amplitude = RMS of the pattern / spatial std of the field
+        Natural fields have gradients inside cells too, but with a different orientation
+        in every cell, so they average out: pattern_fraction ~ 0. A pattern repeated in
+        every cell gives a clearly positive value. Prints [cellpat] lines.
+        """
+        x = pred.float().mean(0)                                   # (N, C) ensemble mean
+        N, C = x.shape
+        dev = x.device
+        ncell = tcs_lens.numel() - 1
+        cell = torch.repeat_interleave(torch.arange(ncell, device=dev), tcs_lens[1:].to(dev).long())
+        if cell.numel() != N:
+            return
+        cnt = torch.zeros(ncell, device=dev).index_add_(0, cell, torch.ones(N, device=dev))
+        csum = torch.zeros(ncell, C, device=dev).index_add_(0, cell, x)
+        d = x - (csum / cnt.clamp(min=1).unsqueeze(1))[cell]        # within-cell deviation
+        # position inside the cell: tangent-plane offsets w.r.t. the centre vertex
+        # (local block = channels [-102:-3]; centre vertex iv=4 -> zi=60..62, use y and z)
+        loc = t_coords[:, -102:-3].float()
+        yz = loc[:, 61:63]
+        sub = yz[torch.randperm(N, device=dev)[: min(N, 200000)]]
+        qs = torch.linspace(0, 1, nbins + 1, device=dev)[1:-1]
+        ey, ez = torch.quantile(sub[:, 0], qs), torch.quantile(sub[:, 1], qs)
+        b = torch.bucketize(yz[:, 0].contiguous(), ey) * nbins + torch.bucketize(yz[:, 1].contiguous(), ez)
+        nb = nbins * nbins
+        bcnt = torch.zeros(nb, device=dev).index_add_(0, b, torch.ones(N, device=dev))
+        bsum = torch.zeros(nb, C, device=dev).index_add_(0, b, d)
+        M = bsum / bcnt.clamp(min=1).unsqueeze(1)                   # (nb, C) repeated pattern
+        var_pat = (M**2 * bcnt.unsqueeze(1)).sum(0) / N              # (C,)
+        var_in = (d**2).mean(0).clamp(min=1e-20)
+        frac = var_pat / var_in
+        amp = var_pat.sqrt() / x.std(0).clamp(min=1e-12)
+        calls = self.__dict__.setdefault("_cellpat_calls", {})
+        calls[stream_name] = calls.get(stream_name, 0) + 1
+        if is_root() and (calls[stream_name] <= 4 or calls[stream_name] % 16 == 0):
+            print(
+                f"[cellpat] {stream_name} repeated in-cell pattern: fraction of within-cell "
+                f"variance mean={frac.mean():.3f} per channel=["
+                + " ".join(f"{v:.3f}" for v in frac.tolist())
+                + f"] | amplitude / field std mean={amp.mean():.4f} max={amp.max():.4f}",
+                flush=True,
+            )
+
     def _pou_geometry(self, domain):
         """
         Per-cell tables to recompute the 99 cell-relative target-coordinate channels of a
@@ -2021,6 +2074,16 @@ class Model(torch.nn.Module):
 
                     # final prediction head to map back to physical space
                     pred = self.pred_heads[stream_name](tc_tokens)
+
+            # opt-in, evaluation only: is there a pattern repeated inside every cell?
+            if (
+                self.cf.get("cell_pattern_diag", False)
+                and not self.training
+                and pred.dim() == 3
+                and pred.shape[1] == t_coords.shape[0]
+                and pred.shape[1] > 0
+            ):
+                self._cell_pattern_diag(stream_name, pred, t_coords, tcs_lens)
 
             # recover batch dimension (ragged, so as list)
             pred = torch.split(pred, t_coords_lens, dim=1)
