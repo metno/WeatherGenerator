@@ -562,7 +562,7 @@ class Model(torch.nn.Module):
             )
 
         # embed coordinates yielding one query token for each target token
-        dropout_rate = cf.embed_dropout_rate
+        dropout_rate = cf.get("embed_target_coords_dropout_rate", cf.embed_dropout_rate)
         self.embed_target_coords = torch.nn.ModuleDict()
         self.target_token_engines = torch.nn.ModuleDict()
         self.pred_heads = torch.nn.ModuleDict()
