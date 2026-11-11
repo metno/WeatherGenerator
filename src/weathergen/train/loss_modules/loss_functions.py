@@ -2799,7 +2799,7 @@ def healpix_cell_pattern(
     in the error e = pred - target as a non-zero mean over ALL cells at fixed in-cell
     position, while ordinary forecast errors (different sign in every cell) average out.
 
-        d    = e - (mean of e over its cell)
+        d    = e - (mean of e over its cell) - (least-squares plane of e in its cell)
         M_b  = mean of d over all points in in-cell position bin b   (nbins x nbins bins)
         loss = sum_b (n_b / N) M_b^2 / var_ref           per channel, then channel mean
 
@@ -2838,16 +2838,28 @@ def healpix_cell_pattern(
         return (v - (csum(v * w) / cnt.clamp(min=1.0))[cell]) * w
 
     with torch.no_grad():
-        # reference: sub-cell variability of the target after removing each cell's plane
-        dt = within(t)
         xc, yc = within(dx), within(dy)
         sxx, syy, sxy = csum(xc * xc), csum(yc * yc), csum(xc * yc)
         det = sxx * syy - sxy * sxy
-        det = torch.where(det.abs() > 1e-20, det, torch.ones_like(det))
-        sxd, syd = csum(xc * dt), csum(yc * dt)
-        a = (syy * sxd - sxy * syd) / det
-        b = (sxx * syd - sxy * sxd) / det
-        rt = dt - (a[cell] * xc + b[cell] * yc)
+        good = (det.abs() > 1e-20) & (cnt >= 6)                              # (ncell, 1)
+        det = torch.where(good, det, torch.ones_like(det))
+        gmask = good.float()
+
+    def deplane(v):
+        """v - cell mean - the cell's own least-squares plane (linear in v: differentiable).
+
+        Without this, a large-scale error gradient (every cell tilted the same way) would
+        count as a 'repeated pattern' although it has nothing to do with the cell grid.
+        """
+        dv = within(v)
+        sxd, syd = csum(xc * dv), csum(yc * dv)
+        a = (syy * sxd - sxy * syd) / det * gmask
+        b = (sxx * syd - sxy * sxd) / det * gmask
+        return dv - (a[cell] * xc + b[cell] * yc)
+
+    with torch.no_grad():
+        # reference: sub-cell variability of the target after removing each cell's plane
+        rt = deplane(t)
         field_var = ((t - (t * w).sum(0) / nw) ** 2 * w).sum(0) / nw
         var_ref = torch.maximum((rt**2).sum(0) / nw, eps_rel * field_var).clamp(min=1e-20)
         nb = nbins * nbins
@@ -2856,7 +2868,7 @@ def healpix_cell_pattern(
     loss_chs = torch.zeros(C, device=dev)
     for ie in range(pred.shape[0]):
         e = torch.where(ok.unsqueeze(1), pred[ie] - t, torch.zeros_like(t))
-        d = within(e)
+        d = deplane(e)
         M = torch.zeros(nb, C, device=dev, dtype=d.dtype).index_add_(0, bidx, d) / bcnt.clamp(min=1.0)
         loss_chs = loss_chs + (M**2 * bcnt).sum(0) / nw / var_ref
     loss_chs = loss_chs / pred.shape[0]
