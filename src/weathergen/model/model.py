@@ -1360,6 +1360,8 @@ class Model(torch.nn.Module):
                  pou_blend_sharpness: p  (default 1 = bilinear weights; p > 1 narrows
                                           the blending to bands along cell edges)
                  pou_blend_mode: "own"   (diagnostic: must equal pou_blend: false)
+                 pou_blend_diag: true    (evaluation: print how much the candidate
+                                          decodings of a point disagree, [pou_diag] lines)
                  pou_blend_train: "blend" (default: full blend also in training, ~K passes)
                                   | "stochastic" (one candidate per point, drawn with prob. lam)
                                   | "sparse" (all pairs with lam >= pou_blend_min_weight,
@@ -1553,6 +1555,8 @@ class Model(torch.nn.Module):
             out.index_add_(1, pt_idx, pred_pairs * w_pair.view(1, -1, 1).to(pred_pairs.dtype))
             return out
 
+        pou_diag = bool(self.cf.get("pou_blend_diag", False)) and not self.training
+        pred_sq = None
         pred_blend = None
         for k in range(K):
             lam_k = lam[:, k]
@@ -1605,6 +1609,35 @@ class Model(torch.nn.Module):
 
             w_k = lam_k.view(1, -1, 1).to(pred_k.dtype)
             pred_blend = pred_k * w_k if pred_blend is None else pred_blend + pred_k * w_k
+            if pou_diag:
+                with torch.no_grad():
+                    sq_k = pred_k.float() ** 2 * w_k.float()
+                    pred_sq = sq_k if pred_sq is None else pred_sq + sq_k
+
+        # pou_blend_diag: how much do the candidate decodings of a point disagree?
+        #   disagreement = weighted RMS spread of the candidates around the blend,
+        #   relative to the spatial std of the blended field (per channel, then averaged).
+        #   ~0  -> all candidates give the same value: the weights (sharpness) cannot
+        #          change the output; remaining artifacts are not edge discontinuities.
+        #   large -> candidates differ: blending matters and sharpness changes the output.
+        if pou_diag and pred_blend is not None:
+            with torch.no_grad():
+                pb = pred_blend.float()
+                spread = (pred_sq - pb**2).clamp(min=0.0).mean(dim=(0, 1)).sqrt()   # (C,)
+                field_std = pb.std(dim=1).mean(0).clamp(min=1e-12)                  # (C,)
+                rel = spread / field_std
+                n_eff = (1.0 / (lam**2).sum(dim=1).clamp(min=1e-12)).mean()
+                top = lam.max(dim=1).values
+                cnt = self.__dict__.setdefault("_pou_diag_calls", {})
+                cnt[stream_name] = cnt.get(stream_name, 0) + 1
+                if is_root() and (cnt[stream_name] <= 3 or cnt[stream_name] % 16 == 0):
+                    print(
+                        f"[pou_diag] {stream_name} sharpness={sharp:g} | candidates per point "
+                        f"(effective)={n_eff:.2f} | points with top weight < 0.9: "
+                        f"{100.0 * (top < 0.9).float().mean():.1f}% | disagreement / field std: "
+                        f"mean={rel.mean():.4f} max channel={rel.max():.4f}",
+                        flush=True,
+                    )
 
         return pred_blend
 
