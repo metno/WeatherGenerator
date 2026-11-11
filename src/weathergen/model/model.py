@@ -1143,20 +1143,25 @@ class Model(torch.nn.Module):
         return cache[key]
 
     @torch.no_grad()
-    def _cell_pattern_diag(self, stream_name, pred, t_coords, tcs_lens, nbins: int = 6):
+    def _cell_pattern_diag(self, stream_name, pred, t_coords, tcs_lens, nbins: int = 8):
         """
-        Diagnostic (config cell_pattern_diag: true, evaluation only): how much of the
-        within-cell variability of the prediction is a FIXED pattern of the position inside
-        the cell, i.e. the same in every cell (a grid imprint)?
+        Diagnostic (config cell_pattern_diag: true, evaluation only): grid imprint of the
+        healpix cells on the prediction. Per channel, with d = prediction - cell mean:
 
-        For every channel: d = prediction - mean of the prediction over its cell. The points
-        are binned by their position inside the cell (local coordinates w.r.t. the cell
-        centre, nbins x nbins bins); M_b = mean of d over ALL cells in bin b.
-            pattern_fraction = var explained by M_b / var(d)
-            pattern_amplitude = RMS of the pattern / spatial std of the field
-        Natural fields have gradients inside cells too, but with a different orientation
-        in every cell, so they average out: pattern_fraction ~ 0. A pattern repeated in
-        every cell gives a clearly positive value. Prints [cellpat] lines.
+          planar   fraction of the within-cell variance explained by a plane fitted to
+                   EACH cell (its own tilt). High values = the field inside a cell is
+                   almost flat/linear ("faceting": structure only between cells).
+          pattern  after removing each cell's plane: fraction of the remaining variance
+                   that is a FIXED function of the position inside the cell (same in every
+                   cell). Removing the plane first makes this insensitive to large-scale
+                   gradients (e.g. z_500 decreasing polewards in every cell).
+          edge     mean squared residual in the outer third of the cell (by distance from
+                   the cell centre) divided by that in the inner third. Residuals of a
+                   plane fit grow outwards for any curved field, so compare with the
+                   autoencoder: a clearly larger ratio = extra structure at the cell edges.
+
+        Compare a forecast with the autoencoder (control) channel by channel.
+        Prints [cellpat] lines.
         """
         x = pred.float().mean(0)                                   # (N, C) ensemble mean
         N, C = x.shape
@@ -1165,33 +1170,61 @@ class Model(torch.nn.Module):
         cell = torch.repeat_interleave(torch.arange(ncell, device=dev), tcs_lens[1:].to(dev).long())
         if cell.numel() != N:
             return
-        cnt = torch.zeros(ncell, device=dev).index_add_(0, cell, torch.ones(N, device=dev))
-        csum = torch.zeros(ncell, C, device=dev).index_add_(0, cell, x)
-        d = x - (csum / cnt.clamp(min=1).unsqueeze(1))[cell]        # within-cell deviation
+        ones = torch.ones(N, device=dev)
+
+        def cmean(v):                                               # per-cell mean, gathered
+            sm = torch.zeros(ncell, *v.shape[1:], device=dev).index_add_(0, cell, v)
+            return (sm / cnt.clamp(min=1).view(-1, *[1] * (v.dim() - 1)))[cell]
+
+        cnt = torch.zeros(ncell, device=dev).index_add_(0, cell, ones)
+        d = x - cmean(x)                                            # within-cell deviation
         # position inside the cell: tangent-plane offsets w.r.t. the centre vertex
         # (local block = channels [-102:-3]; centre vertex iv=4 -> zi=60..62, use y and z)
-        loc = t_coords[:, -102:-3].float()
-        yz = loc[:, 61:63]
-        sub = yz[torch.randperm(N, device=dev)[: min(N, 200000)]]
+        yz = t_coords[:, -102:-3].float()[:, 61:63]
+        yzc = yz - cmean(yz)
+        yc, zc = yzc[:, 0:1], yzc[:, 1:2]
+        # per-cell least-squares plane d ~ a*yc + b*zc (2x2 normal equations per cell)
+        def csum(v):
+            return torch.zeros(ncell, v.shape[1], device=dev).index_add_(0, cell, v)
+        syy, szz, syz = csum(yc * yc), csum(zc * zc), csum(yc * zc)          # (ncell, 1)
+        syd, szd = csum(yc * d), csum(zc * d)                                 # (ncell, C)
+        det = syy * szz - syz * syz
+        ok_cell = (cnt >= 12) & (det.squeeze(1) > 1e-12)
+        det = torch.where(det.abs() > 1e-12, det, torch.ones_like(det))
+        a = (szz * syd - syz * szd) / det
+        b = (syy * szd - syz * syd) / det
+        r = d - a[cell] * yc - b[cell] * zc                                   # residual
+        ok = ok_cell[cell]
+        if ok.sum() < 1000:
+            return
+        d, r, yzc, yz_ok = d[ok], r[ok], yzc[ok], yz[ok]
+        n_ok = d.shape[0]
+        var_d = (d**2).mean(0).clamp(min=1e-20)
+        var_r = (r**2).mean(0).clamp(min=1e-20)
+        planar = 1.0 - var_r / var_d
+        # fixed in-cell pattern of the residual
+        sub = yz_ok[torch.randperm(n_ok, device=dev)[: min(n_ok, 200000)]]
         qs = torch.linspace(0, 1, nbins + 1, device=dev)[1:-1]
         ey, ez = torch.quantile(sub[:, 0], qs), torch.quantile(sub[:, 1], qs)
-        b = torch.bucketize(yz[:, 0].contiguous(), ey) * nbins + torch.bucketize(yz[:, 1].contiguous(), ez)
+        bidx = torch.bucketize(yz_ok[:, 0].contiguous(), ey) * nbins + torch.bucketize(
+            yz_ok[:, 1].contiguous(), ez
+        )
         nb = nbins * nbins
-        bcnt = torch.zeros(nb, device=dev).index_add_(0, b, torch.ones(N, device=dev))
-        bsum = torch.zeros(nb, C, device=dev).index_add_(0, b, d)
-        M = bsum / bcnt.clamp(min=1).unsqueeze(1)                   # (nb, C) repeated pattern
-        var_pat = (M**2 * bcnt.unsqueeze(1)).sum(0) / N              # (C,)
-        var_in = (d**2).mean(0).clamp(min=1e-20)
-        frac = var_pat / var_in
-        amp = var_pat.sqrt() / x.std(0).clamp(min=1e-12)
+        bcnt = torch.zeros(nb, device=dev).index_add_(0, bidx, torch.ones(n_ok, device=dev))
+        M = torch.zeros(nb, C, device=dev).index_add_(0, bidx, r) / bcnt.clamp(min=1).unsqueeze(1)
+        pattern = (M**2 * bcnt.unsqueeze(1)).sum(0) / n_ok / var_r
+        # residual energy near the cell edge vs near the cell centre
+        rho = yzc.norm(dim=1)
+        q1, q2 = torch.quantile(rho[torch.randperm(n_ok, device=dev)[: min(n_ok, 200000)]],
+                                torch.tensor([1 / 3, 2 / 3], device=dev))
+        edge = (r[rho >= q2] ** 2).mean(0) / (r[rho <= q1] ** 2).mean(0).clamp(min=1e-20)
         calls = self.__dict__.setdefault("_cellpat_calls", {})
         calls[stream_name] = calls.get(stream_name, 0) + 1
         if is_root() and (calls[stream_name] <= 4 or calls[stream_name] % 16 == 0):
+            fmt = lambda v: " ".join(f"{t:.3f}" for t in v.tolist())  # noqa: E731
             print(
-                f"[cellpat] {stream_name} repeated in-cell pattern: fraction of within-cell "
-                f"variance mean={frac.mean():.3f} per channel=["
-                + " ".join(f"{v:.3f}" for v in frac.tolist())
-                + f"] | amplitude / field std mean={amp.mean():.4f} max={amp.max():.4f}",
+                f"[cellpat] {stream_name} planar=[{fmt(planar)}] | pattern=[{fmt(pattern)}] | "
+                f"edge=[{fmt(edge)}]",
                 flush=True,
             )
 
