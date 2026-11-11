@@ -2736,3 +2736,134 @@ def global_haar_energy_reshape(
             )
 
     return loss, loss_chs
+
+
+# ---------------------------------------------------------------------------------------
+# Healpix cell-pattern penalty
+# ---------------------------------------------------------------------------------------
+_CELLPAT_CACHE: dict = {}
+
+
+def _cellpat_geometry(target_coords_raw, healpix_level: int, nbins: int, stream_name: str):
+    """Cell index, in-cell offsets and in-cell position bin of every target point (cached)."""
+    from astropy_healpix import healpy as _hpy
+
+    lat = target_coords_raw[:, 0].detach().cpu().numpy().astype(np.float64)
+    lon = target_coords_raw[:, 1].detach().cpu().numpy().astype(np.float64)
+    key = (stream_name, healpix_level, nbins, lat.shape[0], float(lat.sum()), float(lon.sum()))
+    g = _CELLPAT_CACHE.get(key)
+    if g is None:
+        nside = 2**healpix_level
+        # same convention as the tokenizer (coords_to_hpyidxs): theta = colatitude, phi = lon + 180
+        theta = np.deg2rad(90.0 - lat)
+        phi = np.deg2rad(lon + 180.0)
+        ipix = _hpy.ang2pix(nside, theta, phi, nest=True)
+        th_c, ph_c = _hpy.pix2ang(nside, ipix, nest=True)
+        dy = -(theta - th_c)                                               # northward offset
+        dx = (np.mod(phi - ph_c + np.pi, 2 * np.pi) - np.pi) * np.sin(theta)  # eastward offset
+        _, inv = np.unique(ipix, return_inverse=True)
+        qs = np.linspace(0, 1, nbins + 1)[1:-1]
+        bx = np.searchsorted(np.quantile(dx, qs), dx)
+        by = np.searchsorted(np.quantile(dy, qs), dy)
+        g = {
+            "cell": torch.from_numpy(inv.astype(np.int64)),
+            "ncell": int(inv.max()) + 1,
+            "dx": torch.from_numpy((dx / (np.abs(dx).max() + 1e-30)).astype(np.float32)),
+            "dy": torch.from_numpy((dy / (np.abs(dy).max() + 1e-30)).astype(np.float32)),
+            "bin": torch.from_numpy((by * nbins + bx).astype(np.int64)),
+        }
+        if len(_CELLPAT_CACHE) > 16:
+            _CELLPAT_CACHE.clear()
+        _CELLPAT_CACHE[key] = g
+    return g
+
+
+def healpix_cell_pattern(
+    target: torch.Tensor,
+    pred: torch.Tensor,
+    target_coords_raw: torch.Tensor,
+    weights_channels: torch.Tensor | None,
+    weights_points: torch.Tensor | None,
+    healpix_level: int = 8,
+    nbins: int = 8,
+    min_points_per_cell: float = 16.0,
+    eps_rel: float = 1.0e-6,
+    stream_name: str = "",
+):
+    """
+    Penalty on an error pattern that repeats inside every healpix cell (grid imprint).
+
+    The latent has one token per healpix cell and the decoder knows where a point sits
+    inside its cell, so it can add a fixed function of the in-cell position to the output:
+    a regular mesh at the cell spacing. Real fields have no such pattern, hence it shows up
+    in the error e = pred - target as a non-zero mean over ALL cells at fixed in-cell
+    position, while ordinary forecast errors (different sign in every cell) average out.
+
+        d    = e - (mean of e over its cell)
+        M_b  = mean of d over all points in in-cell position bin b   (nbins x nbins bins)
+        loss = sum_b (n_b / N) M_b^2 / var_ref           per channel, then channel mean
+
+    var_ref (detached) is the variance of the TARGET inside cells after removing each
+    cell's own plane, so the loss reads "repeated-pattern variance as a fraction of the
+    true sub-cell variability" (~0.03-0.05 observed in forecasts, 0.000 in the autoencoder).
+
+    Streams with fewer than min_points_per_cell points per cell (e.g. ERA5 at its coarse
+    level) are skipped (loss 0). target_coords_raw: (N, 2) lat, lon in degrees.
+    """
+    N, C = target.shape
+    zero = (
+        torch.tensor(0.0, device=target.device, requires_grad=True),
+        torch.zeros(C, device=target.device),
+    )
+    if N == 0:
+        return zero
+    g = _cellpat_geometry(target_coords_raw, healpix_level, nbins, stream_name)
+    ncell = g["ncell"]
+    if N / max(ncell, 1) < min_points_per_cell:
+        return zero
+    dev = target.device
+    cell, bidx = g["cell"].to(dev), g["bin"].to(dev)
+    dx, dy = g["dx"].to(dev).unsqueeze(1), g["dy"].to(dev).unsqueeze(1)
+    pred = pred.float()
+    ok = torch.isfinite(target).all(dim=1) & torch.isfinite(pred).all(dim=(0, 2))
+    w = ok.float().unsqueeze(1)                                            # (N, 1)
+    nw = w.sum().clamp(min=1.0)
+    t = torch.where(ok.unsqueeze(1), target.float(), torch.zeros_like(target, dtype=torch.float32))
+    cnt = torch.zeros(ncell, 1, device=dev).index_add_(0, cell, w)
+
+    def csum(v):
+        return torch.zeros(ncell, v.shape[1], device=dev, dtype=v.dtype).index_add_(0, cell, v)
+
+    def within(v):                                                         # v - cell mean
+        return (v - (csum(v * w) / cnt.clamp(min=1.0))[cell]) * w
+
+    with torch.no_grad():
+        # reference: sub-cell variability of the target after removing each cell's plane
+        dt = within(t)
+        xc, yc = within(dx), within(dy)
+        sxx, syy, sxy = csum(xc * xc), csum(yc * yc), csum(xc * yc)
+        det = sxx * syy - sxy * sxy
+        det = torch.where(det.abs() > 1e-20, det, torch.ones_like(det))
+        sxd, syd = csum(xc * dt), csum(yc * dt)
+        a = (syy * sxd - sxy * syd) / det
+        b = (sxx * syd - sxy * sxd) / det
+        rt = dt - (a[cell] * xc + b[cell] * yc)
+        field_var = ((t - (t * w).sum(0) / nw) ** 2 * w).sum(0) / nw
+        var_ref = torch.maximum((rt**2).sum(0) / nw, eps_rel * field_var).clamp(min=1e-20)
+        nb = nbins * nbins
+        bcnt = torch.zeros(nb, 1, device=dev).index_add_(0, bidx, w)
+
+    loss_chs = torch.zeros(C, device=dev)
+    for ie in range(pred.shape[0]):
+        e = torch.where(ok.unsqueeze(1), pred[ie] - t, torch.zeros_like(t))
+        d = within(e)
+        M = torch.zeros(nb, C, device=dev, dtype=d.dtype).index_add_(0, bidx, d) / bcnt.clamp(min=1.0)
+        loss_chs = loss_chs + (M**2 * bcnt).sum(0) / nw / var_ref
+    loss_chs = loss_chs / pred.shape[0]
+
+    if weights_channels is not None:
+        wc = weights_channels.to(dev).float()
+        loss = (loss_chs * wc).sum() / wc.sum().clamp(min=1e-12)
+    else:
+        loss = loss_chs.mean()
+    return loss, loss_chs.detach()

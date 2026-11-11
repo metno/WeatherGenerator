@@ -120,6 +120,7 @@ class LossPhysical(LossModuleBase):
             "global_haar_ll_reshape_varweighted",
             "global_haar_energy_reshape",
             "global_fft_mse",
+            "healpix_cell_pattern",
         )
         self.loss_fcts = []
         for name, params in loss_fcts.items():
@@ -381,6 +382,24 @@ class LossPhysical(LossModuleBase):
             stream_name=stream_name,
         )
 
+    @staticmethod
+    def _loss_healpix_cell_pattern(
+        target, pred, target_coords_raw, weights_channels,
+        stream_name="", healpix_level=8, nbins=8, min_points_per_cell=16.0, eps_rel=1.0e-6,
+    ):
+        if target.shape[0] == 0:
+            return (
+                torch.tensor(0.0, device=target.device, requires_grad=True),
+                torch.zeros(target.shape[-1], device=target.device),
+            )
+        return loss_fns.healpix_cell_pattern(
+            target, pred, target_coords_raw,
+            weights_channels=weights_channels, weights_points=None,
+            healpix_level=healpix_level, nbins=nbins,
+            min_points_per_cell=min_points_per_cell, eps_rel=eps_rel,
+            stream_name=stream_name,
+        )
+
     def compute_loss(self, preds: dict, targets: dict, metadata) -> LossValues:
         """
         Computes the total loss for a given batch of predictions and corresponding
@@ -622,6 +641,18 @@ class LossPhysical(LossModuleBase):
                                 weights_channels, stream_name=stream_name,
                                 template_path=stream_info.get("template_path", ""),
                                 regrid_method=_regrid,
+                                **_ov,
+                            )
+
+                        elif loss_fct_name == "healpix_cell_pattern":
+                            # penalty on an error pattern repeated inside every healpix
+                            # cell; per-stream overrides via `cell_pattern_overrides`
+                            _ov = dict(loss_fct_params)
+                            _ov.update(stream_info.get("cell_pattern_overrides", {}))
+                            _ov.pop("template_path", None)
+                            loss_lfct, loss_lfct_chs = self._loss_healpix_cell_pattern(
+                                target, pred, targets_coords_batch[target_idx],
+                                weights_channels, stream_name=stream_name,
                                 **_ov,
                             )
 
