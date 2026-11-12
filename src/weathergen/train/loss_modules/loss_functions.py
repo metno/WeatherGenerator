@@ -2761,7 +2761,7 @@ def _cellpat_geometry(target_coords_raw, healpix_level: int, nbins: int, stream_
         th_c, ph_c = _hpy.pix2ang(nside, ipix, nest=True)
         dy = -(theta - th_c)                                               # northward offset
         dx = (np.mod(phi - ph_c + np.pi, 2 * np.pi) - np.pi) * np.sin(theta)  # eastward offset
-        _, inv = np.unique(ipix, return_inverse=True)
+        ucell, inv = np.unique(ipix, return_inverse=True)
         qs = np.linspace(0, 1, nbins + 1)[1:-1]
         bx = np.searchsorted(np.quantile(dx, qs), dx)
         by = np.searchsorted(np.quantile(dy, qs), dy)
@@ -2771,6 +2771,8 @@ def _cellpat_geometry(target_coords_raw, healpix_level: int, nbins: int, stream_
             "dx": torch.from_numpy((dx / (np.abs(dx).max() + 1e-30)).astype(np.float32)),
             "dy": torch.from_numpy((dy / (np.abs(dy).max() + 1e-30)).astype(np.float32)),
             "bin": torch.from_numpy((by * nbins + bx).astype(np.int64)),
+            "ucell": ucell.astype(np.int64),      # nested healpix index of each (compact) cell
+            "regions": {},                        # region_level -> (region of each cell, nregion)
         }
         if len(_CELLPAT_CACHE) > 16:
             _CELLPAT_CACHE.clear()
@@ -2789,6 +2791,8 @@ def healpix_cell_pattern(
     min_points_per_cell: float = 16.0,
     eps_rel: float = 1.0e-6,
     stream_name: str = "",
+    region_level: int | None = None,
+    region_min_cells: int = 8,
 ):
     """
     Penalty on an error pattern that repeats inside every healpix cell (grid imprint).
@@ -2806,6 +2810,22 @@ def healpix_cell_pattern(
     var_ref (detached) is the variance of the TARGET inside cells after removing each
     cell's own plane, so the loss reads "repeated-pattern variance as a fraction of the
     true sub-cell variability" (~0.03-0.05 observed in forecasts, 0.000 in the autoencoder).
+
+    region_level (None = as above, one average over the whole domain):
+    the pattern is measured separately inside each healpix cell of level `region_level`
+    (e.g. 5 -> groups of 64 level-8 cells). A pattern whose sign or strength changes from
+    region to region (e.g. dots that follow the wind) cancels in the domain-wide average
+    but not here. A pattern identical everywhere is seen by both, so the regional version
+    replaces the global one. With few cells per group ordinary errors no longer average
+    out, so M_b^2 is replaced by its unbiased estimate: the average product of the in-cell
+    patterns of two DIFFERENT cells of the group,
+
+        U_rb = (S_rb^2 - sum_c s_cb^2) / (n_rb^2 - sum_c n_cb^2)
+
+    (s_cb, n_cb: sum of d and number of points of cell c in bin b; S_rb, n_rb: the same
+    summed over the cells c of region r). Its expectation is 0 for errors unrelated between
+    cells. The channel total is clamped at 0 so that anti-correlated cells are not rewarded.
+    Regions with fewer than region_min_cells cells (domain border) are skipped.
 
     Streams with fewer than min_points_per_cell points per cell (e.g. ERA5 at its coarse
     level) are skipped (loss 0). target_coords_raw: (N, 2) lat, lon in degrees.
@@ -2865,12 +2885,48 @@ def healpix_cell_pattern(
         nb = nbins * nbins
         bcnt = torch.zeros(nb, 1, device=dev).index_add_(0, bidx, w)
 
+    regional = region_level is not None and 0 <= int(region_level) < int(healpix_level)
+    if regional:
+        with torch.no_grad():
+            rl = int(region_level)
+            if rl not in g["regions"]:
+                par = g["ucell"] >> (2 * (int(healpix_level) - rl))
+                _, rinv = np.unique(par, return_inverse=True)
+                g["regions"][rl] = (torch.from_numpy(rinv.astype(np.int64)), int(rinv.max()) + 1)
+            reg_of_cell, nreg = g["regions"][rl]
+            reg_of_cell = reg_of_cell.to(dev)
+            cb = cell * nb + bidx                                            # (N,) cell-bin index
+            rb_of_cb = (reg_of_cell.unsqueeze(1) * nb
+                        + torch.arange(nb, device=dev).unsqueeze(0)).reshape(-1)
+            n_cb = torch.zeros(ncell * nb, 1, device=dev).index_add_(0, cb, w)
+            n_rb = torch.zeros(nreg * nb, 1, device=dev).index_add_(0, rb_of_cb, n_cb)
+            n2_rb = torch.zeros(nreg * nb, 1, device=dev).index_add_(0, rb_of_cb, n_cb**2)
+            cells_in_reg = torch.zeros(nreg, 1, device=dev).index_add_(
+                0, reg_of_cell, (cnt > 0).float()
+            )
+            pairs = n_rb**2 - n2_rb                                          # ordered point pairs
+            use = (pairs > 0.5) & (
+                cells_in_reg.repeat_interleave(nb, dim=0) >= float(region_min_cells)
+            )
+            wgt = n_rb * use.float()
+            wgt = wgt / wgt.sum().clamp(min=1.0)
+            pairs = torch.where(use, pairs, torch.ones_like(pairs))
+
     loss_chs = torch.zeros(C, device=dev)
     for ie in range(pred.shape[0]):
         e = torch.where(ok.unsqueeze(1), pred[ie] - t, torch.zeros_like(t))
         d = deplane(e)
-        M = torch.zeros(nb, C, device=dev, dtype=d.dtype).index_add_(0, bidx, d) / bcnt.clamp(min=1.0)
-        loss_chs = loss_chs + (M**2 * bcnt).sum(0) / nw / var_ref
+        if regional:
+            s_cb = torch.zeros(ncell * nb, C, device=dev, dtype=d.dtype).index_add_(0, cb, d)
+            S_rb = torch.zeros(nreg * nb, C, device=dev, dtype=d.dtype).index_add_(0, rb_of_cb, s_cb)
+            Q_rb = torch.zeros(nreg * nb, C, device=dev, dtype=d.dtype).index_add_(
+                0, rb_of_cb, s_cb**2
+            )
+            U = (S_rb**2 - Q_rb) / pairs
+            loss_chs = loss_chs + torch.relu((U * wgt).sum(0)) / var_ref
+        else:
+            M = torch.zeros(nb, C, device=dev, dtype=d.dtype).index_add_(0, bidx, d) / bcnt.clamp(min=1.0)
+            loss_chs = loss_chs + (M**2 * bcnt).sum(0) / nw / var_ref
     loss_chs = loss_chs / pred.shape[0]
 
     if weights_channels is not None:

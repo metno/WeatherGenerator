@@ -1143,7 +1143,8 @@ class Model(torch.nn.Module):
         return cache[key]
 
     @torch.no_grad()
-    def _cell_pattern_diag(self, stream_name, pred, t_coords, tcs_lens, nbins: int = 8):
+    def _cell_pattern_diag(self, stream_name, pred, t_coords, tcs_lens, nbins: int = 8,
+                           domain=None):
         """
         Diagnostic (config cell_pattern_diag: true, evaluation only): grid imprint of the
         healpix cells on the prediction. Per channel, with d = prediction - cell mean:
@@ -1159,6 +1160,13 @@ class Model(torch.nn.Module):
                    the cell centre) divided by that in the inner third. Residuals of a
                    plane fit grow outwards for any curved field, so compare with the
                    autoencoder: a clearly larger ratio = extra structure at the cell edges.
+
+          regional as `pattern`, but measured separately inside each coarser healpix cell
+                   (config cell_pattern_region_level, default 5 = groups of 64 level-8
+                   cells) and then averaged. Sees patterns whose sign/strength changes
+                   from region to region (they cancel in `pattern`). Uses the average
+                   product between DIFFERENT cells of a group, so unrelated cell-to-cell
+                   variability does not count; small negative values are noise.
 
         Compare a forecast with the autoencoder (control) channel by channel.
         Prints [cellpat] lines.
@@ -1197,6 +1205,7 @@ class Model(torch.nn.Module):
         ok = ok_cell[cell]
         if ok.sum() < 1000:
             return
+        cell_ok = cell[ok]
         d, r, yzc, yz_ok = d[ok], r[ok], yzc[ok], yz[ok]
         n_ok = d.shape[0]
         var_d = (d**2).mean(0).clamp(min=1e-20)
@@ -1213,6 +1222,38 @@ class Model(torch.nn.Module):
         bcnt = torch.zeros(nb, device=dev).index_add_(0, bidx, torch.ones(n_ok, device=dev))
         M = torch.zeros(nb, C, device=dev).index_add_(0, bidx, r) / bcnt.clamp(min=1).unsqueeze(1)
         pattern = (M**2 * bcnt.unsqueeze(1)).sum(0) / n_ok / var_r
+        # the same inside each coarser cell (pairs of different cells of a region)
+        regional = None
+        rl = int(self.cf.get("cell_pattern_region_level", 5))
+        if domain is not None and 0 <= rl < int(domain.healpix_level) and ncell % len(domain) == 0:
+            nc = len(domain)
+            par = torch.as_tensor(
+                np.asarray(domain.active_cells, dtype=np.int64) >> (2 * (int(domain.healpix_level) - rl))
+            )
+            _, rinv = torch.unique(par, return_inverse=True)
+            nreg1 = int(rinv.max()) + 1
+            rinv = rinv.to(dev)
+            cidx = torch.arange(ncell, device=dev)
+            reg_of_cell = rinv[cidx % nc] + (cidx // nc) * nreg1          # regions per sample
+            nreg = nreg1 * (ncell // nc)
+            cb = cell_ok * nb + bidx
+            rb_of_cb = (reg_of_cell.unsqueeze(1) * nb
+                        + torch.arange(nb, device=dev).unsqueeze(0)).reshape(-1)
+            n_cb = torch.zeros(ncell * nb, device=dev).index_add_(0, cb, torch.ones(n_ok, device=dev))
+            n_rb = torch.zeros(nreg * nb, device=dev).index_add_(0, rb_of_cb, n_cb)
+            n2_rb = torch.zeros(nreg * nb, device=dev).index_add_(0, rb_of_cb, n_cb**2)
+            cells_in_reg = torch.zeros(nreg, device=dev).index_add_(
+                0, reg_of_cell, ok_cell.float()
+            ).repeat_interleave(nb)
+            pairs = n_rb**2 - n2_rb
+            use = (pairs > 0.5) & (cells_in_reg >= 8)
+            wgt = n_rb * use.float()
+            wgt = (wgt / wgt.sum().clamp(min=1.0)).unsqueeze(1)
+            pairs = torch.where(use, pairs, torch.ones_like(pairs)).unsqueeze(1)
+            s_cb = torch.zeros(ncell * nb, C, device=dev).index_add_(0, cb, r)
+            S_rb = torch.zeros(nreg * nb, C, device=dev).index_add_(0, rb_of_cb, s_cb)
+            Q_rb = torch.zeros(nreg * nb, C, device=dev).index_add_(0, rb_of_cb, s_cb**2)
+            regional = (((S_rb**2 - Q_rb) / pairs) * wgt).sum(0) / var_r
         # residual energy near the cell edge vs near the cell centre
         rho = yzc.norm(dim=1)
         q1, q2 = torch.quantile(rho[torch.randperm(n_ok, device=dev)[: min(n_ok, 200000)]],
@@ -1224,7 +1265,8 @@ class Model(torch.nn.Module):
             fmt = lambda v: " ".join(f"{t:.3f}" for t in v.tolist())  # noqa: E731
             print(
                 f"[cellpat] {stream_name} planar=[{fmt(planar)}] | pattern=[{fmt(pattern)}] | "
-                f"edge=[{fmt(edge)}]",
+                f"edge=[{fmt(edge)}]"
+                + ("" if regional is None else f" | regional=[{fmt(regional)}]"),
                 flush=True,
             )
 
@@ -2116,7 +2158,14 @@ class Model(torch.nn.Module):
                 and pred.shape[1] == t_coords.shape[0]
                 and pred.shape[1] > 0
             ):
-                self._cell_pattern_diag(stream_name, pred, t_coords, tcs_lens)
+                _lvl = getattr(self.encoder, "stream_encode_level", {}).get(
+                    stream_name, self.domain_pyramid.finest
+                )
+                try:
+                    _dom = self.domain_pyramid.domain(_lvl) if _lvl is not None else None
+                except Exception:
+                    _dom = None
+                self._cell_pattern_diag(stream_name, pred, t_coords, tcs_lens, domain=_dom)
 
             # recover batch dimension (ragged, so as list)
             pred = torch.split(pred, t_coords_lens, dim=1)

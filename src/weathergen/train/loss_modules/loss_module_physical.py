@@ -386,6 +386,7 @@ class LossPhysical(LossModuleBase):
     def _loss_healpix_cell_pattern(
         target, pred, target_coords_raw, weights_channels,
         stream_name="", healpix_level=8, nbins=8, min_points_per_cell=16.0, eps_rel=1.0e-6,
+        region_level=None, region_min_cells=8,
     ):
         if target.shape[0] == 0:
             return (
@@ -398,6 +399,7 @@ class LossPhysical(LossModuleBase):
             healpix_level=healpix_level, nbins=nbins,
             min_points_per_cell=min_points_per_cell, eps_rel=eps_rel,
             stream_name=stream_name,
+            region_level=region_level, region_min_cells=region_min_cells,
         )
 
     def compute_loss(self, preds: dict, targets: dict, metadata) -> LossValues:
