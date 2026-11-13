@@ -12,6 +12,7 @@
 
 import logging
 from collections import defaultdict
+from functools import partial
 
 import numpy as np
 import torch
@@ -60,7 +61,9 @@ class LossPhysical(LossModuleBase):
         # dynamically load loss functions based on configuration and stage
         self.loss_fcts = [
             [
-                getattr(loss_fns, name),
+                partial(loss_fns.kernel_crps, alpha=params.get("alpha"))
+                if name == "kernel_crps"
+                else getattr(loss_fns, name),
                 params.get("weight", 1.0),
                 name,
             ]

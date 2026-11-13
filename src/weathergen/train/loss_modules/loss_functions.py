@@ -73,6 +73,7 @@ def kernel_crps(
     weights_channels: torch.Tensor | None,
     weights_points: torch.Tensor | None,
     fair=True,
+    alpha: float | None = None,
 ):
     """
     Compute kernel CRPS
@@ -82,6 +83,7 @@ def kernel_crps(
     pred : shape ( ens_dim , num_data_points , num_channels)
     weights_channels : shape = (num_channels,)
     weights_points : shape = (num_data_points)
+    alpha : blend between standard (0) and fair (1) CRPS; overrides fair when provided
 
     Returns:
     loss: scalar - overall weighted CRPS
@@ -91,6 +93,9 @@ def kernel_crps(
     ens_size = preds.shape[0]
     assert ens_size > 1, "Ensemble size has to be greater than 1 for kernel CRPS."
     assert len(preds.shape) == 3, "if data has batch dimension, remove unsqueeze() below"
+    alpha = (1.0 if fair else 0.0) if alpha is None else alpha
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError("CRPS alpha must be in the range [0, 1].")
 
     # replace NaN by 0
     mask_nan = ~torch.isnan(targets)
@@ -103,7 +108,7 @@ def kernel_crps(
 
     mae = torch.mean(torch.abs(targets[..., None] - preds), dim=-1)
 
-    ens_n = -1.0 / (ens_size * (ens_size - 1)) if fair else -1.0 / (ens_size**2)
+    ens_n = -(alpha / (ens_size * (ens_size - 1)) + (1.0 - alpha) / ens_size**2)
     abs = torch.abs
     ens_var = torch.zeros(size=preds.shape[:-1], device=preds.device)
     # loop to reduce memory usage
