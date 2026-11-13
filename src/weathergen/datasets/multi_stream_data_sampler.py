@@ -22,12 +22,14 @@ from weathergen.datasets.batch import ModelBatch
 from weathergen.datasets.data_reader_anemoi import DataReaderAnemoi
 from weathergen.datasets.data_reader_base import (
     DataReaderBase,
+    ReaderData,
     TimeWindowHandler,
     TIndex,
 )
 from weathergen.datasets.data_reader_obs import DataReaderObs
 from weathergen.datasets.domain import Domain
 from weathergen.datasets.domain_pyramid import build_domain_pyramid
+from weathergen.datasets.increment_baseline import IncrementBaseline, has_increment_baseline
 from weathergen.datasets.masking import Masker
 from weathergen.datasets.stream_data import StreamData, spoof
 from weathergen.datasets.stream_levels import assign_stream_levels
@@ -82,14 +84,39 @@ def collect_datasources(
         else:
             assert False, "invalid value for argument `type`"
 
+        # increment learning: baseline appended as extra target channels (see
+        # increment_baseline.py); computed on the reader grid, before cropping / shuffling
+        with_baseline = type == "target" and has_increment_baseline(ds.stream_info)
+
         # get source (of potentially multi-step length)
+        rdata = get_reader_data(idx)
+        if with_baseline:
+            baseline = getattr(ds, "increment_baseline", None)
+            if baseline is not None:
+                b, valid = baseline(rdata)
+            else:  # reader without data: no rows anyway
+                b, valid = np.full_like(rdata.data, np.nan), np.ones(len(rdata.data), bool)
+            rdata.data = np.concatenate([rdata.data, b.astype(rdata.data.dtype)], axis=1)
+            if not valid.all():
+                # no baseline at these times: drop the targets (all dropped -> spoofed sample)
+                rdata = ReaderData(
+                    rdata.coords[valid],
+                    rdata.geoinfos[valid],
+                    rdata.data[valid],
+                    rdata.datetimes[valid],
+                )
         rdata = (
-            get_reader_data(idx)
-            .crop_to_domain(domain)
+            rdata.crop_to_domain(domain)
             .shuffle(rng, shuffle, num_subset)
             .remove_nan_coords_and_geoinfos()
         )
-        rdata.data = normalize_channels(rdata.data)
+        if with_baseline:
+            # target and baseline share the target normalisation; no baseline -> 0 (mean)
+            n = rdata.data.shape[1] // 2
+            rdata.data[:, :n] = normalize_channels(rdata.data[:, :n])
+            rdata.data[:, n:] = np.nan_to_num(normalize_channels(rdata.data[:, n:]), nan=0.0)
+        else:
+            rdata.data = normalize_channels(rdata.data)
         rdata.geoinfos = ds.normalize_geoinfos(rdata.geoinfos)
         rdatas += [rdata]
 
@@ -336,6 +363,16 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                     )
                 ds = dataset(filename=filename, **kwargs)
 
+                # increment learning: interpolated baseline for the target channels
+                if has_increment_baseline(stream_info) and ds.length() > 0:
+                    if not isinstance(ds, DataReaderAnemoi):
+                        raise ValueError(
+                            f"increment_baseline ({stream_name}): only anemoi target streams"
+                        )
+                    ds.increment_baseline = IncrementBaseline(
+                        stream_info["increment_baseline"], ds, cf.get("data_paths", [])
+                    )
+
                 streams_datasets[stream_name].readers += [ds]
 
             stream_info[str(self._stage) + "_source_channels"] = ds.source_channels
@@ -543,15 +580,22 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             if token_data[0] is None and token_data[1] is None:
                 continue
 
+            with_baseline = has_increment_baseline(stream_info)
+
             if "target_coords" in mode:
-                (tc, tc_l) = self._tok(stream_info).get_target_coords(
+                (tc, tc_l, *tdata) = self._tok(stream_info).get_target_coords(
                     stream_info,
                     rdata,
                     token_data,
                     (time_win_target.start, time_win_target.end),
                     target_mask,
+                    return_data=with_baseline,
                 )
                 stream_data.add_target_coords(self._stage, timestep_idx, tc, tc_l, rdata.is_spoof)
+                if with_baseline:
+                    # baseline at the target coords, in the same point order as the predictions
+                    n = tdata[0].shape[-1] // 2
+                    stream_data.add_target_baseline(timestep_idx, tdata[0][:, n:])
 
             if "target_values" in mode:
                 (tt_cells, tt_t, tt_c, idxs_inv) = self._tok(stream_info).get_target_values(
@@ -561,6 +605,9 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                     (time_win_target.start, time_win_target.end),
                     target_mask,
                 )
+                if with_baseline:
+                    # targets only; the baseline channels are carried by the target coords
+                    tt_cells = tt_cells[:, : tt_cells.shape[-1] // 2]
 
                 stream_data.add_target_values(
                     self._stage, timestep_idx, tt_cells, tt_c, tt_t, idxs_inv, rdata.is_spoof
@@ -683,11 +730,14 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 # work around for https://github.com/pytorch/pytorch/issues/158719
                 # create non-empty mean data instead of empty tensor
                 time_win = self.time_window_handler.window(step_forecast_dt)
+                num_channels = len(stream_ds[0].mean[stream_ds[0].target_idx])
+                if has_increment_baseline(stream_ds[0].stream_info):
+                    num_channels *= 2  # target + baseline (zero = mean)
                 rdata = spoof(
                     healpix_level,
                     time_win.start,
                     stream_ds[0].get_geoinfo_size(),
-                    len(stream_ds[0].mean[stream_ds[0].target_idx]),
+                    num_channels,
                     domain=domain,
                 )
                 rdata.is_spoof = True

@@ -98,6 +98,9 @@ class StreamData:
             torch.tensor([0 for _ in range(self.healpix_cells)]) for _ in range(output_steps)
         ]
         self.target_tokens = [torch.tensor([]) for _ in range(output_steps)]
+        # increment learning: baseline at the target coords (normalised, same point order as
+        # target_coords); the prediction is baseline + decoder output (see increment_baseline.py)
+        self.target_baseline = [torch.tensor([]) for _ in range(output_steps)]
         self.idxs_inv = [torch.tensor([], dtype=torch.int64) for _ in range(output_steps)]
 
         # source tokens per cell
@@ -120,6 +123,7 @@ class StreamData:
         self.target_coords = _pin_tensor_list(self.target_coords)
         self.target_coords_lens = _pin_tensor_list(self.target_coords_lens)
         self.target_tokens = _pin_tensor_list(self.target_tokens)
+        self.target_baseline = _pin_tensor_list(self.target_baseline)
         self.idxs_inv = _pin_tensor_list(self.idxs_inv)
         self.target_coords_raw = _pin_tensor_list(self.target_coords_raw)
 
@@ -148,6 +152,7 @@ class StreamData:
         self.target_coords = [t.to(dv, non_blocking=True) for t in self.target_coords]
         self.target_coords_lens = [t.to(dv, non_blocking=True) for t in self.target_coords_lens]
         self.target_tokens = [t.to(dv, non_blocking=True) for t in self.target_tokens]
+        self.target_baseline = [t.to(dv, non_blocking=True) for t in self.target_baseline]
 
         # move to device if source data is present
         if not np.array([s is None for s in self.source_tokens_cells]).all():
@@ -330,6 +335,13 @@ class StreamData:
         self.target_coords_lens[fstep] = target_coords_per_cell
 
         self.target_is_spoof[fstep] = is_spoof
+
+    def add_target_baseline(self, fstep: int, baseline: torch.Tensor) -> None:
+        """
+        Add the increment-learning baseline at the target coords of forecast step fstep:
+        torch.tensor( number of target points, number of target channels ), normalised
+        """
+        self.target_baseline[fstep] = baseline
 
     def target_empty(self) -> bool:
         """

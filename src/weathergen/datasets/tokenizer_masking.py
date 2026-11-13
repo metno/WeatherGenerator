@@ -166,7 +166,12 @@ class TokenizerMasking(Tokenizer):
         token_data,
         time_win: tuple,
         cell_mask,
+        return_data: bool = False,
     ):
+        """
+        return_data: also return the (masked) data values, in the order of the target coords
+        (used for the increment-learning baseline, see increment_baseline.py)
+        """
         # create tokenization index
         (idxs_cells, idxs_cells_lens) = token_data
 
@@ -175,7 +180,7 @@ class TokenizerMasking(Tokenizer):
         )
 
         # TODO: split up
-        _, _, _, coords_local, coords_per_cell = tokenize_apply_mask_target(
+        data, _, _, coords_local, coords_per_cell = tokenize_apply_mask_target(
             stream_info["stream_id"],
             self.hl_target,
             idxs_cells,
@@ -192,6 +197,8 @@ class TokenizerMasking(Tokenizer):
             global_coords=self.global_coords,
         )
 
+        if return_data:
+            return (coords_local, coords_per_cell, data)
         return (coords_local, coords_per_cell)
 
     def get_target_values(

@@ -1113,11 +1113,33 @@ class Model(torch.nn.Module):
                     # final prediction head to map back to physical space
                     pred = self.pred_heads[stream_name](tc_tokens)
 
+                # increment learning: the decoder predicts the increment w.r.t. an
+                # interpolated baseline (see datasets/increment_baseline.py)
+                if self.streams[stream_name].get("increment_baseline") is not None:
+                    pred = self._add_increment_baseline(pred, batch, stream_name, step)
+
             # recover batch dimension (ragged, so as list)
             pred = torch.split(pred, t_coords_lens, dim=1)
             output.add_physical_prediction(step, stream_name, pred)
 
         return output
+
+    @staticmethod
+    def _add_increment_baseline(pred, batch, stream_name: str, step: int) -> torch.Tensor:
+        """
+        pred (ensemble, target points, channels) = decoder increment -> baseline + increment.
+        The baseline is in the normalised space of the stream and in the point order of the
+        target coords (both are tokenised together in the data loader). Added in float32 so
+        that the (large) baseline is not rounded in mixed precision.
+        """
+        baseline = torch.cat(
+            [sample.streams_data[stream_name].target_baseline[step] for sample in batch.samples]
+        ).to(device=pred.device, dtype=torch.float32)
+        assert baseline.shape == pred.shape[1:], (
+            f"increment_baseline ({stream_name}): baseline {tuple(baseline.shape)} does not "
+            f"match prediction {tuple(pred.shape)}"
+        )
+        return pred.to(torch.float32) + baseline.unsqueeze(0)
 
     def predict_decoders_kv_multi_level(
         self, model_params, stream_name: str, tokens_lvl: dict, batch_size: int
