@@ -40,12 +40,15 @@ class NoiseInjector(nn.Module):
         noise_dim: int = 16,
         hidden_dim: int = 64,
         noise_std: float = 1.0,
+        seed: int | None = None,
     ) -> None:
         super().__init__()
         if noise_dim <= 0 or hidden_dim <= 0 or noise_std < 0:
             raise ValueError("Noise dimensions must be positive and noise_std nonnegative.")
         self.noise_dim = noise_dim
         self.noise_std = noise_std
+        self.seed = seed
+        self._generator = None
         self.noise_mlp = nn.Sequential(
             nn.Linear(noise_dim, hidden_dim),
             nn.GELU(),
@@ -55,9 +58,19 @@ class NoiseInjector(nn.Module):
         self.projection = nn.Linear(latent_dim + noise_dim, latent_dim)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        noise = torch.randn(
-            (*tokens.shape[:-1], self.noise_dim), device=tokens.device, dtype=tokens.dtype
-        ) * self.noise_std
+        if self.seed is not None and (
+            self._generator is None or self._generator.device != tokens.device
+        ):
+            self._generator = torch.Generator(device=tokens.device).manual_seed(self.seed)
+        noise = (
+            torch.randn(
+                (*tokens.shape[:-1], self.noise_dim),
+                device=tokens.device,
+                dtype=tokens.dtype,
+                generator=self._generator,
+            )
+            * self.noise_std
+        )
         noise = self.noise_mlp(noise)
         return self.projection(torch.cat((tokens, noise), dim=-1))
 

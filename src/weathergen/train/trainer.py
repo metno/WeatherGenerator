@@ -50,7 +50,7 @@ from weathergen.train.utils import (
     get_batch_size_from_config,
     get_target_idxs_from_cfg,
 )
-from weathergen.utils.distributed import is_root
+from weathergen.utils.distributed import is_ensemble_root, is_root
 from weathergen.utils.inference_logger import EXTRA_INFERENCE_WRITERS
 from weathergen.utils.performance import NullThroughputTracker, ThroughputTracker
 from weathergen.utils.train_logger import (
@@ -225,6 +225,8 @@ class Trainer(TrainerBase):
         # Get world_size of previous, to be continued run before
         # world_size gets overwritten by current setting during init_ddp()
         self.world_size_original = cf.get("world_size_original", cf.get("world_size", None))
+        if cf.get("noise_injector", {}).get("member_parallel", False):
+            self.world_size_original = cf.data_parallel_size
         cf.world_size_original = self.world_size_original
 
         self.log_grad_norms = cf.train_logging.get("log_grad_norms", False)
@@ -303,7 +305,7 @@ class Trainer(TrainerBase):
         num_samples_write = mode_cfg.get("output", {}).get("num_samples", 0) * batch_size
         # This assumes that you only have a physical loss, else this breaks
         compute_full_loss = mode_cfg.get("compute_full_validation_loss", True)
-        should_write_output = not is_diffusion and bidx < num_samples_write
+        should_write_output = not is_diffusion and bidx < num_samples_write and is_ensemble_root()
         if should_write_output:
             denormalize_data_fct = (
                 (lambda x0, x1: x1)
@@ -563,7 +565,7 @@ class Trainer(TrainerBase):
             LearningRateScheduler(
                 optimizer,
                 self.batch_size_per_gpu,
-                cf.world_size,
+                cf.get("data_parallel_size", cf.world_size),
                 cf.general.istep,
                 lr_steps,
                 lr_cfg,
@@ -584,7 +586,10 @@ class Trainer(TrainerBase):
         self.loss_calculator_val = LossCalculator(cf, val_cfg, VAL, device=self.device)
 
         # recover mini_epoch when continuing run
-        if self.world_size_original is None:
+        if (
+            cf.get("noise_injector", {}).get("member_parallel", False)
+            or self.world_size_original is None
+        ):
             mini_epoch_base = int(self.cf.general.istep / len(self.data_loader))
         else:
             len_per_rank = (
@@ -825,7 +830,8 @@ class Trainer(TrainerBase):
         with torch.no_grad():
             # print progress bar but only in interactive mode, i.e. when without ddp
             with tqdm.tqdm(
-                total=len(self.data_loader_validation) * self.cf.world_size,
+                total=len(self.data_loader_validation)
+                * cf.get("data_parallel_size", cf.world_size),
                 disable=self.cf.rank > 0,
                 desc="validation samples",
                 position=0,
@@ -919,7 +925,7 @@ class Trainer(TrainerBase):
                         targets_and_aux=targets_and_auxs,
                         metadata=extract_batch_metadata(batch),
                     )
-                    pbar.update(batch_size * self.cf.world_size)
+                    pbar.update(batch_size * cf.get("data_parallel_size", cf.world_size))
 
                     if (bidx * batch_size) > mode_cfg.samples_per_mini_epoch:
                         break

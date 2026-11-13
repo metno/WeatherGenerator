@@ -62,6 +62,8 @@ fe_layer_norm_after_blocks: []  # Index starts at 0. Thus, [3] adds a LayerNorm 
 fe_impute_latent_noise_std: 0.0  # 1e-4
 noise_injector:
   enabled: false
+  ensemble_size: 1
+  member_parallel: false
   noise_dim: 16
   hidden_dim: 64
   noise_std: 1.0

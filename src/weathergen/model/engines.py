@@ -621,6 +621,11 @@ class ForecastingEngine(torch.nn.Module):
                 noise_dim=noise_cfg.get("noise_dim", 16),
                 hidden_dim=noise_cfg.get("hidden_dim", 64),
                 noise_std=noise_cfg.get("noise_std", 1.0),
+                seed=(
+                    int(self.cf.data_loading.rng_seed) + self.cf.rank
+                    if noise_cfg.get("member_parallel", False)
+                    else None
+                ),
             )
 
         global_rate = int(1 / self.cf.forecast_att_dense_rate)

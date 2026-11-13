@@ -13,6 +13,7 @@ import logging
 import math
 import typing
 import warnings
+from dataclasses import dataclass
 
 import astropy_healpix as hp
 import astropy_healpix.healpy
@@ -45,7 +46,12 @@ from weathergen.model.engines import (
 )
 from weathergen.model.layers import MLP, NamedLinear
 from weathergen.model.utils import get_num_parameters
-from weathergen.utils.distributed import is_root
+from weathergen.utils.distributed import (
+    gather_ensemble_predictions,
+    get_ensemble_parallel_size,
+    is_root,
+    validate_ensemble_targets,
+)
 from weathergen.utils.utils import get_dtype, is_stream_reconstructed
 
 logger = logging.getLogger(__name__)
@@ -53,6 +59,7 @@ logger = logging.getLogger(__name__)
 type StreamName = str
 
 
+@dataclass(init=False, repr=False, eq=False)
 class ModelOutput:
     """
     Representation of model output
@@ -355,6 +362,21 @@ class Model(torch.nn.Module):
 
         self.cf = cf
         self.dtype = get_dtype(self.cf.attention_dtype)
+        noise_cfg = cf.get("noise_injector", {})
+        self.noise_ensemble_size = (
+            noise_cfg.get("ensemble_size", 1) if noise_cfg.get("enabled", False) else 1
+        )
+        if not isinstance(self.noise_ensemble_size, int) or self.noise_ensemble_size < 1:
+            raise ValueError("noise_injector.ensemble_size must be a positive integer.")
+        self.member_parallel = noise_cfg.get("member_parallel", False)
+        if self.member_parallel and get_ensemble_parallel_size() != self.noise_ensemble_size:
+            raise ValueError("Initialize an ensemble process group before creating the model.")
+        self.local_noise_ensemble_size = 1 if self.member_parallel else self.noise_ensemble_size
+        if self.noise_ensemble_size > 1:
+            if cf.get("diffusion", {}).get("enabled", False) or cf.fe_num_blocks < 1:
+                raise ValueError("Noise ensembles require a non-diffusion forecast engine.")
+            if list(cf.training_config.training_mode) != ["masking"]:
+                raise ValueError("Noise ensembles currently support physical-space training only.")
         self.sources_size = sources_size
         self.targets_num_channels = targets_num_channels
         self.targets_coords_size = targets_coords_size
@@ -553,7 +575,7 @@ class Model(torch.nn.Module):
                         dims_embed[-1],
                         self.targets_num_channels[i_stream],
                         si["pred_head"]["num_layers"],
-                        si["pred_head"]["ens_size"],
+                        1 if self.noise_ensemble_size > 1 else si["pred_head"]["ens_size"],
                         norm_type=cf.norm_type,
                         final_activation=final_activation,
                         stream_name=stream_name,
@@ -608,7 +630,7 @@ class Model(torch.nn.Module):
                         dims_embed[-1],
                         self.targets_num_channels[i_stream],
                         si["pred_head"]["num_layers"],
-                        si["pred_head"]["ens_size"],
+                        1 if self.noise_ensemble_size > 1 else si["pred_head"]["ens_size"],
                         norm_type=cf.norm_type,
                         final_activation=final_activation,
                         stream_name=stream_name,
@@ -1009,6 +1031,8 @@ class Model(torch.nn.Module):
             shape = (len(source_samples), source_samples.get_num_steps(), *tokens.shape[1:])
             # collapse along input step dimension
             tokens = tokens.reshape(shape)
+            if self.local_noise_ensemble_size > 1:
+                tokens = tokens.repeat(self.local_noise_ensemble_size, 1, 1, 1)
             # reshape intermediates the same way as tokens
             for i, inter in enumerate(intermediates):
                 intermediates[i] = inter.reshape(shape).sum(axis=1)
@@ -1167,6 +1191,8 @@ class Model(torch.nn.Module):
             t_coords_lens = [len(t) for t in t_coords]
             t_coords = torch.cat(t_coords)
 
+            if self.member_parallel:
+                validate_ensemble_targets(t_coords, t_coords_lens)
             if len(t_coords) == 0:
                 continue
 
@@ -1219,10 +1245,16 @@ class Model(torch.nn.Module):
                     pred = self.pred_heads[stream_name](tc_tokens)
 
             # recover batch dimension (ragged, so as list)
+            if self.member_parallel:
+                pred = gather_ensemble_predictions(pred)
             pred = torch.split(pred, t_coords_lens, dim=1)
+            if self.local_noise_ensemble_size > 1:
+                pred = tuple(
+                    torch.cat(pred[sample_idx::n_real], dim=0) for sample_idx in range(n_real)
+                )
             # out_step (not chunk_idx derived from the constant `step`) so that decoding the
             # same real forecast step at several out_steps (e.g. one per ODE denoising step in
             # diffusion) doesn't repeatedly overwrite a single slot.
-            output.add_physical_prediction(out_step, stream_name, pred)
+            output.add_physical_prediction(output.chunk_idx(out_step), stream_name, pred)
 
         return output

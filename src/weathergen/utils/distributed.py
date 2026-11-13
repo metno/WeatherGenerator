@@ -8,10 +8,105 @@
 # nor does it submit to any jurisdiction.
 
 
+import hashlib
+
 import torch
 import torch.distributed as dist
 
 SYNC_TIMEOUT_SEC = 60 * 60  # 1 hour
+_ENSEMBLE_GROUP: dist.ProcessGroup | None = None
+
+
+class _GatherEnsemble(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, predictions, group):
+        ctx.group = group
+        members = [torch.empty_like(predictions) for _ in range(dist.get_world_size(group))]
+        dist.all_gather(members, predictions.contiguous(), group=group)
+        return torch.cat(members, dim=0)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        gradients = grad_output.contiguous().clone()
+        dist.all_reduce(gradients, op=dist.ReduceOp.SUM, group=ctx.group)
+        local = gradients.chunk(dist.get_world_size(ctx.group), dim=0)[dist.get_rank(ctx.group)]
+        return local.contiguous(), None
+
+
+def init_ensemble_parallel(cf):
+    """Assign contiguous member ranks to each logical data-parallel sample batch."""
+    global _ENSEMBLE_GROUP
+    _ENSEMBLE_GROUP = None
+    noise_cfg = cf.get("noise_injector", {})
+    size = noise_cfg.get("ensemble_size", 1) if noise_cfg.get("member_parallel", False) else 1
+    if not isinstance(size, int) or size < 1:
+        raise ValueError("noise_injector.ensemble_size must be a positive integer.")
+    if noise_cfg.get("member_parallel", False) and size < 2:
+        raise ValueError("Member parallelism requires at least two ensemble members.")
+    world_size = get_world_size()
+    if size > 1:
+        if not noise_cfg.get("enabled", False):
+            raise ValueError("Member parallelism requires noise_injector.enabled.")
+        if world_size % size:
+            raise ValueError("Distributed world size must be divisible by the ensemble size.")
+        for start in range(0, world_size, size):
+            ranks = list(range(start, start + size))
+            group = dist.new_group(ranks=ranks)
+            if get_rank() in ranks:
+                _ENSEMBLE_GROUP = group
+    cf.data_parallel_rank = get_rank() // size
+    cf.data_parallel_size = world_size // size
+    return cf
+
+
+def get_ensemble_parallel_size() -> int:
+    return 1 if _ENSEMBLE_GROUP is None else dist.get_world_size(_ENSEMBLE_GROUP)
+
+
+def is_ensemble_root() -> bool:
+    return _ENSEMBLE_GROUP is None or dist.get_rank(_ENSEMBLE_GROUP) == 0
+
+
+def validate_ensemble_targets(coordinates: torch.Tensor, lengths: list[int]) -> None:
+    """Reject different target layouts before any member skips an empty decoder call."""
+    if _ENSEMBLE_GROUP is None:
+        return
+    digest = hashlib.sha256(
+        coordinates.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+    )
+    digest.update(torch.tensor(lengths, dtype=torch.int64).numpy().tobytes())
+    signature = torch.tensor(list(digest.digest()), dtype=torch.uint8, device=coordinates.device)
+    signatures = [torch.empty_like(signature) for _ in range(get_ensemble_parallel_size())]
+    dist.all_gather(signatures, signature, group=_ENSEMBLE_GROUP)
+    if any(not torch.equal(signature, other) for other in signatures):
+        raise ValueError("Ensemble members must use identical target coordinates and lengths.")
+
+
+def gather_ensemble_predictions(
+    predictions: torch.Tensor,
+    target_coordinates: torch.Tensor | None = None,
+    target_lengths: list[int] | None = None,
+) -> torch.Tensor:
+    """Gather members with backward communication; DDP/FSDP averages weight gradients."""
+    if _ENSEMBLE_GROUP is None:
+        return predictions
+    if target_coordinates is not None:
+        validate_ensemble_targets(target_coordinates, target_lengths or [])
+    ndim = torch.tensor([predictions.ndim], dtype=torch.int64, device=predictions.device)
+    dimensions = [torch.empty_like(ndim) for _ in range(get_ensemble_parallel_size())]
+    dist.all_gather(dimensions, ndim, group=_ENSEMBLE_GROUP)
+    if any(not torch.equal(ndim, other) for other in dimensions):
+        raise ValueError("Ensemble members must predict identical target shapes.")
+    shape = torch.tensor(predictions.shape, dtype=torch.int64, device=predictions.device)
+    shapes = [torch.empty_like(shape) for _ in range(get_ensemble_parallel_size())]
+    dist.all_gather(shapes, shape, group=_ENSEMBLE_GROUP)
+    if any(not torch.equal(shape, other) for other in shapes):
+        raise ValueError("Ensemble members must predict identical target shapes.")
+    if torch.is_grad_enabled() and predictions.requires_grad:
+        return _GatherEnsemble.apply(predictions, _ENSEMBLE_GROUP)
+    members = [torch.empty_like(predictions) for _ in shapes]
+    dist.all_gather(members, predictions.contiguous(), group=_ENSEMBLE_GROUP)
+    return torch.cat(members, dim=0)
 
 
 def is_root(pg: dist.ProcessGroup | None = None) -> bool:
