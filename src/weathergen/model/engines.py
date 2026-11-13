@@ -28,7 +28,7 @@ from weathergen.model.embeddings import (
     StreamEmbedLinear,
     StreamEmbedTransformer,
 )
-from weathergen.model.layers import MLP, KwargLayerNorm
+from weathergen.model.layers import MLP, KwargLayerNorm, NoiseInjector
 from weathergen.model.utils import ActivationFactory
 from weathergen.utils.utils import get_dtype
 
@@ -611,6 +611,18 @@ class ForecastingEngine(torch.nn.Module):
         _diffusion_latent_dim = diff_cf.get("latent_dim") or self.cf.ae_global_dim_embed
         _inner_dim = 2 * _diffusion_latent_dim if _concat_hd else _diffusion_latent_dim
 
+        noise_cfg = self.cf.get("noise_injector", {})
+        self.noise_injector = None
+        if noise_cfg.get("enabled", False):
+            if diff_cf.get("enabled", False):
+                raise ValueError("noise_injector is only supported for non-diffusion forecasts.")
+            self.noise_injector = NoiseInjector(
+                latent_dim=_inner_dim,
+                noise_dim=noise_cfg.get("noise_dim", 16),
+                hidden_dim=noise_cfg.get("hidden_dim", 64),
+                noise_std=noise_cfg.get("noise_std", 1.0),
+            )
+
         global_rate = int(1 / self.cf.forecast_att_dense_rate)
         if mode_cfg.get("forecast", {}).get("policy") is not None:
             for i in range(self.cf.fe_num_blocks):
@@ -729,6 +741,9 @@ class ForecastingEngine(torch.nn.Module):
         forecast_residual = self.cf.get("forecast_residual", False)
         if forecast_residual:
             tokens_in = tokens
+
+        if self.noise_injector is not None:
+            tokens = self.noise_injector(tokens)
 
         diff_cf = self.cf.get("diffusion", {})
         if diff_cf.get("enabled", False):

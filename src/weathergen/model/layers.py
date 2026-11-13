@@ -31,6 +31,37 @@ import torch.nn as nn
 from weathergen.model.norms import AdaLayerNorm, AdaLNZero, RMSNorm, SwiGLU
 
 
+class NoiseInjector(nn.Module):
+    """Project latent tokens concatenated with learned Gaussian noise features."""
+
+    def __init__(
+        self,
+        latent_dim: int,
+        noise_dim: int = 16,
+        hidden_dim: int = 64,
+        noise_std: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if noise_dim <= 0 or hidden_dim <= 0 or noise_std < 0:
+            raise ValueError("Noise dimensions must be positive and noise_std nonnegative.")
+        self.noise_dim = noise_dim
+        self.noise_std = noise_std
+        self.noise_mlp = nn.Sequential(
+            nn.Linear(noise_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, noise_dim),
+            nn.LayerNorm(noise_dim),
+        )
+        self.projection = nn.Linear(latent_dim + noise_dim, latent_dim)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        noise = torch.randn(
+            (*tokens.shape[:-1], self.noise_dim), device=tokens.device, dtype=tokens.dtype
+        ) * self.noise_std
+        noise = self.noise_mlp(noise)
+        return self.projection(torch.cat((tokens, noise), dim=-1))
+
+
 class NamedLinear(torch.nn.Module):
     def __init__(self, name: str | None = None, **kwargs):
         super(NamedLinear, self).__init__()
