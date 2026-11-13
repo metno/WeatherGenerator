@@ -14,7 +14,12 @@ from flash_attn import flash_attn_func, flash_attn_varlen_func
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 from weathergen.model.norms import AdaLayerNorm, RMSNorm
-from weathergen.model.positional_encoding import rotary_pos_emb_2d
+from weathergen.model.positional_encoding import (
+    apply_rotary_2d_single,
+    rope_2d_wavelength_freqs,
+    rotary_cos_sin_2d_wavelengths,
+    rotary_pos_emb_2d,
+)
 
 """
 Attention blocks used by WeatherGenerator.
@@ -394,7 +399,18 @@ class MultiCrossAttentionHeadVarlen(torch.nn.Module):
         attention_dtype=torch.bfloat16,
         adaln_zero_init: bool = False,
         adaln_with_gate: bool = False,
+        with_2d_rope: bool = False,
+        rope_min_wavelength: float = 0.25,
+        rope_max_wavelength: float = 64.0,
     ):
+        """
+        with_2d_rope: 2D RoPE between queries and keys. The caller passes coords_q (one row
+        per query) and coords_kv (one row per key), both (N, 2) = (y, x) in the same units
+        (for the decoder: units of healpix cells). q is rotated by its coordinates, k by its
+        own, so the attention score depends only on the offset between the two. Wavelengths
+        are a geometric series from rope_min_wavelength to rope_max_wavelength (same units).
+        No trainable weights are added.
+        """
         super(MultiCrossAttentionHeadVarlen, self).__init__()
 
         self.num_heads = num_heads
@@ -447,7 +463,25 @@ class MultiCrossAttentionHeadVarlen(torch.nn.Module):
         self.dtype = attention_dtype
         assert with_flash, "Only flash attention supported at the moment"
 
-    def forward(self, x_q, x_kv, x_q_lens=None, x_kv_lens=None, ada_ln_aux=None):
+        self.with_2d_rope = with_2d_rope
+        self.rope_min_wavelength = float(rope_min_wavelength)
+        self.rope_max_wavelength = float(rope_max_wavelength)
+        if self.with_2d_rope:
+            assert self.dim_head_proj % 4 == 0, (
+                "2D RoPE in the cross-attention needs a head dimension divisible by 4; "
+                f"got dim_head_proj={self.dim_head_proj}"
+            )
+
+    def forward(
+        self,
+        x_q,
+        x_kv,
+        x_q_lens=None,
+        x_kv_lens=None,
+        ada_ln_aux=None,
+        coords_q=None,
+        coords_kv=None,
+    ):
         if self.with_residual:
             x_q_in = x_q
         gate = None
@@ -462,9 +496,33 @@ class MultiCrossAttentionHeadVarlen(torch.nn.Module):
         # project onto heads and q,k,v and
         # ensure these are 4D tensors as required for flash attention
         s = [x_q.shape[0], self.num_heads, self.dim_head_proj]
-        qs = self.lnorm_q(self.proj_heads_q(x_q).reshape(s)).to(self.dtype)
+        qs = self.lnorm_q(self.proj_heads_q(x_q).reshape(s))
         s = [x_kv.shape[0], self.num_heads, self.dim_head_proj]
-        ks = self.lnorm_k(self.proj_heads_k(x_kv).reshape(s)).to(self.dtype)
+        ks = self.lnorm_k(self.proj_heads_k(x_kv).reshape(s))
+        if self.with_2d_rope:
+            if coords_q is None or coords_kv is None:
+                raise ValueError(
+                    "coords_q and coords_kv must be provided when with_2d_rope=True"
+                )
+            assert coords_q.shape[0] == qs.shape[0] and coords_kv.shape[0] == ks.shape[0], (
+                f"RoPE coordinates do not match the tokens: queries {coords_q.shape[0]} vs "
+                f"{qs.shape[0]}, keys {coords_kv.shape[0]} vs {ks.shape[0]}"
+            )
+            # angles in float32 (they reach thousands of radians), rotation in the token dtype
+            with torch.no_grad():
+                freqs = rope_2d_wavelength_freqs(
+                    self.dim_head_proj,
+                    self.num_heads,
+                    self.rope_min_wavelength,
+                    self.rope_max_wavelength,
+                    device=qs.device,
+                )
+                cos_q, sin_q = rotary_cos_sin_2d_wavelengths(coords_q, freqs)
+                cos_k, sin_k = rotary_cos_sin_2d_wavelengths(coords_kv, freqs)
+            qs = apply_rotary_2d_single(qs, cos_q, sin_q)
+            ks = apply_rotary_2d_single(ks, cos_k, sin_k)
+        qs = qs.to(self.dtype)
+        ks = ks.to(self.dtype)
 #        vs = self.proj_heads_v(x_kv).reshape(s)
         vs = self.proj_heads_v(x_kv).reshape(s).to(self.dtype)
 

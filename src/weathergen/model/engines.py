@@ -8,6 +8,7 @@
 # nor does it submit to any jurisdiction.
 
 import dataclasses
+import logging
 import math
 
 import torch
@@ -31,6 +32,8 @@ from weathergen.model.embeddings import (
 from weathergen.model.layers import MLP
 from weathergen.model.utils import ActivationFactory
 from weathergen.utils.utils import get_dtype
+
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingEngine(torch.nn.Module):
@@ -794,10 +797,35 @@ class TargetPredictionEngineClassic(nn.Module):
             )
             mlp_dim_aux = head_dim_aux if self.cf.pred_mlp_adaln else None
 
+        # decoder_rope_2D: 2D RoPE between output points (queries) and latent cells (keys)
+        # in the cross-attention; the score then depends on the offset point - cell centre.
+        # Coordinates are in units of healpix cells (see Model._dec_rope_tables); wavelengths
+        # [shortest, longest] in the same units, per stream via
+        # target_readout.rope_wavelengths or globally via decoder_rope_wavelengths.
+        self.rope_2d = bool(self.cf.get("decoder_rope_2D", False))
+        _wl = stream_config["target_readout"].get(
+            "rope_wavelengths", self.cf.get("decoder_rope_wavelengths", [0.25, 64.0])
+        )
+        self.rope_wavelengths = (float(_wl[0]), float(_wl[1]))
+        if self.rope_2d:
+            _nh = stream_config["target_readout"]["num_heads"]
+            _dh = (
+                self.dims_embed[0] // _nh if self.tr_dim_head_proj is None
+                else self.tr_dim_head_proj
+            )
+            logger.info(
+                f"{self.name}: decoder_rope_2D on, wavelengths {self.rope_wavelengths[0]:g} .. "
+                f"{self.rope_wavelengths[1]:g} cells, {_dh // 4} per direction per head x "
+                f"{_nh} heads (head dim {_dh})"
+            )
+
         for i in range(len(self.dims_embed) - 1):
             # Multi-Cross Attention Head
             self.tte.append(
                 MultiCrossAttentionHeadVarlen(
+                    with_2d_rope=self.rope_2d,
+                    rope_min_wavelength=self.rope_wavelengths[0],
+                    rope_max_wavelength=self.rope_wavelengths[1],
                     dim_embed_q=self.dims_embed[i],
                     dim_embed_kv=self.cf.ae_global_dim_embed,
                     num_heads=stream_config["target_readout"]["num_heads"],
@@ -850,11 +878,21 @@ class TargetPredictionEngineClassic(nn.Module):
                 )
             )
 
-    def forward(self, latent, output, latent_lens, output_lens, coordinates):
+    def forward(
+        self, latent, output, latent_lens, output_lens, coordinates, rope_q=None, rope_kv=None
+    ):
+        """
+        rope_q (num_points, 2), rope_kv (num_latent_tokens, 2): (y, x) positions of the output
+        points and of the latent cells' centres, required when decoder_rope_2D is set.
+        """
         tc_tokens = output
         tcs_lens = output_lens
         tokens_stream = latent
         tokens_lens = latent_lens
+        if self.rope_2d and (rope_q is None or rope_kv is None):
+            raise ValueError(f"{self.name}: decoder_rope_2D is set but no RoPE coordinates given")
+        if not self.rope_2d:
+            rope_q, rope_kv = None, None
         # Fix 2/3: choose the AdaLN conditioning signal.
         #   disable_adaln          -> None (plain LayerNorm inside the heads)
         #   adaln_on_embedded_query-> the query tokens q(p) themselves
@@ -870,15 +908,30 @@ class TargetPredictionEngineClassic(nn.Module):
             if self.cf.pred_self_attention and ib % 3 == 1:
                 tc_tokens = checkpoint(block, tc_tokens, tcs_lens, tcs_aux, use_reentrant=False)
             else:
-                tc_tokens = checkpoint(
-                    block,
-                    tc_tokens,
-                    tokens_stream,
-                    tcs_lens,
-                    tokens_lens,
-                    tcs_aux,
-                    use_reentrant=False,
-                )
+                # cross-attention block or MLP block (the MLP ignores the middle arguments)
+                is_cross = isinstance(block, MultiCrossAttentionHeadVarlen)
+                if is_cross and self.rope_2d:
+                    tc_tokens = checkpoint(
+                        block,
+                        tc_tokens,
+                        tokens_stream,
+                        tcs_lens,
+                        tokens_lens,
+                        tcs_aux,
+                        rope_q,
+                        rope_kv,
+                        use_reentrant=False,
+                    )
+                else:
+                    tc_tokens = checkpoint(
+                        block,
+                        tc_tokens,
+                        tokens_stream,
+                        tcs_lens,
+                        tokens_lens,
+                        tcs_aux,
+                        use_reentrant=False,
+                    )
         return tc_tokens
 
 
@@ -917,6 +970,11 @@ class TargetPredictionEngine(nn.Module):
             LayerNorm that does not scale after the layer is applied
         """
         super(TargetPredictionEngine, self).__init__()
+        if cf.get("decoder_rope_2D", False):
+            raise NotImplementedError(
+                "decoder_rope_2D is implemented for TargetPredictionEngineClassic only "
+                "(decoder_type: PerceiverIOCoordConditioning, use_target_prediction_engine unset)"
+            )
         self.name = f"TargetPredictionEngine_{stream_config['name']}"
 
         self.cf = cf

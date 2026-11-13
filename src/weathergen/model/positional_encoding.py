@@ -173,3 +173,70 @@ def rotary_pos_emb_2d(q, k, coords, base=10000.0, unsqueeze_dim=1):
 
     cos, sin = rotary_embedding_2d(coords, q.shape[-1], base=base)
     return apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+
+
+####################################################################################################
+# 2D RoPE with explicit wavelengths, separate coordinates for queries and keys.
+# Used by the decoder cross-attention (config decoder_rope_2D): the query is an output point,
+# the keys are latent cells, so the two sides have DIFFERENT coordinates. The attention score
+# then depends only on the offset (point - cell centre).
+#
+# Pairing and layout are the same as rotary_embedding_2d / apply_rotary_pos_emb above:
+# component i is paired with component i + dim/2; of the dim/2 pairs, the first dim/4 use the
+# first coordinate (y, north), the last dim/4 the second coordinate (x, east).
+# Difference: the wavelengths are given explicitly (in units of the coordinates) instead of
+# the fixed 2*pi*base^(...) series, whose shortest wavelength (2*pi ~ 6 units) cannot resolve
+# positions inside a cell when the coordinates are in units of cells.
+
+
+def rope_2d_wavelength_freqs(
+    dim: int,
+    num_heads: int,
+    min_wavelength: float,
+    max_wavelength: float,
+    device=None,
+) -> torch.Tensor:
+    """Angular frequencies 2*pi / wavelength, shape (num_heads, dim // 4), float32.
+
+    dim // 4 * num_heads wavelengths in a geometric series from min_wavelength to
+    max_wavelength; head h takes every num_heads-th one starting at h. Every head therefore
+    spans the whole range, and together the heads sample it num_heads times more finely than
+    a single head could (useful when the head dimension is small).
+    """
+    assert dim % 4 == 0, f"2D rotary embeddings require dim to be divisible by 4; got {dim}"
+    assert 0.0 < min_wavelength < max_wavelength, (
+        f"need 0 < min_wavelength < max_wavelength; got {min_wavelength}, {max_wavelength}"
+    )
+    n = dim // 4
+    total = n * num_heads
+    i = torch.arange(total, dtype=torch.float64, device=device)
+    ell = min_wavelength * (max_wavelength / min_wavelength) ** (i / max(total - 1, 1))
+    ell = ell.reshape(n, num_heads).transpose(0, 1)                       # (num_heads, n)
+    return (2.0 * math.pi / ell).to(torch.float32)
+
+
+def rotary_cos_sin_2d_wavelengths(coords: torch.Tensor, freqs: torch.Tensor):
+    """cos, sin of the rotation angles, each of shape (N, num_heads, dim // 2).
+
+    coords: (N, 2) = (y, x), float32, in the units of the wavelengths.
+    freqs:  (num_heads, dim // 4) from rope_2d_wavelength_freqs.
+    """
+    assert coords.shape[-1] == 2, f"coords last dimension must be 2 (y, x); got {coords.shape}"
+    c = coords.to(torch.float32)
+    ang = torch.cat(
+        (c[:, 0].view(-1, 1, 1) * freqs.unsqueeze(0), c[:, 1].view(-1, 1, 1) * freqs.unsqueeze(0)),
+        dim=-1,
+    )
+    return torch.cos(ang), torch.sin(ang)
+
+
+def apply_rotary_2d_single(t: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Rotate t (N, num_heads, dim) by the angles behind cos/sin (N, num_heads, dim // 2).
+
+    Same rotation as apply_rotary_pos_emb (t * cos + rotate_half(t) * sin), written on the
+    two halves so that cos/sin need not be duplicated.
+    """
+    h = t.shape[-1] // 2
+    t1, t2 = t[..., :h], t[..., h:]
+    cos, sin = cos.to(t.dtype), sin.to(t.dtype)
+    return torch.cat((t1 * cos - t2 * sin, t2 * cos + t1 * sin), dim=-1)

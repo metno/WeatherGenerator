@@ -81,6 +81,46 @@ def fe_rope_coords(healpix_level: int, active_cells) -> torch.Tensor:
     x = dlon * torch.cos(lat_c) / cell
     return torch.stack([y, x], dim=-1).to(torch.float32)
 
+def dec_rope_frame(healpix_level: int, active_cells) -> dict:
+    """Local map frame for the decoder's 2D RoPE (config decoder_rope_2D).
+
+    A flat map centred on the domain: origin = mean direction of the active cell centres,
+    y axis pointing north, x axis pointing east, distances measured along the sphere from the
+    origin (azimuthal equidistant projection) and divided by the mean cell size of
+    `healpix_level`. So coordinates are in units of cells of that level, and they are
+    continuous across cell edges. Meant for regional domains (it degenerates far from the
+    origin, e.g. on a global domain).
+
+    Returns dict(c0, east, north: (3,) float64 unit vectors; cell: cell size [rad]).
+    """
+    verts, _ = healpix_verts_rots(healpix_level, 0.5, 0.5)
+    verts = verts[torch.from_numpy(np.asarray(active_cells))].to(torch.float64)
+    c0 = verts.mean(0)
+    c0 = c0 / c0.norm()
+    zax = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64)
+    east = torch.linalg.cross(zax, c0)
+    assert east.norm() > 1e-6, "decoder RoPE frame: domain centred on a pole is not supported"
+    east = east / east.norm()
+    north = torch.linalg.cross(c0, east)
+    cell = math.sqrt(4.0 * math.pi / (12 * 4**healpix_level))
+    return dict(c0=c0, east=east, north=north, cell=cell)
+
+
+def dec_rope_project(v: torch.Tensor, frame: dict) -> torch.Tensor:
+    """Unit vectors (N, 3) -> map coordinates (N, 2) = (y, x) in cells, float32. See dec_rope_frame."""
+    v = v.to(torch.float64)
+    v = v / v.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+    c0, east, north = (frame[k].to(v.device) for k in ("c0", "east", "north"))
+    cosd = v @ c0
+    t = v - cosd.unsqueeze(-1) * c0                       # component in the tangent plane
+    sind = t.norm(dim=-1)
+    theta = torch.atan2(sind, cosd)                       # angular distance from the origin
+    scale = torch.where(sind > 1e-12, theta / sind.clamp(min=1e-12), torch.ones_like(sind))
+    y = scale * (t @ north) / frame["cell"]
+    x = scale * (t @ east) / frame["cell"]
+    return torch.stack([y, x], dim=-1).to(torch.float32)
+
+
 type StreamName = str
 
 
@@ -1270,6 +1310,129 @@ class Model(torch.nn.Module):
                 flush=True,
             )
 
+    def _lcoords_off(self) -> bool:
+        """True if the 99 cell-relative target-coordinate channels are zeroed
+        (config decoder_cell_coords: false, or env WEATHERGEN_ABLATE_CELL_COORDS=1)."""
+        from weathergen.datasets.tokenizer_utils import _ABLATE_CELL_COORDS
+
+        return _ABLATE_CELL_COORDS or not bool(self.cf.get("decoder_cell_coords", True))
+
+    def _dec_rope_tables(self, base_lvl: int, coarse_lvls, model_params) -> dict:
+        """
+        Static tables for the decoder's 2D RoPE (config decoder_rope_2D), cached.
+
+        base_lvl: level whose cells are the stream's target cells (its 1-ring is read first).
+        coarse_lvls: further (coarser) levels whose parent 1-ring is appended, in that order.
+
+        Returns dict:
+          frame     map frame (dec_rope_frame) of the base-level domain; units = base cells
+          xy        (n, 2) map position of every base cell centre
+          kv        (n, ring_total, 2) map positions of the latent cells in the KV pool of
+                    base cell i, in the SAME order as the tokens: 9 * nq entries of the fine
+                    1-ring (hp_nbours of the base level), then 9 per coarse level (1-ring of
+                    the parent of i). Missing neighbours follow the hp_nbours convention
+                    (replaced by the ring's centre cell); a missing parent (its tokens are
+                    zeroed) gets the position of cell i itself.
+        All positions are in ONE frame, so point - cell offsets are comparable across levels.
+        """
+        cache = self.__dict__.setdefault("_dec_rope_cache", {})
+        key = (int(base_lvl), tuple(int(l) for l in coarse_lvls))
+        if key not in cache:
+            def _mp(lvl):
+                return (model_params.params_for(lvl) if hasattr(model_params, "params_for")
+                        else model_params)
+
+            dom = self.domain_pyramid.domain(base_lvl)
+            frame = dec_rope_frame(base_lvl, dom.active_cells)
+
+            def _centres(lvl):
+                d = self.domain_pyramid.domain(lvl)
+                verts, _ = healpix_verts_rots(lvl, 0.5, 0.5)
+                return dec_rope_project(verts[torch.from_numpy(np.asarray(d.active_cells))], frame)
+
+            nq = int(self.cf.ae_local_num_queries)
+            xy = _centres(base_lvl)                                          # (n, 2)
+            nb = _mp(base_lvl).hp_nbours.detach().long().cpu()               # (n, 9)
+            parts = [xy[nb].repeat_interleave(nq, dim=1)]                    # (n, 9*nq, 2)
+            for lvl in coarse_lvls:
+                if nq != 1:
+                    raise NotImplementedError(
+                        "decoder_rope_2D with multi-level decoding requires "
+                        "ae_local_num_queries == 1"
+                    )
+                xy_c = _centres(lvl)
+                nb_c = _mp(lvl).hp_nbours.detach().long().cpu()              # (nc, 9)
+                poc = torch.as_tensor(
+                    self.domain_pyramid.parent_of_child(lvl, base_lvl), dtype=torch.long
+                )
+                ring = xy_c[nb_c[poc.clamp(min=0)]]                          # (n, 9, 2)
+                ring = torch.where((poc >= 0).view(-1, 1, 1), ring, xy.unsqueeze(1))
+                parts.append(ring)
+            cache[key] = dict(frame=frame, xy=xy, kv=torch.cat(parts, dim=1))
+            if is_root():
+                kv = cache[key]["kv"]
+                off = (kv - xy.unsqueeze(1)).abs().amax()
+                logger.info(
+                    f"decoder_rope_2D: tables for base level {base_lvl} (+ levels "
+                    f"{list(coarse_lvls)}): {xy.shape[0]} cells, {kv.shape[1]} latent tokens "
+                    f"per cell, largest |offset| cell-to-token = {off:.2f} cells"
+                )
+        return cache[key]
+
+    def _dec_rope_inputs(self, stream_name, t_coords, tcs_lens, batch_size, base_lvl,
+                         coarse_lvls, model_params) -> dict:
+        """
+        Per-call inputs for the decoder's 2D RoPE:
+          q      (N_points, 2) map position of every target point (from the unit-sphere
+                 position in the last 3 target-coordinate channels)
+          table  (n, ring_total, 2) see _dec_rope_tables()['kv'] (on the points' device)
+        Checks once per stream that the points lie in the cells they are assigned to.
+        """
+        tab = self._dec_rope_tables(base_lvl, coarse_lvls, model_params)
+        dev = t_coords.device
+        p_r3 = t_coords[..., -NUM_GLOBAL_COORD_CHANNELS_POU:].to(torch.float32)
+        q = dec_rope_project(p_r3, tab["frame"])
+        dcache = self.__dict__.setdefault("_dec_rope_dev", {})
+        dkey = (id(tab), str(dev))
+        if dkey not in dcache:
+            dcache[dkey] = dict(xy=tab["xy"].to(dev), kv=tab["kv"].to(dev))
+        checked = self.__dict__.setdefault("_dec_rope_checked", set())
+        if stream_name not in checked:
+            checked.add(stream_name)
+            if t_coords.dtype not in (torch.float32, torch.float64):
+                logger.warning(
+                    f"decoder_rope_2D ({stream_name}): target coordinates are {t_coords.dtype}; "
+                    "point positions need float32 to resolve positions inside a cell"
+                )
+            norms = p_r3.norm(dim=-1)
+            if not torch.allclose(norms, torch.ones_like(norms), atol=1e-2):
+                raise ValueError(
+                    "decoder_rope_2D needs the unit-sphere position of the target points in "
+                    "the last 3 target-coordinate channels; found non-unit vectors."
+                )
+            n = dcache[dkey]["xy"].shape[0]
+            lens = tcs_lens[1:].to(dev).long()
+            if lens.numel() == batch_size * n and int(lens.sum()) == q.shape[0]:
+                cell = torch.repeat_interleave(torch.arange(lens.numel(), device=dev), lens) % n
+                dist = (q - dcache[dkey]["xy"][cell]).norm(dim=-1).max().item()
+                if dist > 2.0:
+                    raise ValueError(
+                        f"decoder_rope_2D ({stream_name}): a target point is {dist:.2f} cells "
+                        "away from the centre of the cell it is assigned to (expected < ~1). "
+                        "Point positions and cell centres are not in the same frame."
+                    )
+                if is_root():
+                    logger.info(
+                        f"decoder_rope_2D ({stream_name}): largest distance point-to-own-cell "
+                        f"centre = {dist:.2f} cells (frame check passed)"
+                    )
+            else:
+                logger.warning(
+                    f"decoder_rope_2D ({stream_name}): frame check skipped (target cells do "
+                    f"not match base level: {lens.numel()} sequences vs {batch_size} x {n})"
+                )
+        return dict(q=q, table=dcache[dkey]["kv"])
+
     def _pou_geometry(self, domain):
         """
         Per-cell tables to recompute the 99 cell-relative target-coordinate channels of a
@@ -1328,6 +1491,7 @@ class Model(torch.nn.Module):
     def _pou_decode_pairs(
         self, stream_name, pt_idx, k_idx, row_of_point, cand_c_dev, n, K, nbours_fine,
         coarse_dev, tokens_flat, t_coords, p_r3_dev, geo, n_loc, ring_total, embed, dev,
+        rope=None,
     ):
         """
         Decode (point, candidate column) pairs in ONE decoder pass. Pairs are grouped by
@@ -1335,7 +1499,7 @@ class Model(torch.nn.Module):
         its candidate cell j (fine ring of j + parent ring of j) and its points get their
         cell-relative coordinates recomputed w.r.t. j. Returns (ens, P, C) in pair order.
         """
-        from weathergen.datasets.tokenizer_utils import _ABLATE_CELL_COORDS
+        _ABLATE_CELL_COORDS = self._lcoords_off()
 
         row_p = row_of_point[pt_idx]                                       # (P,) in [0, B*n)
         c_p = row_p % n
@@ -1369,6 +1533,16 @@ class Model(torch.nn.Module):
             [torch.zeros(1, dtype=torch.int32, device=dev), counts.to(torch.int32)]
         )
 
+        # decoder RoPE: the point keeps its own map position; the keys get the positions of
+        # the cells in the KV pool of the candidate cell j of their group
+        rope_kw = {}
+        if rope is not None:
+            assert rope["table"].shape[1] == ring_total, (
+                f"decoder_rope_2D: {rope['table'].shape[1]} token positions per cell, "
+                f"but {ring_total} tokens"
+            )
+            rope_kw = dict(rope_q=rope["q"][pt_s], rope_kv=rope["table"][j_g].reshape(-1, 2))
+
         def _fwd(tokens_flat_, t_, idxs_, *ca_):
             toks_ = self._pou_build_kv(tokens_flat_, idxs_, ca_, G)
             out_ = self.target_token_engines[stream_name](
@@ -1377,6 +1551,7 @@ class Model(torch.nn.Module):
                 latent_lens=lens_g,
                 output_lens=out_lens_g,
                 coordinates=t_,
+                **rope_kw,
             )
             return self.pred_heads[stream_name](out_)
 
@@ -1418,6 +1593,7 @@ class Model(torch.nn.Module):
         domain=None,
         coarse: list | None = None,
         nbours_fine: torch.Tensor | None = None,
+        rope: dict | None = None,
     ) -> torch.Tensor:
         """
         Partition-of-unity readout blend removing healpix grid-imprint artifacts.
@@ -1626,7 +1802,13 @@ class Model(torch.nn.Module):
         # standard readout, coordinates recomputed w.r.t. j (see docstring)
         geo = self._pou_geometry(domain)
         geo = {k_: (v_.to(dev) if torch.is_tensor(v_) else v_) for k_, v_ in geo.items()}
-        from weathergen.datasets.tokenizer_utils import _ABLATE_CELL_COORDS
+        _ABLATE_CELL_COORDS = self._lcoords_off()
+        if rope is not None:
+            assert rope["table"].shape[1] == ring_total, (
+                f"decoder_rope_2D: {rope['table'].shape[1]} token positions per cell, "
+                f"but {ring_total} tokens"
+            )
+            assert nbours_fine is not None, "decoder_rope_2D with pou_blend needs nbours_fine"
 
         own_cells = torch.arange(n, device=dev)
         cand_c_dev = cand_c.to(dev)                                       # (n, K) compact
@@ -1672,7 +1854,7 @@ class Model(torch.nn.Module):
             pred_pairs = self._pou_decode_pairs(
                 stream_name, pt_idx, k_idx, cell_of_point.to(dev), cand_c_dev, n, K,
                 nbours_fine, coarse_dev, tokens_flat, t_coords, p_r3_dev, geo, n_loc,
-                ring_total, embed, dev,
+                ring_total, embed, dev, rope=rope,
             )                                                                 # (ens, P, C)
             if w_pair is None:
                 return pred_pairs                                             # P == N, in order
@@ -1708,7 +1890,16 @@ class Model(torch.nn.Module):
                 loc = self._pou_local_channels(p_r3_dev, j_k[cell_c_pt], geo)
                 t_coords_k[..., -n_loc : -NUM_GLOBAL_COORD_CHANNELS_POU] = loc.to(t_coords.dtype)
 
-            def _slot_forward(tokens_flat_, t_coords_, idxs_flat_, *coarse_args_):
+            # decoder RoPE: keys get the positions of the cells in the KV pool of candidate j
+            rope_kw = {}
+            if rope is not None:
+                rope_kw = dict(
+                    rope_q=rope["q"],
+                    rope_kv=rope["table"][j_k].repeat(batch_size, 1, 1).reshape(-1, 2),
+                )
+
+            def _slot_forward(tokens_flat_, t_coords_, idxs_flat_, *coarse_args_,
+                              rope_kw_=rope_kw):
                 # gather and query embedding INSIDE the checkpoint (recomputed at backward)
                 toks_k_ = self._pou_build_kv(tokens_flat_, idxs_flat_, coarse_args_, num_cells_total)
                 tc_tokens_ = embed(t_coords_)
@@ -1718,6 +1909,7 @@ class Model(torch.nn.Module):
                     latent_lens=lens,
                     output_lens=tcs_lens,
                     coordinates=t_coords_,
+                    **rope_kw_,
                 )
                 return self.pred_heads[stream_name](out_k_)
 
@@ -2022,6 +2214,12 @@ class Model(torch.nn.Module):
             ]
             t_coords_lens = [len(t) for t in t_coords]
             t_coords = torch.cat(t_coords)
+            t_coords_full = t_coords            # with the cell-relative channels (diagnostics)
+            if self._lcoords_off() and t_coords.shape[-1] >= 99 + NUM_GLOBAL_COORD_CHANNELS_POU:
+                # decoder_cell_coords: false -> the decoder does not get the 99 cell-relative
+                # channels (zeroed; tensor layout unchanged)
+                t_coords = t_coords.clone()
+                t_coords[..., -(99 + NUM_GLOBAL_COORD_CHANNELS_POU) : -NUM_GLOBAL_COORD_CHANNELS_POU] = 0.0
 
 #            print(f"READOUT skip check: stream={stream_name} step={step} n_coords={len(t_coords)}", flush=True)
             if len(t_coords) == 0:
@@ -2070,6 +2268,21 @@ class Model(torch.nn.Module):
                 )
                 ncells_enc = len(self.domain_pyramid.domain(enc_lvl))
                 s = [batch_size, ncells_enc, self.cf.ae_local_num_queries, toks_enc.shape[-1]]
+
+                # decoder_rope_2D: map positions of the target points and of the latent
+                # cells they read (same order as the KV pool: fine 1-ring, then the parent's
+                # 1-ring at every coarser decode level)
+                rope = None
+                if self.cf.get("decoder_rope_2D", False) and self.cf.decoder_type != "Linear":
+                    _base = _finest if len(dec_levels) != 1 else dec_levels[0]
+                    _coarse_lvls = (
+                        [lvl for lvl in dec_levels if lvl != _finest]
+                        if len(dec_levels) != 1 else []
+                    )
+                    rope = self._dec_rope_inputs(
+                        stream_name, t_coords, tcs_lens, batch_size, _base, _coarse_lvls,
+                        model_params,
+                    )
 
                 if self.cf.decoder_type == "Linear":
                     # one latent row per target cell (BilinearDecoder repeats row i
@@ -2136,15 +2349,29 @@ class Model(torch.nn.Module):
                         nbours_fine=(model_params.params_for(enc_lvl)
                                      if hasattr(model_params, "params_for")
                                      else model_params).hp_nbours.long(),
+                        rope=rope,
                     )
 
                 else:
+                    rope_kw = {}
+                    if rope is not None:
+                        assert rope["table"].shape[0] * rope["table"].shape[1] * batch_size == (
+                            tokens_nbors.shape[0]
+                        ), (
+                            f"decoder_rope_2D ({stream_name}): {tokens_nbors.shape[0]} latent "
+                            f"tokens but positions for {batch_size} x {tuple(rope['table'].shape[:2])}"
+                        )
+                        rope_kw = dict(
+                            rope_q=rope["q"],
+                            rope_kv=rope["table"].repeat(batch_size, 1, 1).reshape(-1, 2),
+                        )
                     tc_tokens = self.target_token_engines[stream_name](
                         latent=tokens_nbors,
                         output=tc_tokens,
                         latent_lens=tokens_nbors_lens,
                         output_lens=tcs_lens,
                         coordinates=t_coords,
+                        **rope_kw,
                     )
 
                     # final prediction head to map back to physical space
@@ -2165,7 +2392,7 @@ class Model(torch.nn.Module):
                     _dom = self.domain_pyramid.domain(_lvl) if _lvl is not None else None
                 except Exception:
                     _dom = None
-                self._cell_pattern_diag(stream_name, pred, t_coords, tcs_lens, domain=_dom)
+                self._cell_pattern_diag(stream_name, pred, t_coords_full, tcs_lens, domain=_dom)
 
             # recover batch dimension (ragged, so as list)
             pred = torch.split(pred, t_coords_lens, dim=1)
