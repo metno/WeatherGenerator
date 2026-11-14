@@ -2015,8 +2015,9 @@ class Model(torch.nn.Module):
         # latent_blur_eval: a (0..1) -> EVALUATION-ONLY experiment: before decoding, replace
         # every latent cell token by (1 - a) * token + a * (average of other tokens).
         #   latent_blur_eval_mode: "neighbours" (default) average of the 8 neighbouring cells
-        #                          "batch"      the same cell of the next sample in the batch
-        #                                       (another date): a literal average of two codes
+        #                          "batch"      the same cell of another date (next sample of
+        #                                       the batch, or the previous batch if the
+        #                                       batch has one sample): average of two codes
         #   latent_blur_eval_levels: list of latent levels to blur (default: all)
         # Purpose: test whether "averaged" latents (as a forecast produces) make the decoder
         # draw a pattern repeated in every cell. Training is never affected.
@@ -2043,16 +2044,22 @@ class Model(torch.nn.Module):
                 na = self.num_aux_tokens
                 cells = t[:, na:]                                    # (B, ncells * nq, D)
                 if mode == "batch":
-                    if cells.shape[0] < 2:
-                        if not getattr(self, "_latent_blur_warned", False):
-                            logger.warning(
-                                "latent_blur_eval_mode 'batch' needs at least 2 samples per "
-                                "batch; latent left unchanged"
-                            )
-                            self._latent_blur_warned = True
+                    # another date: the next sample of the batch, or, with one sample per
+                    # batch, the sample of the PREVIOUS evaluation batch (kept in memory;
+                    # the very first batch is left unchanged)
+                    prev_store = self.__dict__.setdefault("_latent_blur_prev", {})
+                    prev = prev_store.get(lvl)
+                    prev_store[lvl] = cells[-1:].detach().clone()
+                    if cells.shape[0] >= 2:
+                        other = torch.roll(cells, shifts=1, dims=0)
+                    elif prev is not None and prev.shape == cells.shape:
+                        other = prev.to(cells.dtype)
+                    else:
+                        if is_root():
+                            print("[latent_blur] first batch: no other date yet, latent "
+                                  "left unchanged", flush=True)
                         out[lvl] = t
                         continue
-                    other = torch.roll(cells, shifts=1, dims=0)
                 elif mode == "neighbours":
                     mp_l = (model_params.params_for(lvl)
                             if hasattr(model_params, "params_for") else model_params)
