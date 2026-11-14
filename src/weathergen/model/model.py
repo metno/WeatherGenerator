@@ -2012,6 +2012,60 @@ class Model(torch.nn.Module):
             print("[fcdiag] forecast_bypass_eval active: forecast engine skipped", flush=True)
             self._fc_bypass_announced = True
 
+        # latent_blur_eval: a (0..1) -> EVALUATION-ONLY experiment: before decoding, replace
+        # every latent cell token by (1 - a) * token + a * (average of other tokens).
+        #   latent_blur_eval_mode: "neighbours" (default) average of the 8 neighbouring cells
+        #                          "batch"      the same cell of the next sample in the batch
+        #                                       (another date): a literal average of two codes
+        #   latent_blur_eval_levels: list of latent levels to blur (default: all)
+        # Purpose: test whether "averaged" latents (as a forecast produces) make the decoder
+        # draw a pattern repeated in every cell. Training is never affected.
+        blur_a = 0.0 if self.training else float(self.cf.get("latent_blur_eval", 0.0) or 0.0)
+        if blur_a > 0.0 and is_root() and not getattr(self, "_latent_blur_announced", False):
+            print(
+                f"[latent_blur] active in evaluation: a={blur_a} "
+                f"mode={self.cf.get('latent_blur_eval_mode', 'neighbours')} "
+                f"levels={self.cf.get('latent_blur_eval_levels', 'all')}",
+                flush=True,
+            )
+            self._latent_blur_announced = True
+
+        def _blur_latents(tlvl):
+            if blur_a <= 0.0:
+                return tlvl
+            mode = self.cf.get("latent_blur_eval_mode", "neighbours")
+            lvls = self.cf.get("latent_blur_eval_levels", None)
+            out = {}
+            for lvl, t in tlvl.items():
+                if lvls is not None and int(lvl) not in [int(v) for v in lvls]:
+                    out[lvl] = t
+                    continue
+                na = self.num_aux_tokens
+                cells = t[:, na:]                                    # (B, ncells * nq, D)
+                if mode == "batch":
+                    if cells.shape[0] < 2:
+                        if not getattr(self, "_latent_blur_warned", False):
+                            logger.warning(
+                                "latent_blur_eval_mode 'batch' needs at least 2 samples per "
+                                "batch; latent left unchanged"
+                            )
+                            self._latent_blur_warned = True
+                        out[lvl] = t
+                        continue
+                    other = torch.roll(cells, shifts=1, dims=0)
+                elif mode == "neighbours":
+                    mp_l = (model_params.params_for(lvl)
+                            if hasattr(model_params, "params_for") else model_params)
+                    nb = mp_l.hp_nbours.long()                       # (ncells, 9), column 0 = self
+                    nq = self.cf.ae_local_num_queries
+                    c4 = cells.reshape(cells.shape[0], nb.shape[0], nq, cells.shape[-1])
+                    other = c4[:, nb[:, 1:]].mean(dim=2).reshape(cells.shape).to(cells.dtype)
+                else:
+                    raise ValueError(f"latent_blur_eval_mode: unknown mode '{mode}'")
+                mixed = (1.0 - blur_a) * cells + blur_a * other
+                out[lvl] = torch.cat([t[:, :na], mixed], dim=1)
+            return out
+
         def _forecast_all(tlvl, step):
             # advance each level's latent through ITS OWN forecast engine, then
             # couple levels with the forecast cascade. Single level + inert cascade
@@ -2056,8 +2110,10 @@ class Model(torch.nn.Module):
             tokens_lvl = _forecast_all(tokens_lvl, step)
             tokens = tokens_lvl[_finest]
             # decoder predictions (fine streams read coarse+fine via tokens_lvl)
+            # (latent_blur_eval: the blurred copy is decoded only, never rolled forward)
+            tokens_dec = _blur_latents(tokens_lvl)
             output = self.predict_decoders(
-                model_params, step, tokens, batch, output, tokens_lvl=tokens_lvl
+                model_params, step, tokens_dec[_finest], batch, output, tokens_lvl=tokens_dec
             )
             # latent predictions (raw and with SSL heads)
             output = self.predict_latent(model_params, step, tokens, batch, output)
