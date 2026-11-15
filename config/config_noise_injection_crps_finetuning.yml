@@ -1,33 +1,22 @@
 general:
-  desc: "Two-member almost-fair CRPS fine-tuning from sdnbfpve"
+  desc: "Two-member two-step ERA5 almost-fair CRPS fine-tuning from sdnbfpve"
   istep: 0
-
-load_chkpt:
-  run_id: sdnbfpve
-  mini_epoch: -1
 
 streams:
   ERA5:
     diagnostic: true
     forcing: false
     reconstruct: true
-
-freeze_modules: ""
-reset_modules: ""
-fe_impute_latent_noise_std: 0.0
-
-diffusion:
-  enabled: false
-  latent_dim: null
-  conditioning_type: null
-
-noise_injector:
-  enabled: true
-  ensemble_size: 2
-  member_parallel: true
-  noise_dim: 16
-  hidden_dim: 64
-  noise_std: 1.0
+  AVHRR: {reconstruct: false}
+  ERA5_in: {reconstruct: false}
+  GOES_ABI_VIS: {reconstruct: false}
+  GOES_ABI_IR: {reconstruct: false}
+  HIMAWARI_AHI_VIS: {reconstruct: false}
+  HIMAWARI_AHI_IR: {reconstruct: false}
+  ICON_DREAM_TP: {reconstruct: false}
+  METEOSAT_SEVIRI_IR: {reconstruct: false}
+  METOP_ABC_IASI: {reconstruct: false}
+  SurfaceCombined: {reconstruct: false}
 
 crps_losses:
   physical:
@@ -41,28 +30,22 @@ training_config:
   training_mode: ["masking"]
   num_mini_epochs: 8
   losses: ${crps_losses}
-  learning_rate_scheduling:
-    lr_start: 1e-6
-    lr_max: 1e-5
-    lr_final_decay: 1e-6
-    lr_final: 0.0
-    num_steps_warmup: 256
-    num_steps_cooldown: 512
-    policy_warmup: "cosine"
-    policy_decay: "cosine"
-    policy_cooldown: "linear"
-    parallel_scaling_policy: "sqrt"
+  noise:
+    enabled: true
+    noise_dim: 16
+    hidden_dim: 64
+    noise_std: 1.0
+    condition_on_forecast_step: true
   forecast:
-    offset: 1
-    num_steps: 1
+    num_steps: 2
+    num_members: 2
     policy: "fixed"
     pushforward: false
 
 validation_config:
   losses: ${crps_losses}
   forecast:
-    offset: 1
-    num_steps: 1
+    num_steps: 2
     policy: "fixed"
     pushforward: false
   validate_before_training: true
@@ -70,7 +53,6 @@ validation_config:
 test_config:
   losses: ${crps_losses}
   forecast:
-    offset: 1
-    num_steps: 1
+    num_steps: 2
     policy: "fixed"
     pushforward: false

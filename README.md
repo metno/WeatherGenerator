@@ -36,16 +36,17 @@ torchrun --nproc-per-node=2 --module weathergen.run_train \
 
 The overlay requests eight mini-epochs, ERA5 as an output-only stream and physical-space
 almost-fair CRPS with `alpha=0.95`. Other stream settings are inherited from the saved run.
-Consecutive ranks form a member group and consume the same examples with independent
-latent noise. Four ranks form two groups, each with two members. The world size must be
-divisible by the ensemble size. Shared model weights remain synchronized over all ranks;
-do not divide the CRPS loss by the ensemble size again.
+`training_config.forecast.num_members` sets the number of parallel replicas, independently
+of `training_config.noise.enabled`. Consecutive ranks share inputs and model weights;
+enabled noise adds independent perturbations. The world size must be divisible by the
+member count. Physical predictions are gathered with gradient communication for CRPS;
+do not divide the loss by the member count again.
 
-Set `noise_injector.member_parallel: false` for the original single-process, locally batched
-ensemble. Distributed regression checks can be run on the server with
-`PYTHONPATH=src pytest tests/test_member_parallel.py -q`. These checks use CPU/Gloo and
-lightweight attention substitutes; the real checkpoint, CUDA/NCCL and FSDP training paths
-still require a server smoke run before a full experiment.
+Validation inherits the training settings and count. Separate inference can override
+`test_config.forecast.num_members` with a compatible rank count. The overlay also enables
+`training_config.noise.condition_on_forecast_step`; enabling it on an existing unconditioned
+injector changes its first MLP layer's input size and requires a weight migration or reset.
+GPU/checkpoint validation must be done on the training server.
 
 # Development guidelines
 
