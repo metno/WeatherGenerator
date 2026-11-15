@@ -23,6 +23,30 @@ More details coming soon. Please open an issue if you are interested in using th
 The model is currently being developed by the WeatherGenerator Consortium. If you want to
 engage, you are encouraged to contact us first by opening an issue on Github.
 
+## Member-parallel CRPS fine-tuning
+
+On the training server, with the project environment, datasets and checkpoint `sdnbfpve`
+available, launch two members on two GPUs:
+
+```bash
+torchrun --nproc-per-node=2 --module weathergen.run_train \
+  train_continue --from-run-id sdnbfpve --mini-epoch -1 \
+  --config config/config_noise_injection_crps_finetuning.yml
+```
+
+The overlay requests eight mini-epochs, ERA5 as an output-only stream and physical-space
+almost-fair CRPS with `alpha=0.95`. Other stream settings are inherited from the saved run.
+Consecutive ranks form a member group and consume the same examples with independent
+latent noise. Four ranks form two groups, each with two members. The world size must be
+divisible by the ensemble size. Shared model weights remain synchronized over all ranks;
+do not divide the CRPS loss by the ensemble size again.
+
+Set `noise_injector.member_parallel: false` for the original single-process, locally batched
+ensemble. Distributed regression checks can be run on the server with
+`PYTHONPATH=src pytest tests/test_member_parallel.py -q`. These checks use CPU/Gloo and
+lightweight attention substitutes; the real checkpoint, CUDA/NCCL and FSDP training paths
+still require a server smoke run before a full experiment.
+
 # Development guidelines
 
 The [main branch](https://github.com/ecmwf/WeatherGenerator/tree/main) is the most stable version. If you are running experiments, you should use this branch.
