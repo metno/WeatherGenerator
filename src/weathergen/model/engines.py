@@ -30,6 +30,7 @@ from weathergen.model.embeddings import (
 )
 from weathergen.model.layers import MLP, KwargLayerNorm, NoiseInjector
 from weathergen.model.utils import ActivationFactory
+from weathergen.utils.distributed import get_ensemble_size, get_noise_config
 from weathergen.utils.utils import get_dtype
 
 
@@ -611,19 +612,20 @@ class ForecastingEngine(torch.nn.Module):
         _diffusion_latent_dim = diff_cf.get("latent_dim") or self.cf.ae_global_dim_embed
         _inner_dim = 2 * _diffusion_latent_dim if _concat_hd else _diffusion_latent_dim
 
-        noise_cfg = self.cf.get("noise_injector", {})
+        noise_cfg = get_noise_config(self.cf)
         self.noise_injector = None
         if noise_cfg.get("enabled", False):
             if diff_cf.get("enabled", False):
-                raise ValueError("noise_injector is only supported for non-diffusion forecasts.")
+                raise ValueError("Noise injection is only supported for non-diffusion forecasts.")
             self.noise_injector = NoiseInjector(
                 latent_dim=_inner_dim,
                 noise_dim=noise_cfg.get("noise_dim", 16),
                 hidden_dim=noise_cfg.get("hidden_dim", 64),
                 noise_std=noise_cfg.get("noise_std", 1.0),
+                condition_on_forecast_step=noise_cfg.get("condition_on_forecast_step", False),
                 seed=(
                     int(self.cf.data_loading.rng_seed) + self.cf.rank
-                    if noise_cfg.get("member_parallel", False)
+                    if get_ensemble_size(self.cf) > 1
                     else None
                 ),
             )
@@ -748,7 +750,7 @@ class ForecastingEngine(torch.nn.Module):
             tokens_in = tokens
 
         if self.noise_injector is not None:
-            tokens = self.noise_injector(tokens)
+            tokens = self.noise_injector(tokens, fstep=fstep)
 
         diff_cf = self.cf.get("diffusion", {})
         if diff_cf.get("enabled", False):

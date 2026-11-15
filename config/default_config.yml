@@ -60,13 +60,6 @@ fe_dropout_rate: 0.1
 fe_with_qk_lnorm: True
 fe_layer_norm_after_blocks: []  # Index starts at 0. Thus, [3] adds a LayerNorm after the fourth layer
 fe_impute_latent_noise_std: 0.0  # 1e-4
-noise_injector:
-  enabled: false
-  ensemble_size: 1
-  member_parallel: false
-  noise_dim: 16
-  hidden_dim: 64
-  noise_std: 1.0
 # currently fixed to 1.0 (due to limitations with flex_attention and triton)
 forecast_att_dense_rate: 1.0
 
@@ -201,9 +194,17 @@ training_config:
       },
     }
 
+  noise:
+    enabled: false
+    noise_dim: 16
+    hidden_dim: 64
+    noise_std: 1.0
+    condition_on_forecast_step: false
+
   forecast :
       time_step: 06:00:00
       num_steps: 2
+      num_members: 1
       offset: 1
       policy: "fixed"
 

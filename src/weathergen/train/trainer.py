@@ -50,7 +50,12 @@ from weathergen.train.utils import (
     get_batch_size_from_config,
     get_target_idxs_from_cfg,
 )
-from weathergen.utils.distributed import is_ensemble_root, is_root
+from weathergen.utils.distributed import (
+    get_ensemble_size,
+    get_noise_config,
+    is_ensemble_root,
+    is_root,
+)
 from weathergen.utils.inference_logger import EXTRA_INFERENCE_WRITERS
 from weathergen.utils.performance import NullThroughputTracker, ThroughputTracker
 from weathergen.utils.train_logger import (
@@ -205,6 +210,20 @@ class Trainer(TrainerBase):
         self.test_cfg = get_active_stage_config(
             self.validation_cfg, cf.get("test_config", {}), cfg_keys_to_filter
         )
+        training_noise = get_noise_config(cf, self.training_cfg)
+        validation_noise = get_noise_config(cf, self.validation_cfg)
+        if cf.get("stage") != "inference" and training_noise != validation_noise:
+            raise ValueError(
+                "validation_config.noise must match training_config.noise when sharing "
+                "the training model. Use test_config.noise for separate inference settings."
+            )
+        training_members = get_ensemble_size(cf, self.training_cfg)
+        validation_members = get_ensemble_size(cf, self.validation_cfg)
+        if cf.get("stage") != "inference" and training_members != validation_members:
+            raise ValueError(
+                "validation_config.forecast.num_members must match training while sharing "
+                "the training process groups. Use test_config.forecast for separate inference."
+            )
 
         # batch sizes
         self.batch_size_per_gpu = get_batch_size_from_config(self.training_cfg)
@@ -225,7 +244,7 @@ class Trainer(TrainerBase):
         # Get world_size of previous, to be continued run before
         # world_size gets overwritten by current setting during init_ddp()
         self.world_size_original = cf.get("world_size_original", cf.get("world_size", None))
-        if cf.get("noise_injector", {}).get("member_parallel", False):
+        if get_ensemble_size(cf) > 1:
             self.world_size_original = cf.data_parallel_size
         cf.world_size_original = self.world_size_original
 
@@ -586,10 +605,7 @@ class Trainer(TrainerBase):
         self.loss_calculator_val = LossCalculator(cf, val_cfg, VAL, device=self.device)
 
         # recover mini_epoch when continuing run
-        if (
-            cf.get("noise_injector", {}).get("member_parallel", False)
-            or self.world_size_original is None
-        ):
+        if get_ensemble_size(cf) > 1 or self.world_size_original is None:
             mini_epoch_base = int(self.cf.general.istep / len(self.data_loader))
         else:
             len_per_rank = (

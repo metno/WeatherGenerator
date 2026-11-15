@@ -17,7 +17,7 @@ import torch.multiprocessing
 
 from weathergen.common.config import Config
 from weathergen.train.utils import str_to_tensor, tensor_to_str
-from weathergen.utils.distributed import init_ensemble_parallel, is_root
+from weathergen.utils.distributed import get_ensemble_size, init_ensemble_parallel, is_root
 
 PORT = 1345
 
@@ -142,12 +142,13 @@ class TrainerBase:
         cf.with_ddp = world_size > 1
 
         cf = init_ensemble_parallel(cf)
-        if cf.get("noise_injector", {}).get("member_parallel", False):
+        if get_ensemble_size(cf) > 1:
             seed_device = (
                 torch.device(f"cuda:{local_rank}") if dist.get_backend() == "nccl" else "cpu"
             )
             seed = torch.tensor([cf.data_loading.rng_seed], dtype=torch.int64, device=seed_device)
             dist.broadcast(seed, src=0)
             cf.data_loading.rng_seed = seed.item()
+            torch.manual_seed(cf.data_loading.rng_seed)
 
         return cf

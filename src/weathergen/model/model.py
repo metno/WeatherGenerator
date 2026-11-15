@@ -49,6 +49,8 @@ from weathergen.model.utils import get_num_parameters
 from weathergen.utils.distributed import (
     gather_ensemble_predictions,
     get_ensemble_parallel_size,
+    get_ensemble_size,
+    get_noise_config,
     is_root,
     validate_ensemble_targets,
 )
@@ -362,21 +364,20 @@ class Model(torch.nn.Module):
 
         self.cf = cf
         self.dtype = get_dtype(self.cf.attention_dtype)
-        noise_cfg = cf.get("noise_injector", {})
-        self.noise_ensemble_size = (
-            noise_cfg.get("ensemble_size", 1) if noise_cfg.get("enabled", False) else 1
+        noise_cfg = get_noise_config(cf)
+        self.ensemble_size = get_ensemble_size(cf)
+        self.shared_prediction_head = (
+            self.ensemble_size > 1
+            or get_ensemble_size(cf, cf.training_config) > 1
+            or noise_cfg.get("enabled", False)
         )
-        if not isinstance(self.noise_ensemble_size, int) or self.noise_ensemble_size < 1:
-            raise ValueError("noise_injector.ensemble_size must be a positive integer.")
-        self.member_parallel = noise_cfg.get("member_parallel", False)
-        if self.member_parallel and get_ensemble_parallel_size() != self.noise_ensemble_size:
+        if get_ensemble_parallel_size() != self.ensemble_size:
             raise ValueError("Initialize an ensemble process group before creating the model.")
-        self.local_noise_ensemble_size = 1 if self.member_parallel else self.noise_ensemble_size
-        if self.noise_ensemble_size > 1:
-            if cf.get("diffusion", {}).get("enabled", False) or cf.fe_num_blocks < 1:
-                raise ValueError("Noise ensembles require a non-diffusion forecast engine.")
+        if self.ensemble_size > 1:
+            if cf.get("diffusion", {}).get("enabled", False):
+                raise ValueError("Parallel forecast members cannot use diffusion sampling.")
             if list(cf.training_config.training_mode) != ["masking"]:
-                raise ValueError("Noise ensembles currently support physical-space training only.")
+                raise ValueError("Parallel members currently support physical-space training only.")
         self.sources_size = sources_size
         self.targets_num_channels = targets_num_channels
         self.targets_coords_size = targets_coords_size
@@ -575,7 +576,7 @@ class Model(torch.nn.Module):
                         dims_embed[-1],
                         self.targets_num_channels[i_stream],
                         si["pred_head"]["num_layers"],
-                        1 if self.noise_ensemble_size > 1 else si["pred_head"]["ens_size"],
+                        1 if self.shared_prediction_head else si["pred_head"]["ens_size"],
                         norm_type=cf.norm_type,
                         final_activation=final_activation,
                         stream_name=stream_name,
@@ -630,7 +631,7 @@ class Model(torch.nn.Module):
                         dims_embed[-1],
                         self.targets_num_channels[i_stream],
                         si["pred_head"]["num_layers"],
-                        1 if self.noise_ensemble_size > 1 else si["pred_head"]["ens_size"],
+                        1 if self.shared_prediction_head else si["pred_head"]["ens_size"],
                         norm_type=cf.norm_type,
                         final_activation=final_activation,
                         stream_name=stream_name,
@@ -1031,8 +1032,6 @@ class Model(torch.nn.Module):
             shape = (len(source_samples), source_samples.get_num_steps(), *tokens.shape[1:])
             # collapse along input step dimension
             tokens = tokens.reshape(shape)
-            if self.local_noise_ensemble_size > 1:
-                tokens = tokens.repeat(self.local_noise_ensemble_size, 1, 1, 1)
             # reshape intermediates the same way as tokens
             for i, inter in enumerate(intermediates):
                 intermediates[i] = inter.reshape(shape).sum(axis=1)
@@ -1144,21 +1143,14 @@ class Model(torch.nn.Module):
             return output
 
         if out_step is None:
-            out_step = step
+            out_step = output.chunk_idx(step)
 
         # remove register  and class tokens
         tokens = tokens[:, self.num_aux_tokens :]
 
         # get 1-ring neighborhood for prediction
-        # Derive the effective batch size from the token tensor so that the ensemble branch
-        # can pass all N members stacked on dim 0 without a separate loop.
         batch_size = tokens.shape[0]
         s = [batch_size, self.num_healpix_cells, self.cf.ae_local_num_queries, tokens.shape[-1]]
-        # Add per-member batch offsets so that member i looks up its own rows in the
-        # flattened (batch_size * H, Q, D) tensor.  Without the offset every member
-        # would index into [0, H) — i.e. always member 0's tokens — causing all
-        # ensemble members to decode with identical features and produce identical
-        # predictions.
         batch_offsets = (
             torch.arange(batch_size, device=model_params.hp_nbours.device)[:, None, None]
             * self.num_healpix_cells
@@ -1191,8 +1183,7 @@ class Model(torch.nn.Module):
             t_coords_lens = [len(t) for t in t_coords]
             t_coords = torch.cat(t_coords)
 
-            if self.member_parallel:
-                validate_ensemble_targets(t_coords, t_coords_lens)
+            validate_ensemble_targets(t_coords, t_coords_lens)
             if len(t_coords) == 0:
                 continue
 
@@ -1245,16 +1236,8 @@ class Model(torch.nn.Module):
                     pred = self.pred_heads[stream_name](tc_tokens)
 
             # recover batch dimension (ragged, so as list)
-            if self.member_parallel:
-                pred = gather_ensemble_predictions(pred)
+            pred = gather_ensemble_predictions(pred)
             pred = torch.split(pred, t_coords_lens, dim=1)
-            if self.local_noise_ensemble_size > 1:
-                pred = tuple(
-                    torch.cat(pred[sample_idx::n_real], dim=0) for sample_idx in range(n_real)
-                )
-            # out_step (not chunk_idx derived from the constant `step`) so that decoding the
-            # same real forecast step at several out_steps (e.g. one per ODE denoising step in
-            # diffusion) doesn't repeatedly overwrite a single slot.
-            output.add_physical_prediction(output.chunk_idx(out_step), stream_name, pred)
+            output.add_physical_prediction(out_step, stream_name, pred)
 
         return output

@@ -41,6 +41,7 @@ class NoiseInjector(nn.Module):
         hidden_dim: int = 64,
         noise_std: float = 1.0,
         seed: int | None = None,
+        condition_on_forecast_step: bool = False,
     ) -> None:
         super().__init__()
         if noise_dim <= 0 or hidden_dim <= 0 or noise_std < 0:
@@ -48,16 +49,19 @@ class NoiseInjector(nn.Module):
         self.noise_dim = noise_dim
         self.noise_std = noise_std
         self.seed = seed
+        self.condition_on_forecast_step = condition_on_forecast_step
         self._generator = None
         self.noise_mlp = nn.Sequential(
-            nn.Linear(noise_dim, hidden_dim),
+            nn.Linear(noise_dim + int(condition_on_forecast_step), hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, noise_dim),
             nn.LayerNorm(noise_dim),
         )
         self.projection = nn.Linear(latent_dim + noise_dim, latent_dim)
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, tokens: torch.Tensor, fstep: int | None = None) -> torch.Tensor:
+        if self.condition_on_forecast_step and fstep is None:
+            raise ValueError("fstep is required for forecast-step-conditioned noise injection.")
         if self.seed is not None and (
             self._generator is None or self._generator.device != tokens.device
         ):
@@ -71,6 +75,9 @@ class NoiseInjector(nn.Module):
             )
             * self.noise_std
         )
+        if self.condition_on_forecast_step:
+            step_features = torch.full_like(noise[..., :1], fstep)
+            noise = torch.cat((noise, step_features), dim=-1)
         noise = self.noise_mlp(noise)
         return self.projection(torch.cat((tokens, noise), dim=-1))
 

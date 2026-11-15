@@ -33,20 +33,36 @@ class _GatherEnsemble(torch.autograd.Function):
         return local.contiguous(), None
 
 
+def _get_mode_config(cf, section, mode_cfg=None) -> dict:
+    settings = dict(cf.get("training_config", {}).get(section, {}))
+    if mode_cfg is not None:
+        settings.update(mode_cfg.get(section, {}))
+    elif cf.get("stage") == "inference":
+        settings.update(cf.get("validation_config", {}).get(section, {}))
+        settings.update(cf.get("test_config", {}).get(section, {}))
+    return settings
+
+
+def get_noise_config(cf, mode_cfg=None) -> dict:
+    """Resolve injector settings independently of ensemble execution."""
+    return _get_mode_config(cf, "noise", mode_cfg)
+
+
+def get_ensemble_size(cf, mode_cfg=None) -> int:
+    """Resolve the member count; multi-member execution always uses parallel ranks."""
+    size = _get_mode_config(cf, "forecast", mode_cfg).get("num_members", 1)
+    if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+        raise ValueError("forecast.num_members must be a positive integer.")
+    return size
+
+
 def init_ensemble_parallel(cf):
     """Assign contiguous member ranks to each logical data-parallel sample batch."""
     global _ENSEMBLE_GROUP
     _ENSEMBLE_GROUP = None
-    noise_cfg = cf.get("noise_injector", {})
-    size = noise_cfg.get("ensemble_size", 1) if noise_cfg.get("member_parallel", False) else 1
-    if not isinstance(size, int) or size < 1:
-        raise ValueError("noise_injector.ensemble_size must be a positive integer.")
-    if noise_cfg.get("member_parallel", False) and size < 2:
-        raise ValueError("Member parallelism requires at least two ensemble members.")
+    size = get_ensemble_size(cf)
     world_size = get_world_size()
     if size > 1:
-        if not noise_cfg.get("enabled", False):
-            raise ValueError("Member parallelism requires noise_injector.enabled.")
         if world_size % size:
             raise ValueError("Distributed world size must be divisible by the ensemble size.")
         for start in range(0, world_size, size):
@@ -82,16 +98,10 @@ def validate_ensemble_targets(coordinates: torch.Tensor, lengths: list[int]) -> 
         raise ValueError("Ensemble members must use identical target coordinates and lengths.")
 
 
-def gather_ensemble_predictions(
-    predictions: torch.Tensor,
-    target_coordinates: torch.Tensor | None = None,
-    target_lengths: list[int] | None = None,
-) -> torch.Tensor:
+def gather_ensemble_predictions(predictions: torch.Tensor) -> torch.Tensor:
     """Gather members with backward communication; DDP/FSDP averages weight gradients."""
     if _ENSEMBLE_GROUP is None:
         return predictions
-    if target_coordinates is not None:
-        validate_ensemble_targets(target_coordinates, target_lengths or [])
     ndim = torch.tensor([predictions.ndim], dtype=torch.int64, device=predictions.device)
     dimensions = [torch.empty_like(ndim) for _ in range(get_ensemble_parallel_size())]
     dist.all_gather(dimensions, ndim, group=_ENSEMBLE_GROUP)
