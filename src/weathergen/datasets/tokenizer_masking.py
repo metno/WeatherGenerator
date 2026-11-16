@@ -41,9 +41,13 @@ def readerdata_to_torch(rdata: IOReaderData) -> IOReaderData:
 
 class TokenizerMasking(Tokenizer):
     def __init__(
-        self, healpix_level: int, masker: Masker, domain=None, normalize_lcoords: bool = True
+        self, healpix_level: int, masker: Masker, domain=None, normalize_lcoords: bool = True,
+        normalize_source_lcoords: bool = False,
     ):
-        super().__init__(healpix_level, domain, normalize_lcoords=normalize_lcoords)
+        super().__init__(
+            healpix_level, domain, normalize_lcoords=normalize_lcoords,
+            normalize_source_lcoords=normalize_source_lcoords,
+        )
         self.masker = masker
         self.rng = None
         self.token_size = None
@@ -148,6 +152,7 @@ class TokenizerMasking(Tokenizer):
             time_win,
             self.hpy_verts_rots_source[-1],
             encode_times_source,
+            coords_local_scale=self.source_lcoords_scale,
         )
 
         return (source_tokens_cells, source_tokens_lens)

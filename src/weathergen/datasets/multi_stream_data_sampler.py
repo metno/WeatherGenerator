@@ -145,6 +145,10 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         # config `normalize_target_lcoords` (default True). Changes the decoder inputs,
         # so checkpoints trained without it are not directly comparable.
         normalize_lcoords = bool(cf.get("normalize_target_lcoords", True))
+        # rescaling of the local coordinates of the SOURCE points to units of cells;
+        # config `normalize_source_lcoords` (default False = original behaviour). Changes
+        # the encoder inputs: needs a new autoencoder, same value in its forecasts.
+        normalize_source_lcoords = bool(cf.get("normalize_source_lcoords", False))
         self._maskers: dict[int, Masker] = {}
         self._tokenizers: dict[int, TokenizerMasking] = {}
         for lvl in self.domain_pyramid.levels:
@@ -152,7 +156,8 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             masker_l = Masker(lvl, stage, cf.streams, self.mode_cfg, domain=dom_l)
             self._maskers[lvl] = masker_l
             self._tokenizers[lvl] = TokenizerMasking(
-                lvl, masker_l, domain=dom_l, normalize_lcoords=normalize_lcoords
+                lvl, masker_l, domain=dom_l, normalize_lcoords=normalize_lcoords,
+                normalize_source_lcoords=normalize_source_lcoords,
             )
 
         # backward-compat aliases: legacy single-tokenizer references resolve to

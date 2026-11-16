@@ -7,6 +7,7 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+import math
 import warnings
 
 import astropy_healpix as hp
@@ -27,7 +28,8 @@ class Tokenizer:
     Base class for tokenizers.
     """
 
-    def __init__(self, healpix_level: int, domain=None, normalize_lcoords: bool = True):
+    def __init__(self, healpix_level: int, domain=None, normalize_lcoords: bool = True,
+                 normalize_source_lcoords: bool = False):
         ref = torch.tensor([1.0, 0.0, 0.0])
 
         if domain is None:
@@ -38,6 +40,14 @@ class Tokenizer:
         self.healpix_level = healpix_level
         self.hl_source = healpix_level
         self.hl_target = healpix_level
+        # local coordinates of the SOURCE points (lat/lon relative to the cell centre, in
+        # radians): multiplied by 1 / (mean cell size in radians) when
+        # normalize_source_lcoords is set, so they are in units of cells (order 1) instead
+        # of ~1e-3. None = unchanged (original behaviour).
+        self.source_lcoords_scale = (
+            1.0 / math.sqrt(4.0 * math.pi / (12 * 4**healpix_level))
+            if normalize_source_lcoords else None
+        )
 
         self.num_healpix_cells_source = len(domain)
         self.num_healpix_cells_target = len(domain)

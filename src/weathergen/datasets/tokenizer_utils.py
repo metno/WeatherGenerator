@@ -294,9 +294,15 @@ def tokenize_apply_mask_source(
     time_win,
     hpy_verts_rots,
     enc_time,
+    coords_local_scale=None,
 ):
     """
     Apply masking to the data.
+
+    coords_local_scale: None -> the local coordinates of the source points are used as they
+    are (radians relative to the cell centre: ~1e-3 at healpix level 8). A number -> they
+    are multiplied by it (Tokenizer.source_lcoords_scale = 1 / cell size, giving values of
+    order 1 like the other inputs). Config normalize_source_lcoords.
 
     Conceptually, the data is a matrix with the rows corresponding to data points / tokens and
     the cols the channels. Thereby mask_tokens acts on the rows, grouped according to the tokens as
@@ -357,7 +363,9 @@ def tokenize_apply_mask_source(
             for tt, mm in zip(idxs_cells, mask_tokens_per_cell, strict=False)
         ]
     ).to(dtype=torch.int32)
-    coords_local = get_source_coords_local(coords, hpy_verts_rots, masked_points_per_cell)
+    coords_local = get_source_coords_local(
+        coords, hpy_verts_rots, masked_points_per_cell, scale=coords_local_scale
+    )
 
     # create tensor that contains all data
     stream_ids = torch.full([len(datetimes), 1], stream_id, dtype=torch.float32)
@@ -466,8 +474,15 @@ def get_source_coords_local(
     coords: Tensor,
     hpy_verts_rots: Tensor,
     masked_points_per_cell,
+    scale=None,
 ) -> list[Tensor]:
-    """Compute simple local coordinates for a set of 3D positions on the unit sphere."""
+    """Compute simple local coordinates for a set of 3D positions on the unit sphere.
+
+    The points are rotated into the frame of their cell and expressed as (lat, lon) in
+    radians relative to the cell centre, so the values are of the size of a cell in
+    radians (~0.004 at level 8, ~0.03 at level 5). scale (None = unchanged) multiplies
+    them; with scale = 1 / cell size they are in units of cells, i.e. of order 1.
+    """
 
     # remove padding from coords
     posr3 = s2tor3(*theta_phi_to_standard_coords(coords))
@@ -481,7 +496,9 @@ def get_source_coords_local(
     vec_rot = torch.bmm(rots, posr3.unsqueeze(-1)).squeeze(-1)
     vec_scaled = r3tos2(vec_rot).to(torch.float32)
 
-    # TODO: vec_scaled are small -> should they be normalized/rescaled?
+    # vec_scaled are small: optionally rescale to units of cells
+    if scale is not None:
+        vec_scaled = vec_scaled * float(scale)
 
     return vec_scaled
 
