@@ -363,8 +363,10 @@ def tokenize_apply_mask_source(
             for tt, mm in zip(idxs_cells, mask_tokens_per_cell, strict=False)
         ]
     ).to(dtype=torch.int32)
+    # padding entries of the tokens (index 0 -> the dummy row at lat 0, lon 0)
     coords_local = get_source_coords_local(
-        coords, hpy_verts_rots, masked_points_per_cell, scale=coords_local_scale
+        coords, hpy_verts_rots, masked_points_per_cell, scale=coords_local_scale,
+        pad_mask=(idxs_data == 0),
     )
 
     # create tensor that contains all data
@@ -475,6 +477,7 @@ def get_source_coords_local(
     hpy_verts_rots: Tensor,
     masked_points_per_cell,
     scale=None,
+    pad_mask=None,
 ) -> list[Tensor]:
     """Compute simple local coordinates for a set of 3D positions on the unit sphere.
 
@@ -482,6 +485,13 @@ def get_source_coords_local(
     radians relative to the cell centre, so the values are of the size of a cell in
     radians (~0.004 at level 8, ~0.03 at level 5). scale (None = unchanged) multiplies
     them; with scale = 1 / cell size they are in units of cells, i.e. of order 1.
+
+    pad_mask (bool, one entry per point; used only together with scale): True for the
+    padding entries that fill the last token of a cell. Their position is the dummy point
+    (lat 0, lon 0), which seen from the cell is far away (~1 rad, i.e. hundreds of cells);
+    with rescaling this would become a huge input, so their local coordinates are set to 0.
+    Padding remains recognisable through the time channels, which are 0 only for padding.
+    Without scale the original values are kept, so earlier runs are reproduced exactly.
     """
 
     # remove padding from coords
@@ -499,6 +509,8 @@ def get_source_coords_local(
     # vec_scaled are small: optionally rescale to units of cells
     if scale is not None:
         vec_scaled = vec_scaled * float(scale)
+        if pad_mask is not None:
+            vec_scaled[pad_mask] = 0.0
 
     return vec_scaled
 
