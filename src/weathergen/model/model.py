@@ -765,6 +765,8 @@ class Model(torch.nn.Module):
             down_rope=_fc_cfg.get("down_rope", False),
             down_rope_wavelengths=_fc_cfg.get("down_rope_wavelengths", [0.25, 8.0]),
             down_sigma=_fc_cfg.get("down_sigma", 0.0),
+            up_rope=_fc_cfg.get("up_rope", False),
+            up_rope_wavelengths=_fc_cfg.get("up_rope_wavelengths", [0.25, 4.0]),
         )
 
         # embed coordinates yielding one query token for each target token

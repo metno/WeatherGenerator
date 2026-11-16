@@ -44,6 +44,11 @@ Options for the "attention" operator, coarse -> fine direction (both off by defa
                 a Gaussian preference for near sources. The set of 9 sources changes when a
                 fine cell crosses a coarse border; far sources then have ~zero weight, so
                 the update stays (nearly) continuous across the border. 0 = off.
+Option for the fine -> coarse direction (attention operator, off by default):
+    up_rope   : 2D RoPE between the coarse cell and each of its children, so the attention
+                sees where a child sits relative to the coarse cell centre (offsets in
+                units of coarse cells). Without it the children can only be told apart by
+                their content.
 
 The cascade operates ONLY on the spatial cell tokens; prepended register/class
 ("aux") tokens are passed through untouched. With a single-level pyramid there
@@ -90,7 +95,7 @@ class _PairOperator(torch.nn.Module):
     """
 
     def __init__(self, dim: int, kind: str = "none", num_heads: int = 8,
-                 down_rope_wavelengths=None):
+                 down_rope_wavelengths=None, up_rope_wavelengths=None):
         super().__init__()
         self.kind = kind
         self.dim = dim
@@ -110,7 +115,7 @@ class _PairOperator(torch.nn.Module):
             self.num_heads = num_heads
             assert dim % num_heads == 0, "dim must be divisible by num_heads"
             self.down_attn = _CrossAttn(dim, num_heads, rope_wavelengths=down_rope_wavelengths)
-            self.up_attn = _CrossAttn(dim, num_heads)
+            self.up_attn = _CrossAttn(dim, num_heads, rope_wavelengths=up_rope_wavelengths)
         else:
             raise ValueError(f"unknown cascade operator kind={kind!r}")
 
@@ -121,12 +126,12 @@ class _PairOperator(torch.nn.Module):
             return self.down_proj(source)
         return self.down_attn(query, source, mask, coords_q, coords_src, bias)
 
-    def up(self, query, source, mask=None):
+    def up(self, query, source, mask=None, coords_q=None, coords_src=None):
         if self.kind == "none":
             return source
         if self.kind == "linear":
             return self.up_proj(source)
-        return self.up_attn(query, source, mask)
+        return self.up_attn(query, source, mask, coords_q, coords_src)
 
 
 class _CrossAttn(torch.nn.Module):
@@ -247,16 +252,20 @@ class LatentCascade(torch.nn.Module):
         down_rope: bool = False,
         down_rope_wavelengths=(0.25, 8.0),
         down_sigma: float = 0.0,
+        up_rope: bool = False,
+        up_rope_wavelengths=(0.25, 4.0),
     ):
         super().__init__()
+        self.up_rope = bool(up_rope) and operator == "attention"
+        self.up_rope_wavelengths = (float(up_rope_wavelengths[0]), float(up_rope_wavelengths[1]))
         self.down_sigma = float(down_sigma or 0.0) if operator == "attention" else 0.0
         # down_ring / down_rope: see the module docstring. Attention operator only.
         self.down_ring = bool(down_ring) and operator == "attention"
         self.down_rope = bool(down_rope) and operator == "attention"
-        if (down_ring or down_rope) and operator != "attention":
+        if (down_ring or down_rope or up_rope) and operator != "attention":
             _logger.warning(
-                "latent cascade: down_ring / down_rope need operator 'attention'; ignored "
-                f"for operator '{operator}'"
+                "latent cascade: down_ring / down_rope / up_rope need operator 'attention'; "
+                f"ignored for operator '{operator}'"
             )
         self.pyramid = domain_pyramid
         self.dim = dim
@@ -277,6 +286,7 @@ class LatentCascade(torch.nn.Module):
             self._ops[key] = _PairOperator(
                 dim, operator, num_heads=num_heads,
                 down_rope_wavelengths=down_rope_wavelengths if self.down_rope else None,
+                up_rope_wavelengths=self.up_rope_wavelengths if self.up_rope else None,
             )
             poc = self.pyramid.parent_of_child(lc, lf)        # (n_fine,) coarse idx or -1
             cop = self.pyramid.child_of_parent(lc, lf)        # (n_coarse, K) fine idx or -1
@@ -292,6 +302,52 @@ class LatentCascade(torch.nn.Module):
         # computed in the constructor (and non-persistent buffers would not survive).
         self.down_rope_wavelengths = (float(down_rope_wavelengths[0]), float(down_rope_wavelengths[1]))
         self._down_geo = {}
+
+    def _centres(self, lc, lf):
+        """Map positions (CPU, float32) of the fine and coarse cell centres of the pair
+        (lc, lf): (n_fine, 2), (n_coarse, 2), on one flat map of the fine domain, in units
+        of COARSE cells. Call inside torch.device("cpu")."""
+        from weathergen.datasets.utils import healpix_verts_rots
+
+        dom_f, dom_c = self.pyramid.domain(lf), self.pyramid.domain(lc)
+        frame = dec_rope_frame(lf, dom_f.active_cells)
+        scale = 2.0 ** (int(lf) - int(lc))                              # fine cells per coarse cell
+        vf, _ = healpix_verts_rots(lf, 0.5, 0.5)
+        vc, _ = healpix_verts_rots(lc, 0.5, 0.5)
+        xy_f = dec_rope_project(vf[torch.from_numpy(np.asarray(dom_f.active_cells))], frame) / scale
+        xy_c = dec_rope_project(vc[torch.from_numpy(np.asarray(dom_c.active_cells))], frame) / scale
+        return xy_f, xy_c
+
+    def _up_geometry(self, lc, lf, device):
+        """
+        Tables for the fine -> coarse attention with up_rope, on `device` (cached, built at
+        the first forward, see _down_geometry):
+          xyq (n_coarse, 2)     map position of the coarse cell centres
+          xys (n_coarse, K, 2)  map position of the K children of every coarse cell
+                                (missing children: position of the coarse cell; they are
+                                masked in the attention anyway)
+        """
+        ck = ("up", int(lc), int(lf), str(device))
+        if ck in self._down_geo:
+            return self._down_geo[ck]
+        with torch.no_grad(), torch.device("cpu"):
+            xy_f, xy_c = self._centres(lc, lf)
+            cop = torch.as_tensor(
+                np.asarray(self.pyramid.child_of_parent(lc, lf)), dtype=torch.long
+            )                                                           # (n_coarse, K), -1 = none
+            ok = (cop >= 0) & (cop < xy_f.shape[0])
+            xys = xy_f[cop.clamp(min=0, max=xy_f.shape[0] - 1)]         # (n_coarse, K, 2)
+            xys = torch.where(ok.unsqueeze(-1), xys, xy_c.unsqueeze(1).expand_as(xys))
+            off = (xys - xy_c.unsqueeze(1)).norm(dim=-1)[ok]
+            _logger.info(
+                f"latent cascade {lf}->{lc}: up_rope=True; {int(ok.sum())} children of "
+                f"{int(ok.any(dim=1).sum())} coarse cells; distance child to coarse centre "
+                f"{float(off.min()):.2f} .. {float(off.max()):.2f} coarse cells; wavelengths "
+                f"{self.up_rope_wavelengths[0]:g} .. {self.up_rope_wavelengths[1]:g}"
+            )
+        geo = dict(xyq=xy_c.to(device), xys=xys.to(device))
+        self._down_geo[ck] = geo
+        return geo
 
     def _down_geometry(self, lc, lf, device):
         """
@@ -331,19 +387,7 @@ class LatentCascade(torch.nn.Module):
                 valid = has_parent.view(-1, 1)
             geo = dict(src=src, valid=valid, xyq=None, xys=None, bias=None)
             if self.down_rope or self.down_sigma > 0.0:
-                from weathergen.datasets.utils import healpix_verts_rots
-
-                dom_f, dom_c = self.pyramid.domain(lf), self.pyramid.domain(lc)
-                frame = dec_rope_frame(lf, dom_f.active_cells)
-                scale = 2.0 ** (int(lf) - int(lc))                          # fine cells per coarse cell
-                vf, _ = healpix_verts_rots(lf, 0.5, 0.5)
-                vc, _ = healpix_verts_rots(lc, 0.5, 0.5)
-                xy_f = dec_rope_project(
-                    vf[torch.from_numpy(np.asarray(dom_f.active_cells))], frame
-                ) / scale
-                xy_c = dec_rope_project(
-                    vc[torch.from_numpy(np.asarray(dom_c.active_cells))], frame
-                ) / scale
+                xy_f, xy_c = self._centres(lc, lf)
                 dist = (xy_c[src] - xy_f.unsqueeze(1)).norm(dim=-1)                    # (n_fine, S)
                 if self.down_rope:
                     geo["xyq"], geo["xys"] = xy_f, xy_c[src]
@@ -458,7 +502,11 @@ class LatentCascade(torch.nn.Module):
                     # attention: query = coarse cell; source = its K children set;
                     # mask out inactive children.
                     m = cv.view(1, n_coarse, K).expand(B, -1, -1)
-                    cells[lc] = cells[lc] + op.up(cells[lc], gathered, m)
+                    if self.up_rope:
+                        ug = self._up_geometry(lc, lf, fine.device)
+                        cells[lc] = cells[lc] + op.up(cells[lc], gathered, m, ug["xyq"], ug["xys"])
+                    else:
+                        cells[lc] = cells[lc] + op.up(cells[lc], gathered, m)
 
         # re-merge aux + updated cells
         out = {}

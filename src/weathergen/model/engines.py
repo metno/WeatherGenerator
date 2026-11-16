@@ -464,6 +464,21 @@ class GlobalAssimilationEngine(torch.nn.Module):
 
         self.ae_global_blocks = torch.nn.ModuleList()
 
+        # rope_2D_wavelengths: [shortest, longest] wavelength of the global engine's RoPE, in
+        # cells, replacing the fixed 2*pi*10000^(i/n) series (~6 .. ~60000 cells, most of it
+        # far larger than the domain). longest <= 0 -> twice the domain extent of the
+        # engine's level. Unset -> original series. Needs rope_2D with rope_2D_coords "cell"
+        # (the wavelengths are in cells). Only Python numbers are stored here.
+        rope_wl = self.cf.get("rope_2D_wavelengths", None)
+        if rope_wl is not None:
+            rope_wl = (float(rope_wl[0]), float(rope_wl[1]))
+            if not self.cf.get("rope_2D", False) or self.cf.get("rope_2D_coords", "radians") != "cell":
+                raise ValueError(
+                    'rope_2D_wavelengths needs rope_2D: True and rope_2D_coords: "cell" '
+                    "(the wavelengths are given in cells)"
+                )
+        self.rope_wavelengths = rope_wl
+
         global_rate = int(1 / self.cf.ae_global_att_dense_rate)
         for i in range(self.cf.ae_global_num_blocks):
             ## Alternate between local and global attention
@@ -483,9 +498,15 @@ class GlobalAssimilationEngine(torch.nn.Module):
                         norm_eps=self.cf.norm_eps,
                         attention_dtype=get_dtype(self.cf.attention_dtype),
                         with_2d_rope=self.cf.get("rope_2D", False),
+                        rope_wavelengths=rope_wl,
                     )
                 )
             else:
+                if rope_wl is not None:
+                    raise NotImplementedError(
+                        "rope_2D_wavelengths is implemented for dense global attention only "
+                        "(ae_global_att_dense_rate: 1.0)"
+                    )
                 self.ae_global_blocks.append(
                     MultiSelfAttentionHeadLocal(
                         self.cf.ae_global_dim_embed,
@@ -574,6 +595,14 @@ class ForecastingEngine(torch.nn.Module):
             if not fe_rope:
                 raise ValueError("fe_rope_wavelengths needs RoPE in the forecast engine "
                                  "(fe_rope_2D or rope_2D: True)")
+            # the forecast engine's coordinates are in cells with fe_rope_2D: True, or when
+            # it inherits cell-unit coordinates from rope_2D
+            if not (bool(self.cf.get("fe_rope_2D", False))
+                    or self.cf.get("rope_2D_coords", "radians") == "cell"):
+                raise ValueError(
+                    "fe_rope_wavelengths are in cells: needs fe_rope_2D: True or "
+                    'rope_2D_coords: "cell"'
+                )
         self.fe_rope_wavelengths = fe_rope_wl
         if mode_cfg.get("forecast", {}).get("policy") is not None:
             for i in range(self.cf.fe_num_blocks):

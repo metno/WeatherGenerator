@@ -184,6 +184,8 @@ class EncoderModule(torch.nn.Module):
             down_rope=_casc_cfg.get("down_rope", False),
             down_rope_wavelengths=_casc_cfg.get("down_rope_wavelengths", [0.25, 8.0]),
             down_sigma=_casc_cfg.get("down_sigma", 0.0),
+            up_rope=_casc_cfg.get("up_rope", False),
+            up_rope_wavelengths=_casc_cfg.get("up_rope_wavelengths", [0.25, 4.0]),
         )
     def _build_q_cells(
         self, cf, num_cells: int, healpix_level: int, active_cells=None
