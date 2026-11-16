@@ -30,6 +30,21 @@ connections is a pluggable operator:
     - "attention" : (future) fine cells cross-attend to their parent coarse latent
                     and vice versa. Same call site; only the operator changes.
 
+Options for the "attention" operator, coarse -> fine direction (both off by default):
+    down_ring : each fine cell reads the 9 coarse cells around its parent (the parent and
+                its 8 neighbours) instead of the parent alone. With a single source the
+                attention weight is always 1 (the fine cell's own content plays no role
+                and all children of a parent get the same update); with 9 sources the
+                fine cell selects among them and can draw on the neighbouring parent.
+    down_rope : 2D RoPE between the fine cell and each coarse source, so the attention
+                sees the offset (fine cell centre - coarse cell centre) and the update can
+                vary smoothly inside a parent. Offsets in units of coarse cells.
+    down_sigma: > 0 adds a distance penalty -d^2 / (2 sigma^2) to the attention scores
+                (d = distance fine cell centre - coarse cell centre, in coarse cells), i.e.
+                a Gaussian preference for near sources. The set of 9 sources changes when a
+                fine cell crosses a coarse border; far sources then have ~zero weight, so
+                the update stays (nearly) continuous across the border. 0 = off.
+
 The cascade operates ONLY on the spatial cell tokens; prepended register/class
 ("aux") tokens are passed through untouched. With a single-level pyramid there
 are no adjacent pairs, so the cascade is a no-op (baseline behaviour preserved).
@@ -39,6 +54,14 @@ import logging
 
 import numpy as np
 import torch
+
+from weathergen.model.positional_encoding import (
+    apply_rotary_2d_single,
+    dec_rope_frame,
+    dec_rope_project,
+    rope_2d_wavelength_freqs,
+    rotary_cos_sin_2d_wavelengths,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -66,7 +89,8 @@ class _PairOperator(torch.nn.Module):
     applied by the caller; the operator only transforms features.
     """
 
-    def __init__(self, dim: int, kind: str = "none", num_heads: int = 8):
+    def __init__(self, dim: int, kind: str = "none", num_heads: int = 8,
+                 down_rope_wavelengths=None):
         super().__init__()
         self.kind = kind
         self.dim = dim
@@ -85,17 +109,17 @@ class _PairOperator(torch.nn.Module):
         elif kind == "attention":
             self.num_heads = num_heads
             assert dim % num_heads == 0, "dim must be divisible by num_heads"
-            self.down_attn = _CrossAttn(dim, num_heads)
+            self.down_attn = _CrossAttn(dim, num_heads, rope_wavelengths=down_rope_wavelengths)
             self.up_attn = _CrossAttn(dim, num_heads)
         else:
             raise ValueError(f"unknown cascade operator kind={kind!r}")
 
-    def down(self, query, source, mask=None):
+    def down(self, query, source, mask=None, coords_q=None, coords_src=None, bias=None):
         if self.kind == "none":
             return source
         if self.kind == "linear":
             return self.down_proj(source)
-        return self.down_attn(query, source, mask)
+        return self.down_attn(query, source, mask, coords_q, coords_src, bias)
 
     def up(self, query, source, mask=None):
         if self.kind == "none":
@@ -120,26 +144,59 @@ class _CrossAttn(torch.nn.Module):
         (B, N, q, D)   additive update
     """
 
-    def __init__(self, dim: int, num_heads: int):
+    def __init__(self, dim: int, num_heads: int, rope_wavelengths=None):
         super().__init__()
         self.h = num_heads
         self.dh = dim // num_heads
+        # optional 2D RoPE between a target cell and its sources: (shortest, longest)
+        # wavelength in the units of the coordinates passed to forward(). No weights.
+        self.rope_wavelengths = (
+            None if rope_wavelengths is None
+            else (float(rope_wavelengths[0]), float(rope_wavelengths[1]))
+        )
+        if self.rope_wavelengths is not None:
+            assert self.dh % 4 == 0, f"cascade RoPE needs a head dimension divisible by 4; got {self.dh}"
         self.q_proj = torch.nn.Linear(dim, dim, bias=False)
         self.k_proj = torch.nn.Linear(dim, dim, bias=False)
         self.v_proj = torch.nn.Linear(dim, dim, bias=False)
         self.o_proj = torch.nn.Linear(dim, dim, bias=False)
         torch.nn.init.zeros_(self.o_proj.weight)  # identity start
 
-    def forward(self, query, source, mask=None):
+    def forward(self, query, source, mask=None, coords_q=None, coords_src=None, bias=None):
+        """
+        coords_q (N, 2), coords_src (N, S, 2): (y, x) positions of the target cells and of
+        their sources, used only if this attention was built with rope_wavelengths.
+        bias (N, S) or None: added to the attention scores (same for all heads).
+        """
         B, N, q, D = query.shape
         S = source.shape[2]
         # fold the per-cell query count q into the batch of independent attentions
         Q = self.q_proj(query).reshape(B, N, q, self.h, self.dh)
         K = self.k_proj(source).reshape(B, N, S, q, self.h, self.dh)
         V = self.v_proj(source).reshape(B, N, S, q, self.h, self.dh)
+        if self.rope_wavelengths is not None:
+            if coords_q is None or coords_src is None:
+                raise ValueError("cascade RoPE: coords_q and coords_src are required")
+            # rotate Q by the target position and K by the source position: the score then
+            # depends only on the offset target - source. Angles in float32.
+            with torch.no_grad(), torch.autocast(device_type=Q.device.type, enabled=False):
+                freqs = rope_2d_wavelength_freqs(
+                    self.dh, self.h, self.rope_wavelengths[0], self.rope_wavelengths[1],
+                    device=Q.device,
+                )
+                cq, sq = rotary_cos_sin_2d_wavelengths(coords_q.float(), freqs)   # (N, h, dh/2)
+                ck, sk = rotary_cos_sin_2d_wavelengths(coords_src.float().reshape(-1, 2), freqs)
+                half = self.dh // 2
+                cq, sq = cq.view(1, N, 1, self.h, half), sq.view(1, N, 1, self.h, half)
+                ck = ck.view(1, N, S, 1, self.h, half)
+                sk = sk.view(1, N, S, 1, self.h, half)
+            Q = apply_rotary_2d_single(Q, cq, sq)
+            K = apply_rotary_2d_single(K, ck, sk)
         # attention over the S neighbour axis, per (cell, query, head)
         # Q: (B,N,q,h,dh) ; K,V: (B,N,S,q,h,dh)
         scores = torch.einsum("bnqhd,bnsqhd->bnqhs", Q, K) / (self.dh ** 0.5)
+        if bias is not None:
+            scores = scores + bias.to(scores.dtype)[None, :, None, None, :]
         row_all_masked = None
         if mask is not None:
             # mask: (B,N,S) -> (B,N,1,1,S)
@@ -186,8 +243,21 @@ class LatentCascade(torch.nn.Module):
         num_cycles: int = 0,
         operator: str = "none",
         num_heads: int = 8,
+        down_ring: bool = False,
+        down_rope: bool = False,
+        down_rope_wavelengths=(0.25, 8.0),
+        down_sigma: float = 0.0,
     ):
         super().__init__()
+        self.down_sigma = float(down_sigma or 0.0) if operator == "attention" else 0.0
+        # down_ring / down_rope: see the module docstring. Attention operator only.
+        self.down_ring = bool(down_ring) and operator == "attention"
+        self.down_rope = bool(down_rope) and operator == "attention"
+        if (down_ring or down_rope) and operator != "attention":
+            _logger.warning(
+                "latent cascade: down_ring / down_rope need operator 'attention'; ignored "
+                f"for operator '{operator}'"
+            )
         self.pyramid = domain_pyramid
         self.dim = dim
         self.num_queries = num_queries
@@ -204,13 +274,74 @@ class LatentCascade(torch.nn.Module):
         self._ops = torch.nn.ModuleDict()
         for (lc, lf) in self.pairs:
             key = f"{lc}_{lf}"
-            self._ops[key] = _PairOperator(dim, operator, num_heads=num_heads)
+            self._ops[key] = _PairOperator(
+                dim, operator, num_heads=num_heads,
+                down_rope_wavelengths=down_rope_wavelengths if self.down_rope else None,
+            )
             poc = self.pyramid.parent_of_child(lc, lf)        # (n_fine,) coarse idx or -1
             cop = self.pyramid.child_of_parent(lc, lf)        # (n_coarse, K) fine idx or -1
             cv = self.pyramid.child_valid(lc, lf)             # (n_coarse, K) bool
             self.register_buffer(f"poc_{key}", torch.as_tensor(poc, dtype=torch.long), persistent=False)
             self.register_buffer(f"cop_{key}", torch.as_tensor(cop, dtype=torch.long), persistent=False)
             self.register_buffer(f"cv_{key}", torch.as_tensor(cv, dtype=torch.bool), persistent=False)
+
+            if self.down_ring or self.down_rope or self.down_sigma > 0.0:
+                poc_t = torch.as_tensor(poc, dtype=torch.long)
+                has_parent = poc_t >= 0
+                pidx = poc_t.clamp(min=0)
+                # sources of every fine cell: its parent (column 0) and, with down_ring, the
+                # parent's 8 neighbours. Neighbours missing from the domain are returned as
+                # the parent itself (Domain.neighbours_compact convention): mask them, so
+                # that the parent is not counted several times.
+                if self.down_ring:
+                    nb = torch.as_tensor(
+                        self.pyramid.domain(lc).neighbours_compact(), dtype=torch.long
+                    )                                                       # (n_coarse, 8)
+                    ring = torch.cat(
+                        [torch.arange(nb.shape[0]).view(-1, 1), nb], dim=1
+                    )                                                       # (n_coarse, 9)
+                    distinct = torch.ones_like(ring, dtype=torch.bool)
+                    distinct[:, 1:] = nb != torch.arange(nb.shape[0]).view(-1, 1)
+                    src = ring[pidx]                                        # (n_fine, 9)
+                    src_valid = distinct[pidx] & has_parent.view(-1, 1)
+                else:
+                    src = pidx.view(-1, 1)                                  # (n_fine, 1)
+                    src_valid = has_parent.view(-1, 1)
+                self.register_buffer(f"dsrc_{key}", src, persistent=False)
+                self.register_buffer(f"dsrcv_{key}", src_valid, persistent=False)
+                if self.down_rope or self.down_sigma > 0.0:
+                    # cell-centre positions on one flat map of the fine domain, in units
+                    # of COARSE cells (a fine cell is at most ~3 coarse cells from a source)
+                    from weathergen.datasets.utils import healpix_verts_rots
+
+                    dom_f, dom_c = self.pyramid.domain(lf), self.pyramid.domain(lc)
+                    frame = dec_rope_frame(lf, dom_f.active_cells)
+                    scale = 2.0 ** (int(lf) - int(lc))                      # fine cells per coarse cell
+                    vf, _ = healpix_verts_rots(lf, 0.5, 0.5)
+                    vc, _ = healpix_verts_rots(lc, 0.5, 0.5)
+                    xy_f = dec_rope_project(
+                        vf[torch.from_numpy(np.asarray(dom_f.active_cells))], frame
+                    ) / scale
+                    xy_c = dec_rope_project(
+                        vc[torch.from_numpy(np.asarray(dom_c.active_cells))], frame
+                    ) / scale
+                    self.register_buffer(f"dxyq_{key}", xy_f, persistent=False)        # (n_fine, 2)
+                    self.register_buffer(f"dxys_{key}", xy_c[src], persistent=False)   # (n_fine, S, 2)
+                    dist = (xy_c[src] - xy_f.unsqueeze(1)).norm(dim=-1)                # (n_fine, S)
+                    if self.down_sigma > 0.0:
+                        self.register_buffer(
+                            f"dbias_{key}", -(dist**2) / (2.0 * self.down_sigma**2),
+                            persistent=False,
+                        )
+                    off = dist[src_valid]
+                    _logger.info(
+                        f"latent cascade {lc}->{lf}: down_ring={self.down_ring} "
+                        f"down_rope={self.down_rope} down_sigma={self.down_sigma:g}; "
+                        f"{src.shape[1]} source(s) per fine cell, "
+                        f"{int(src_valid.sum())} valid; distance fine cell to source "
+                        f"{off.min():.2f} .. {off.max():.2f} coarse cells; wavelengths "
+                        f"{down_rope_wavelengths[0]:g} .. {down_rope_wavelengths[1]:g}"
+                    )
 
     # -- layout helpers ----------------------------------------------------
     def _split(self, latent):
@@ -262,6 +393,22 @@ class LatentCascade(torch.nn.Module):
                     # none/linear: pass the (validity-zeroed) parent directly.
                     parent = parent * valid.view(1, -1, 1, 1).to(parent.dtype)
                     cells[lf] = cells[lf] + op.down(cells[lf], parent)
+                elif self.down_ring or self.down_rope or self.down_sigma > 0.0:
+                    # attention over the parent (and, with down_ring, its 8 neighbours),
+                    # optionally with the fine-to-coarse offsets (down_rope)
+                    sidx = getattr(self, f"dsrc_{key}")        # (n_fine, S)
+                    sval = getattr(self, f"dsrcv_{key}")       # (n_fine, S)
+                    sval = sval & (sidx < coarse.shape[1])
+                    sidx = sidx.clamp(max=coarse.shape[1] - 1)
+                    Bc, _, qc, Dc = coarse.shape
+                    src = coarse[:, sidx.reshape(-1), :, :].reshape(
+                        Bc, sidx.shape[0], sidx.shape[1], qc, Dc
+                    )                                          # (B, n_fine, S, q, D)
+                    m = sval.unsqueeze(0).expand(Bc, -1, -1)
+                    cq = getattr(self, f"dxyq_{key}") if self.down_rope else None
+                    cs = getattr(self, f"dxys_{key}") if self.down_rope else None
+                    bias = getattr(self, f"dbias_{key}") if self.down_sigma > 0.0 else None
+                    cells[lf] = cells[lf] + op.down(cells[lf], src, m, cq, cs, bias)
                 else:
                     # attention: query = fine cell's own latent; source = its single
                     # parent as a 1-neighbour set; mask out unpaired fine cells.

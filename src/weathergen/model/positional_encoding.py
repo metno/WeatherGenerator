@@ -240,3 +240,51 @@ def apply_rotary_2d_single(t: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
     t1, t2 = t[..., :h], t[..., h:]
     cos, sin = cos.to(t.dtype), sin.to(t.dtype)
     return torch.cat((t1 * cos - t2 * sin, t2 * cos + t1 * sin), dim=-1)
+
+
+####################################################################################################
+# Flat map of a regional domain, in units of healpix cells: the coordinates used by the
+# point-to-cell RoPE of the decoder (decoder_rope_2D) and by the cell-to-cell RoPE of the
+# latent cascade (latent_cascade.down_rope).
+
+
+def dec_rope_frame(healpix_level: int, active_cells) -> dict:
+    """Local map frame for the decoder's 2D RoPE (config decoder_rope_2D).
+
+    A flat map centred on the domain: origin = mean direction of the active cell centres,
+    y axis pointing north, x axis pointing east, distances measured along the sphere from the
+    origin (azimuthal equidistant projection) and divided by the mean cell size of
+    `healpix_level`. So coordinates are in units of cells of that level, and they are
+    continuous across cell edges. Meant for regional domains (it degenerates far from the
+    origin, e.g. on a global domain).
+
+    Returns dict(c0, east, north: (3,) float64 unit vectors; cell: cell size [rad]).
+    """
+    from weathergen.datasets.utils import healpix_verts_rots  # local import: no import cycle
+
+    verts, _ = healpix_verts_rots(healpix_level, 0.5, 0.5)
+    verts = verts[torch.from_numpy(np.asarray(active_cells))].to(torch.float64)
+    c0 = verts.mean(0)
+    c0 = c0 / c0.norm()
+    zax = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64)
+    east = torch.linalg.cross(zax, c0)
+    assert east.norm() > 1e-6, "decoder RoPE frame: domain centred on a pole is not supported"
+    east = east / east.norm()
+    north = torch.linalg.cross(c0, east)
+    cell = math.sqrt(4.0 * math.pi / (12 * 4**healpix_level))
+    return dict(c0=c0, east=east, north=north, cell=cell)
+
+
+def dec_rope_project(v: torch.Tensor, frame: dict) -> torch.Tensor:
+    """Unit vectors (N, 3) -> map coordinates (N, 2) = (y, x) in cells, float32. See dec_rope_frame."""
+    v = v.to(torch.float64)
+    v = v / v.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+    c0, east, north = (frame[k].to(v.device) for k in ("c0", "east", "north"))
+    cosd = v @ c0
+    t = v - cosd.unsqueeze(-1) * c0                       # component in the tangent plane
+    sind = t.norm(dim=-1)
+    theta = torch.atan2(sind, cosd)                       # angular distance from the origin
+    scale = torch.where(sind > 1e-12, theta / sind.clamp(min=1e-12), torch.ones_like(sind))
+    y = scale * (t @ north) / frame["cell"]
+    x = scale * (t @ east) / frame["cell"]
+    return torch.stack([y, x], dim=-1).to(torch.float32)

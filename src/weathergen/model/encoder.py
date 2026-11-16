@@ -179,6 +179,11 @@ class EncoderModule(torch.nn.Module):
             num_aux=(self.num_register_tokens + self.num_class_tokens),
             num_cycles=_casc_cfg.get("num_cycles", 0),
             operator=_casc_cfg.get("operator", "none"),
+            num_heads=_casc_cfg.get("num_heads", 8),
+            down_ring=_casc_cfg.get("down_ring", False),
+            down_rope=_casc_cfg.get("down_rope", False),
+            down_rope_wavelengths=_casc_cfg.get("down_rope_wavelengths", [0.25, 8.0]),
+            down_sigma=_casc_cfg.get("down_sigma", 0.0),
         )
     def _build_q_cells(
         self, cf, num_cells: int, healpix_level: int, active_cells=None
