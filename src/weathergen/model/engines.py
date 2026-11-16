@@ -563,6 +563,18 @@ class ForecastingEngine(torch.nn.Module):
         # roll-out then passes cell-unit coordinates (ModelParams.rope_coords_fe)
         fe_rope = self.cf.get("fe_rope_2D", None)
         fe_rope = self.cf.get("rope_2D", False) if fe_rope is None else bool(fe_rope)
+        # fe_rope_wavelengths: [shortest, longest] wavelength of the forecast engine's RoPE,
+        # in cells, replacing the fixed 2*pi*10000^(i/n) series (~6 .. ~60000 cells, most of
+        # it far larger than the domain). longest <= 0 -> twice the domain extent of the
+        # engine's own level. Unset -> original series. Forecast engine only: no change to
+        # the autoencoder, so it can be used in a forecast from any autoencoder.
+        fe_rope_wl = self.cf.get("fe_rope_wavelengths", None)
+        if fe_rope_wl is not None:
+            fe_rope_wl = (float(fe_rope_wl[0]), float(fe_rope_wl[1]))
+            if not fe_rope:
+                raise ValueError("fe_rope_wavelengths needs RoPE in the forecast engine "
+                                 "(fe_rope_2D or rope_2D: True)")
+        self.fe_rope_wavelengths = fe_rope_wl
         if mode_cfg.get("forecast", {}).get("policy") is not None:
             for i in range(self.cf.fe_num_blocks):
                 # Alternate between global and local attention
@@ -581,9 +593,15 @@ class ForecastingEngine(torch.nn.Module):
                             norm_eps=self.cf.norm_eps,
                             attention_dtype=get_dtype(self.cf.attention_dtype),
                             with_2d_rope=fe_rope,
+                            rope_wavelengths=fe_rope_wl,
                         )
                     )
                 else:
+                    if fe_rope_wl is not None:
+                        raise NotImplementedError(
+                            "fe_rope_wavelengths is implemented for dense forecast attention "
+                            "only (forecast_att_dense_rate: 1.0)"
+                        )
                     self.fe_blocks.append(
                         MultiSelfAttentionHeadLocal(
                             self.cf.ae_global_dim_embed,

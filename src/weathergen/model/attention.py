@@ -785,7 +785,17 @@ class MultiSelfAttentionHead(torch.nn.Module):
         norm_eps=1e-5,
         attention_dtype=torch.bfloat16,
         with_2d_rope=False,
+        rope_wavelengths=None,
     ):
+        """
+        rope_wavelengths (only with with_2d_rope): None -> the original RoPE series
+        (wavelengths 2*pi * 10000^(i/n): from ~6 to ~60000 coordinate units).
+        (shortest, longest) -> a geometric series between the two, in the units of
+        `coords` (cells), interleaved across the heads. longest <= 0 -> twice the extent of
+        the domain, measured from `coords` at every forward (so no wavelength is spent on
+        scales larger than the domain). Only Python numbers are stored here; nothing is
+        computed in the constructor, so a meta-device (FSDP) build is unaffected.
+        """
         super(MultiSelfAttentionHead, self).__init__()
 
         self.num_heads = num_heads
@@ -794,9 +804,18 @@ class MultiSelfAttentionHead(torch.nn.Module):
         self.dropout_rate = dropout_rate
         self.with_residual = with_residual
         self.with_2d_rope = with_2d_rope
+        self.rope_wavelengths = (
+            None if rope_wavelengths is None
+            else (float(rope_wavelengths[0]), float(rope_wavelengths[1]))
+        )
 
         assert dim_embed % num_heads == 0
         self.dim_head_proj = dim_embed // num_heads if dim_head_proj is None else dim_head_proj
+        if self.rope_wavelengths is not None:
+            assert self.dim_head_proj % 4 == 0, (
+                f"rope_wavelengths needs a head dimension divisible by 4; got {self.dim_head_proj}"
+            )
+            assert self.rope_wavelengths[0] > 0.0, "rope_wavelengths: shortest must be > 0"
 
         if norm_type == "LayerNorm":
             norm = partial(torch.nn.LayerNorm, elementwise_affine=False, eps=norm_eps)
@@ -831,6 +850,29 @@ class MultiSelfAttentionHead(torch.nn.Module):
             self.att = self.attention
             self.softmax = torch.nn.Softmax(dim=-1)
 
+    @torch.no_grad()
+    def _rope_cos_sin(self, coords):
+        """cos, sin (1 or B, T, num_heads, dim_head // 2) for the explicit-wavelength RoPE.
+
+        coords (..., T, 2) = (y, x) of every token, in cells. Computed at forward time on
+        the tokens' device, in float32.
+        """
+        with torch.autocast(device_type=coords.device.type, enabled=False):
+            c = coords.to(torch.float32)
+            lo, hi = self.rope_wavelengths
+            if hi <= 0.0:
+                # twice the largest extent of the domain along y or x
+                flat = c.reshape(-1, 2)
+                span = float((flat.amax(0) - flat.amin(0)).amax())
+                hi = max(2.0 * span, 4.0 * lo)
+            freqs = rope_2d_wavelength_freqs(
+                self.dim_head_proj, self.num_heads, lo, hi, device=c.device
+            )                                                            # (H, d/4)
+            ang = torch.cat(
+                (c[..., 0:1].unsqueeze(-1) * freqs, c[..., 1:2].unsqueeze(-1) * freqs), dim=-1
+            )                                                            # (..., T, H, d/2)
+            return torch.cos(ang), torch.sin(ang)
+
     def forward(self, x, coords=None, ada_ln_aux=None):
         if self.with_residual:
             x_in = x
@@ -846,7 +888,12 @@ class MultiSelfAttentionHead(torch.nn.Module):
         if self.with_2d_rope:
             if coords is None:
                 raise ValueError("coords must be provided when with_2d_rope=True")
-            qs, ks = rotary_pos_emb_2d(qs, ks, coords, unsqueeze_dim=2)
+            if self.rope_wavelengths is None:
+                qs, ks = rotary_pos_emb_2d(qs, ks, coords, unsqueeze_dim=2)
+            else:
+                cos, sin = self._rope_cos_sin(coords)
+                qs = apply_rotary_2d_single(qs, cos, sin)
+                ks = apply_rotary_2d_single(ks, cos, sin)
 
         # set dropout rate according to training/eval mode as required by flash_attn
         dropout_rate = self.dropout_rate if self.training else 0.0
