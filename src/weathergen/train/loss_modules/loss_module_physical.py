@@ -21,6 +21,7 @@ from omegaconf import DictConfig
 import weathergen.train.loss_modules.loss_functions as loss_fns
 from weathergen.train.loss_modules.loss_module_base import LossModuleBase, LossValues
 from weathergen.train.utils import TRAIN, VAL, Stage
+from weathergen.utils.distributed import get_ensemble_parallel_size, get_ensemble_size
 
 _logger = logging.getLogger(__name__)
 
@@ -302,6 +303,21 @@ class LossPhysical(LossModuleBase):
                         # expected shape of pred is [ensemble_size, num_samples, num_channels].
                         pred = pred.reshape([pred.shape[0], *target.shape])
                         assert pred.shape[1] > 0
+
+                        if loss_fct_name == "kernel_crps":
+                            expected_members = get_ensemble_size(self.cf, self.mode_cfg)
+                            if pred.shape[0] < 2 or (
+                                expected_members > 1 and pred.shape[0] != expected_members
+                            ):
+                                raise ValueError(
+                                    f"{self.stage} kernel_crps member mismatch for "
+                                    f"{stream_name}, timestep {timestep_idx}: "
+                                    f"prediction_shape={tuple(pred.shape)}, "
+                                    f"forecast.num_members={expected_members}, "
+                                    f"member_group_size={get_ensemble_parallel_size()}, "
+                                    f"rank={self.cf.get('rank')}, "
+                                    f"world_size={self.cf.get('world_size')}."
+                                )
 
                         losses_all[stream_name][str(timestep_idx)][loss_fct_name] = defaultdict(
                             dict
