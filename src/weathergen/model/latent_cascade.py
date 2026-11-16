@@ -285,63 +285,82 @@ class LatentCascade(torch.nn.Module):
             self.register_buffer(f"cop_{key}", torch.as_tensor(cop, dtype=torch.long), persistent=False)
             self.register_buffer(f"cv_{key}", torch.as_tensor(cv, dtype=torch.bool), persistent=False)
 
-            if self.down_ring or self.down_rope or self.down_sigma > 0.0:
-                poc_t = torch.as_tensor(poc, dtype=torch.long)
-                has_parent = poc_t >= 0
-                pidx = poc_t.clamp(min=0)
-                # sources of every fine cell: its parent (column 0) and, with down_ring, the
-                # parent's 8 neighbours. Neighbours missing from the domain are returned as
-                # the parent itself (Domain.neighbours_compact convention): mask them, so
-                # that the parent is not counted several times.
-                if self.down_ring:
-                    nb = torch.as_tensor(
-                        self.pyramid.domain(lc).neighbours_compact(), dtype=torch.long
-                    )                                                       # (n_coarse, 8)
-                    ring = torch.cat(
-                        [torch.arange(nb.shape[0]).view(-1, 1), nb], dim=1
-                    )                                                       # (n_coarse, 9)
-                    distinct = torch.ones_like(ring, dtype=torch.bool)
-                    distinct[:, 1:] = nb != torch.arange(nb.shape[0]).view(-1, 1)
-                    src = ring[pidx]                                        # (n_fine, 9)
-                    src_valid = distinct[pidx] & has_parent.view(-1, 1)
-                else:
-                    src = pidx.view(-1, 1)                                  # (n_fine, 1)
-                    src_valid = has_parent.view(-1, 1)
-                self.register_buffer(f"dsrc_{key}", src, persistent=False)
-                self.register_buffer(f"dsrcv_{key}", src_valid, persistent=False)
-                if self.down_rope or self.down_sigma > 0.0:
-                    # cell-centre positions on one flat map of the fine domain, in units
-                    # of COARSE cells (a fine cell is at most ~3 coarse cells from a source)
-                    from weathergen.datasets.utils import healpix_verts_rots
+        # Geometry of the down_ring / down_rope / down_sigma options (source cells of every
+        # fine cell, map positions, distance penalty). Built LAZILY at the first forward
+        # and kept in a plain dict, NOT as buffers computed here: under FSDP the model is
+        # constructed on the `meta` device, where tensors have no data, so nothing can be
+        # computed in the constructor (and non-persistent buffers would not survive).
+        self.down_rope_wavelengths = (float(down_rope_wavelengths[0]), float(down_rope_wavelengths[1]))
+        self._down_geo = {}
 
-                    dom_f, dom_c = self.pyramid.domain(lf), self.pyramid.domain(lc)
-                    frame = dec_rope_frame(lf, dom_f.active_cells)
-                    scale = 2.0 ** (int(lf) - int(lc))                      # fine cells per coarse cell
-                    vf, _ = healpix_verts_rots(lf, 0.5, 0.5)
-                    vc, _ = healpix_verts_rots(lc, 0.5, 0.5)
-                    xy_f = dec_rope_project(
-                        vf[torch.from_numpy(np.asarray(dom_f.active_cells))], frame
-                    ) / scale
-                    xy_c = dec_rope_project(
-                        vc[torch.from_numpy(np.asarray(dom_c.active_cells))], frame
-                    ) / scale
-                    self.register_buffer(f"dxyq_{key}", xy_f, persistent=False)        # (n_fine, 2)
-                    self.register_buffer(f"dxys_{key}", xy_c[src], persistent=False)   # (n_fine, S, 2)
-                    dist = (xy_c[src] - xy_f.unsqueeze(1)).norm(dim=-1)                # (n_fine, S)
-                    if self.down_sigma > 0.0:
-                        self.register_buffer(
-                            f"dbias_{key}", -(dist**2) / (2.0 * self.down_sigma**2),
-                            persistent=False,
-                        )
-                    off = dist[src_valid]
-                    _logger.info(
-                        f"latent cascade {lc}->{lf}: down_ring={self.down_ring} "
-                        f"down_rope={self.down_rope} down_sigma={self.down_sigma:g}; "
-                        f"{src.shape[1]} source(s) per fine cell, "
-                        f"{int(src_valid.sum())} valid; distance fine cell to source "
-                        f"{off.min():.2f} .. {off.max():.2f} coarse cells; wavelengths "
-                        f"{down_rope_wavelengths[0]:g} .. {down_rope_wavelengths[1]:g}"
-                    )
+    def _down_geometry(self, lc, lf, device):
+        """
+        Tables for the coarse -> fine attention of the pair (lc, lf), on `device` (cached):
+          src   (n_fine, S) long   coarse source cells of every fine cell: its parent
+                                   (column 0) and, with down_ring, the parent's 8 neighbours
+          valid (n_fine, S) bool   False for fine cells without parent and for neighbours
+                                   missing from the domain (returned as the parent itself by
+                                   Domain.neighbours_compact: masked so that the parent is
+                                   not counted several times)
+          xyq   (n_fine, 2)        map position of the fine cell centres       [down_rope]
+          xys   (n_fine, S, 2)     map position of the source cell centres     [down_rope]
+          bias  (n_fine, S)        -d^2 / (2 sigma^2), d = distance to the source [down_sigma]
+        Positions are on one flat map of the fine domain, in units of COARSE cells.
+        """
+        ck = (int(lc), int(lf), str(device))
+        if ck in self._down_geo:
+            return self._down_geo[ck]
+        with torch.no_grad(), torch.device("cpu"):
+            poc_t = torch.as_tensor(
+                np.asarray(self.pyramid.parent_of_child(lc, lf)), dtype=torch.long
+            )
+            has_parent = poc_t >= 0
+            pidx = poc_t.clamp(min=0)
+            if self.down_ring:
+                nb = torch.as_tensor(
+                    np.asarray(self.pyramid.domain(lc).neighbours_compact()), dtype=torch.long
+                )                                                           # (n_coarse, 8)
+                me = torch.arange(nb.shape[0]).view(-1, 1)
+                ring = torch.cat([me, nb], dim=1)                           # (n_coarse, 9)
+                distinct = torch.ones_like(ring, dtype=torch.bool)
+                distinct[:, 1:] = nb != me
+                src = ring[pidx]                                            # (n_fine, 9)
+                valid = distinct[pidx] & has_parent.view(-1, 1)
+            else:
+                src = pidx.view(-1, 1)                                      # (n_fine, 1)
+                valid = has_parent.view(-1, 1)
+            geo = dict(src=src, valid=valid, xyq=None, xys=None, bias=None)
+            if self.down_rope or self.down_sigma > 0.0:
+                from weathergen.datasets.utils import healpix_verts_rots
+
+                dom_f, dom_c = self.pyramid.domain(lf), self.pyramid.domain(lc)
+                frame = dec_rope_frame(lf, dom_f.active_cells)
+                scale = 2.0 ** (int(lf) - int(lc))                          # fine cells per coarse cell
+                vf, _ = healpix_verts_rots(lf, 0.5, 0.5)
+                vc, _ = healpix_verts_rots(lc, 0.5, 0.5)
+                xy_f = dec_rope_project(
+                    vf[torch.from_numpy(np.asarray(dom_f.active_cells))], frame
+                ) / scale
+                xy_c = dec_rope_project(
+                    vc[torch.from_numpy(np.asarray(dom_c.active_cells))], frame
+                ) / scale
+                dist = (xy_c[src] - xy_f.unsqueeze(1)).norm(dim=-1)                    # (n_fine, S)
+                if self.down_rope:
+                    geo["xyq"], geo["xys"] = xy_f, xy_c[src]
+                if self.down_sigma > 0.0:
+                    geo["bias"] = -(dist**2) / (2.0 * self.down_sigma**2)
+                off = dist[valid]
+                _logger.info(
+                    f"latent cascade {lc}->{lf}: down_ring={self.down_ring} "
+                    f"down_rope={self.down_rope} down_sigma={self.down_sigma:g}; "
+                    f"{src.shape[1]} source(s) per fine cell, {int(valid.sum())} valid; "
+                    f"distance fine cell to source {float(off.min()):.2f} .. "
+                    f"{float(off.max()):.2f} coarse cells; wavelengths "
+                    f"{self.down_rope_wavelengths[0]:g} .. {self.down_rope_wavelengths[1]:g}"
+                )
+        geo = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in geo.items()}
+        self._down_geo[ck] = geo
+        return geo
 
     # -- layout helpers ----------------------------------------------------
     def _split(self, latent):
@@ -396,8 +415,8 @@ class LatentCascade(torch.nn.Module):
                 elif self.down_ring or self.down_rope or self.down_sigma > 0.0:
                     # attention over the parent (and, with down_ring, its 8 neighbours),
                     # optionally with the fine-to-coarse offsets (down_rope)
-                    sidx = getattr(self, f"dsrc_{key}")        # (n_fine, S)
-                    sval = getattr(self, f"dsrcv_{key}")       # (n_fine, S)
+                    geo = self._down_geometry(lc, lf, coarse.device)
+                    sidx, sval = geo["src"], geo["valid"]      # (n_fine, S)
                     sval = sval & (sidx < coarse.shape[1])
                     sidx = sidx.clamp(max=coarse.shape[1] - 1)
                     Bc, _, qc, Dc = coarse.shape
@@ -405,9 +424,7 @@ class LatentCascade(torch.nn.Module):
                         Bc, sidx.shape[0], sidx.shape[1], qc, Dc
                     )                                          # (B, n_fine, S, q, D)
                     m = sval.unsqueeze(0).expand(Bc, -1, -1)
-                    cq = getattr(self, f"dxyq_{key}") if self.down_rope else None
-                    cs = getattr(self, f"dxys_{key}") if self.down_rope else None
-                    bias = getattr(self, f"dbias_{key}") if self.down_sigma > 0.0 else None
+                    cq, cs, bias = geo["xyq"], geo["xys"], geo["bias"]
                     cells[lf] = cells[lf] + op.down(cells[lf], src, m, cq, cs, bias)
                 else:
                     # attention: query = fine cell's own latent; source = its single
