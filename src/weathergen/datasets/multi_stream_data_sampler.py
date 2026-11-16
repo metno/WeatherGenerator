@@ -96,6 +96,14 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
     def __init__(self, cf: Config, mode_cfg: dict, stage: Stage):
         super(MultiStreamDataSampler, self).__init__()
 
+        if not cf.get("streams"):
+            raise ValueError(
+                f"No streams configured for the {stage} sampler. "
+                "The resolved config must include the checkpoint's full stream definitions, "
+                "not only reconstruct/diagnostic overrides. "
+                f"streams_directory={cf.get('streams_directory')!r}."
+            )
+
         self.mode_cfg = mode_cfg
         self._stage = stage
 

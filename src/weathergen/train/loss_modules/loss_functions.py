@@ -12,6 +12,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from weathergen.utils.distributed import log_ensemble_diagnostics
+
 stat_loss_fcts = ["stats", "kernel_crps"]  # Names of loss functions that need std computed
 
 
@@ -74,6 +76,7 @@ def kernel_crps(
     weights_points: torch.Tensor | None,
     fair=True,
     alpha: float | None = None,
+    expected_ensemble_size: int | None = None,
 ):
     """
     Compute kernel CRPS
@@ -84,13 +87,29 @@ def kernel_crps(
     weights_channels : shape = (num_channels,)
     weights_points : shape = (num_data_points)
     alpha : blend between standard (0) and fair (1) CRPS; overrides fair when provided
+    expected_ensemble_size : configured parallel member count, when applicable
 
     Returns:
     loss: scalar - overall weighted CRPS
     loss_chs: [C] - per-channel CRPS (location-weighted, not channel-weighted)
     """
 
+    mode = "grad" if torch.is_grad_enabled() else "no_grad"
+    log_ensemble_diagnostics(
+        f"kernel_crps.{mode}.input",
+        source=__file__,
+        expected_members=expected_ensemble_size,
+        prediction_shape=tuple(preds.shape),
+        target_shape=tuple(targets.shape),
+        requires_grad=preds.requires_grad,
+    )
     ens_size = preds.shape[0]
+    if expected_ensemble_size is not None and ens_size != expected_ensemble_size:
+        raise ValueError(
+            f"kernel_crps expected forecast.num_members={expected_ensemble_size}, "
+            f"but received ens_size={ens_size}, prediction_shape={tuple(preds.shape)}. "
+            "Parallel member predictions must be gathered before computing CRPS."
+        )
     assert ens_size > 1, "Ensemble size has to be greater than 1 for kernel CRPS."
     assert len(preds.shape) == 3, "if data has batch dimension, remove unsqueeze() below"
     alpha = (1.0 if fair else 0.0) if alpha is None else alpha

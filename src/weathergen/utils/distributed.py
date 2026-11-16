@@ -9,12 +9,39 @@
 
 
 import hashlib
+import json
+import os
+import sys
 
 import torch
 import torch.distributed as dist
 
 SYNC_TIMEOUT_SEC = 60 * 60  # 1 hour
 _ENSEMBLE_GROUP: dist.ProcessGroup | None = None
+_ENSEMBLE_DEBUG_EVENTS: set[str] = set()
+
+
+def log_ensemble_diagnostics(event: str, **details) -> None:
+    if os.environ.get("WEATHERGEN_DEBUG_ENSEMBLE") != "1" or event in _ENSEMBLE_DEBUG_EVENTS:
+        return
+    _ENSEMBLE_DEBUG_EVENTS.add(event)
+    record = {
+        "event": event,
+        "pid": os.getpid(),
+        "rank": get_rank(),
+        "world_size": get_world_size(),
+        "distributed_initialized": _is_distributed_initialized(),
+        "member_group_size": get_ensemble_parallel_size(),
+        "member_ranks": (
+            dist.get_process_group_ranks(_ENSEMBLE_GROUP)
+            if _ENSEMBLE_GROUP is not None
+            else None
+        ),
+        "distributed_source": __file__,
+        **details,
+    }
+    sys.stderr.write("[ensemble-debug] " + json.dumps(record, default=str) + "\n")
+    sys.stderr.flush()
 
 
 class _GatherEnsemble(torch.autograd.Function):
@@ -62,6 +89,7 @@ def init_ensemble_parallel(cf):
     _ENSEMBLE_GROUP = None
     size = get_ensemble_size(cf)
     world_size = get_world_size()
+    log_ensemble_diagnostics("init.begin", configured_members=size, stage=cf.get("stage"))
     if size > 1:
         if world_size % size:
             raise ValueError("Distributed world size must be divisible by the ensemble size.")
@@ -72,6 +100,12 @@ def init_ensemble_parallel(cf):
                 _ENSEMBLE_GROUP = group
     cf.data_parallel_rank = get_rank() // size
     cf.data_parallel_size = world_size // size
+    log_ensemble_diagnostics(
+        "init.ready",
+        configured_members=size,
+        data_parallel_rank=cf.data_parallel_rank,
+        data_parallel_size=cf.data_parallel_size,
+    )
     return cf
 
 
@@ -100,7 +134,16 @@ def validate_ensemble_targets(coordinates: torch.Tensor, lengths: list[int]) -> 
 
 def gather_ensemble_predictions(predictions: torch.Tensor) -> torch.Tensor:
     """Gather members with backward communication; DDP/FSDP averages weight gradients."""
+    mode = "grad" if torch.is_grad_enabled() else "no_grad"
+    log_ensemble_diagnostics(
+        f"gather.{mode}.input",
+        prediction_shape=tuple(predictions.shape),
+        device=str(predictions.device),
+        dtype=str(predictions.dtype),
+        requires_grad=predictions.requires_grad,
+    )
     if _ENSEMBLE_GROUP is None:
+        log_ensemble_diagnostics(f"gather.{mode}.skipped", reason="No member group initialized")
         return predictions
     ndim = torch.tensor([predictions.ndim], dtype=torch.int64, device=predictions.device)
     dimensions = [torch.empty_like(ndim) for _ in range(get_ensemble_parallel_size())]
@@ -113,10 +156,15 @@ def gather_ensemble_predictions(predictions: torch.Tensor) -> torch.Tensor:
     if any(not torch.equal(shape, other) for other in shapes):
         raise ValueError("Ensemble members must predict identical target shapes.")
     if torch.is_grad_enabled() and predictions.requires_grad:
-        return _GatherEnsemble.apply(predictions, _ENSEMBLE_GROUP)
-    members = [torch.empty_like(predictions) for _ in shapes]
-    dist.all_gather(members, predictions.contiguous(), group=_ENSEMBLE_GROUP)
-    return torch.cat(members, dim=0)
+        gathered = _GatherEnsemble.apply(predictions, _ENSEMBLE_GROUP)
+    else:
+        members = [torch.empty_like(predictions) for _ in shapes]
+        dist.all_gather(members, predictions.contiguous(), group=_ENSEMBLE_GROUP)
+        gathered = torch.cat(members, dim=0)
+    log_ensemble_diagnostics(
+        f"gather.{mode}.output", prediction_shape=tuple(gathered.shape)
+    )
+    return gathered
 
 
 def is_root(pg: dist.ProcessGroup | None = None) -> bool:

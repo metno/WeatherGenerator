@@ -21,7 +21,7 @@ from omegaconf import DictConfig
 import weathergen.train.loss_modules.loss_functions as loss_fns
 from weathergen.train.loss_modules.loss_module_base import LossModuleBase, LossValues
 from weathergen.train.utils import TRAIN, VAL, Stage
-from weathergen.utils.distributed import get_ensemble_parallel_size, get_ensemble_size
+from weathergen.utils.distributed import get_ensemble_size, log_ensemble_diagnostics
 
 _logger = logging.getLogger(__name__)
 
@@ -59,10 +59,22 @@ class LossPhysical(LossModuleBase):
         self.device = device
         self.name = "LossPhysical"
 
+        num_members = get_ensemble_size(cf, mode_cfg)
+        if "kernel_crps" in loss_fcts:
+            log_ensemble_diagnostics(
+                f"loss_config.{stage}",
+                source=__file__,
+                configured_members=num_members,
+                forecast=dict(mode_cfg.get("forecast", {})),
+            )
         # dynamically load loss functions based on configuration and stage
         self.loss_fcts = [
             [
-                partial(loss_fns.kernel_crps, alpha=params.get("alpha"))
+                partial(
+                    loss_fns.kernel_crps,
+                    alpha=params.get("alpha"),
+                    expected_ensemble_size=num_members if num_members > 1 else None,
+                )
                 if name == "kernel_crps"
                 else getattr(loss_fns, name),
                 params.get("weight", 1.0),
@@ -303,21 +315,6 @@ class LossPhysical(LossModuleBase):
                         # expected shape of pred is [ensemble_size, num_samples, num_channels].
                         pred = pred.reshape([pred.shape[0], *target.shape])
                         assert pred.shape[1] > 0
-
-                        if loss_fct_name == "kernel_crps":
-                            expected_members = get_ensemble_size(self.cf, self.mode_cfg)
-                            if pred.shape[0] < 2 or (
-                                expected_members > 1 and pred.shape[0] != expected_members
-                            ):
-                                raise ValueError(
-                                    f"{self.stage} kernel_crps member mismatch for "
-                                    f"{stream_name}, timestep {timestep_idx}: "
-                                    f"prediction_shape={tuple(pred.shape)}, "
-                                    f"forecast.num_members={expected_members}, "
-                                    f"member_group_size={get_ensemble_parallel_size()}, "
-                                    f"rank={self.cf.get('rank')}, "
-                                    f"world_size={self.cf.get('world_size')}."
-                                )
 
                         losses_all[stream_name][str(timestep_idx)][loss_fct_name] = defaultdict(
                             dict
