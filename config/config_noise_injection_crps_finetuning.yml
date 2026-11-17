@@ -30,6 +30,8 @@ training_config:
   training_mode: ["masking"]
   num_mini_epochs: 8
   losses: ${crps_losses}
+  learning_rate_scheduling:
+    parallel_scaling_policy: "sqrt"
   noise:
     enabled: true
     noise_dim: 16
