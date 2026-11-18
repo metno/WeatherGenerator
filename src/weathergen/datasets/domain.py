@@ -39,15 +39,38 @@ Design notes
   be dropped, and those observations are silently discarded. Use `pad_rings` to
   grow the domain by N rings of neighbours if you want a margin; 1 ring is a
   sensible default for a downscaling setup where the boundary matters.
+
+* Alternatively (`type: points`, `points_file: ...`) the domain is the footprint of
+  a point set, e.g. a CARRA2/MEPS template: every cell containing at least one point
+  is active (plus `pad_rings`). `points_file` can be a `.npz` (`lat`/`lon`), a NetCDF
+  file or an anemoi-style zarr; optional `lat_var` / `lon_var` name the variables and
+  `cells_sha256` pins the resulting cell set (printed in the log at start-up).
 """
 
+import hashlib
 import logging
+import os
 
 import astropy_healpix as hp
 import numpy as np
 from numpy.typing import NDArray
 
 _logger = logging.getLogger(__name__)
+
+# Domains are built from the config in several places (sampler, model, pyramid, ...);
+# cache them so the construction (and its log line, and reading a points file) happens
+# once per process.
+_DOMAIN_CACHE: dict[tuple, "Domain"] = {}
+# coordinates read from a points file, keyed by (abs path, lat_var, lon_var): a file used
+# by several latent levels is read once per process
+_POINTS_CACHE: dict[tuple, tuple[NDArray, NDArray]] = {}
+
+
+def _lonlat_to_thetaphi(lats_deg: NDArray, lons_deg: NDArray) -> tuple[NDArray, NDArray]:
+    """Same convention as tokenizer_utils.theta_phi_to_standard_coords."""
+    thetas = ((90.0 - lats_deg) / 180.0) * np.pi
+    phis = ((lons_deg + 180.0) / 360.0) * 2.0 * np.pi
+    return thetas, phis
 
 
 class Domain:
@@ -77,6 +100,7 @@ class Domain:
         is_global: bool = False,
         bbox: tuple | None = None,
         pad_rings: int = 0,
+        points_file: str | None = None,
     ) -> None:
         num_total = 12 * 4**healpix_level
 
@@ -85,6 +109,10 @@ class Domain:
         self.is_global = is_global
         self.bbox = bbox
         self.pad_rings = pad_rings
+        # absolute path of the points file of a footprint domain (type: points), else None
+        self.points_file = points_file
+        # lazily built lookup for the reader pre-filter of a points domain
+        self._prefilter_lookup: NDArray[np.bool_] | None = None
 
         assert self.active_cells.ndim == 1, "active_cells must be 1D"
         assert len(self.active_cells) > 0, (
@@ -238,11 +266,76 @@ class Domain:
         )
 
     @classmethod
+    def from_points(
+        cls,
+        healpix_level: int,
+        lats: NDArray,
+        lons: NDArray,
+        pad_rings: int = 0,
+        points_file: str | None = None,
+    ) -> "Domain":
+        """
+        Build a domain from the footprint of a point set (e.g. a CARRA2/MEPS template):
+        every cell containing at least one point (same cell assignment as the
+        tokenizer) is active, grown by `pad_rings` rings of neighbours. The domain then
+        follows the shape of the grid instead of its lon/lat bounding box.
+
+        Parameters
+        ----------
+        lats, lons :
+            Point coordinates in degrees, any shape (flattened). NaN points are ignored.
+        pad_rings :
+            Grow the selected set by this many rings of healpix neighbours.
+        points_file :
+            Where the points came from (for logging and the domain identity only).
+        """
+        from astropy_healpix.healpy import ang2pix
+
+        assert pad_rings >= 0, "pad_rings must be >= 0"
+        lats = np.asarray(lats, dtype=np.float64).ravel()
+        lons = np.asarray(lons, dtype=np.float64).ravel()
+        assert lats.shape == lons.shape, "lats and lons must have the same number of points"
+        finite = np.isfinite(lats) & np.isfinite(lons)
+        assert finite.any(), f"No finite lat/lon points to build a domain from ({points_file})"
+
+        nside = 2**healpix_level
+        num_total = 12 * 4**healpix_level
+        thetas, phis = _lonlat_to_thetaphi(lats[finite], lons[finite])
+        selected = np.unique(ang2pix(nside, thetas, phis, nest=True).astype(np.int64))
+        num_footprint = len(selected)
+
+        for _ in range(pad_rings):
+            selected = _grow_one_ring(selected, nside)
+
+        domain = cls(
+            healpix_level,
+            selected,
+            is_global=(len(selected) == num_total),
+            bbox=None,
+            pad_rings=pad_rings,
+            points_file=points_file,
+        )
+        _logger.info(
+            "Domain: healpix level %d, footprint of %d points from %s, pad_rings=%d "
+            "-> %d of %d cells active (%d with points, %.2f%% of the sphere), cells_sha256=%s",
+            healpix_level,
+            int(finite.sum()),
+            points_file,
+            pad_rings,
+            len(selected),
+            num_total,
+            num_footprint,
+            100.0 * len(selected) / num_total,
+            domain.cells_sha256,
+        )
+        return domain
+
+    @classmethod
     def from_config(cls, cf) -> "Domain":
         """
         Build the domain from the top-level config.
 
-        Reads the optional `domain` block:
+        Reads the optional `domain` block, either a lon/lat box
 
             domain:
               lon_min: 0.0
@@ -251,21 +344,71 @@ class Domain:
               lat_max: 72.0
               pad_rings: 1
 
+        or the footprint of a point set
+
+            domain:
+              type: points                      # optional, inferred from points_file
+              points_file: /abs/path/template.npz
+              pad_rings: 1
+
         If the block is absent or `domain.enabled` is False, returns the global
         domain, i.e. exactly the current behaviour.
         """
-        dom_cfg = cf.get("domain", None)
-        if dom_cfg is None or not dom_cfg.get("enabled", True):
-            return cls.global_(cf.healpix_level)
+        return cls.from_level_config(cf.healpix_level, cf.get("domain", None))
 
-        return cls.from_bbox(
-            cf.healpix_level,
-            lon_min=dom_cfg["lon_min"],
-            lon_max=dom_cfg["lon_max"],
-            lat_min=dom_cfg["lat_min"],
-            lat_max=dom_cfg["lat_max"],
-            pad_rings=dom_cfg.get("pad_rings", 0),
-        )
+    @classmethod
+    def from_level_config(cls, healpix_level: int, dom_cfg) -> "Domain":
+        """
+        Build (or fetch from the per-process cache) the domain at `healpix_level` for a
+        `domain` config block. A missing block or `enabled: false` gives the global
+        domain. Shared by `from_config` (top-level `domain`) and
+        `DomainPyramid.from_config` (one `domain` block per entry of `latent_levels`).
+        """
+        key = domain_config_key(healpix_level, dom_cfg)
+
+        domain = _DOMAIN_CACHE.get(key)
+        if domain is None:
+            if key[1] is None:
+                domain = cls.global_(key[0])
+            elif key[1] == "points":
+                _, _, path, pad_rings, lat_var, lon_var = key
+                if not os.path.isabs(os.path.expanduser(str(dom_cfg["points_file"]))):
+                    _logger.warning(
+                        "domain points_file %r is a relative path, resolved to %s from the "
+                        "current directory. A continued run or inference started from another "
+                        "directory would read a different file or fail: use an absolute path.",
+                        str(dom_cfg["points_file"]),
+                        path,
+                    )
+                lats, lons = _load_points(path, lat_var, lon_var)
+                domain = cls.from_points(key[0], lats, lons, pad_rings, points_file=path)
+            else:
+                _, _, lon_min, lon_max, lat_min, lat_max, pad_rings = key
+                domain = cls.from_bbox(
+                    key[0],
+                    lon_min=lon_min,
+                    lon_max=lon_max,
+                    lat_min=lat_min,
+                    lat_max=lat_max,
+                    pad_rings=pad_rings,
+                )
+            _DOMAIN_CACHE[key] = domain
+
+        expected = dom_cfg.get("cells_sha256", None) if dom_cfg is not None else None
+        if expected is not None and str(expected) != domain.cells_sha256:
+            raise ValueError(
+                f"Domain at healpix level {healpix_level} ({domain!r}) has cells_sha256="
+                f"{domain.cells_sha256}, but the config pins {expected}. The points file or "
+                "the domain settings changed since the value was recorded."
+            )
+        return domain
+
+    @property
+    def cells_sha256(self) -> str:
+        """sha256 of the active cells (level + sorted global ids): identifies the domain."""
+        h = hashlib.sha256(str(self.healpix_level).encode())
+        h.update(self.active_cells.astype("<i8").tobytes())
+        return h.hexdigest()
 
     # -----------------------------------------------------------------------
     # index mapping
@@ -292,6 +435,9 @@ class Domain:
         """
         Cheap pre-filter on raw lat/lon in degrees, for use in the data readers.
 
+        For a points (footprint) domain there is no bbox; the filter is then the cell
+        lookup of `_points_prefilter_mask` (active cells plus one ring).
+
         This is NOT the authoritative filter -- the authoritative one is the cell
         remap in the tokenizer, which is what actually decides what the model sees.
         This is only to avoid reading/normalising points that are certainly
@@ -299,7 +445,11 @@ class Domain:
         the active cell set extends beyond the box, so we widen the box here by a
         generous margin to avoid dropping points the tokenizer would have kept.
         """
-        if self.is_global or self.bbox is None:
+        if self.is_global:
+            return np.ones(len(lats), dtype=bool)
+        if self.points_file is not None:
+            return self._points_prefilter_mask(lats, lons)
+        if self.bbox is None:
             return np.ones(len(lats), dtype=bool)
 
         lon_min, lon_max, lat_min, lat_max = self.bbox
@@ -317,6 +467,45 @@ class Domain:
             in_lon = (lons >= lon_min - margin) | (lons <= lon_max + margin)
 
         return in_lat & in_lon
+
+    def point_mask(self, lats: NDArray, lons: NDArray) -> NDArray[np.bool_]:
+        """
+        Exact mask of which points (lat/lon in degrees) fall in an ACTIVE cell, using
+        the same cell assignment as the tokenizer. Works for bbox and points domains.
+        """
+        return self._cell_lookup_mask(lats, lons, self.to_compact >= 0)
+
+    def _points_prefilter_mask(self, lats: NDArray, lons: NDArray) -> NDArray[np.bool_]:
+        """
+        Reader pre-filter for a points (footprint) domain. A footprint has no bbox to
+        widen, so instead keep every point whose cell is active OR one ring outside the
+        active set. Like the bbox margin this is deliberately permissive (it absorbs
+        float32/float64 differences at cell edges); the tokenizer's cell remap stays the
+        authoritative filter.
+        """
+        if self._prefilter_lookup is None:
+            grown = _grow_one_ring(self.active_cells, 2**self.healpix_level)
+            lookup = np.zeros(self.num_total_cells, dtype=bool)
+            lookup[grown] = True
+            self._prefilter_lookup = lookup
+        return self._cell_lookup_mask(lats, lons, self._prefilter_lookup)
+
+    def _cell_lookup_mask(
+        self, lats: NDArray, lons: NDArray, lookup: NDArray[np.bool_]
+    ) -> NDArray[np.bool_]:
+        from astropy_healpix.healpy import ang2pix
+
+        lats = np.asarray(lats)
+        lons = np.asarray(lons)
+        mask = np.zeros(len(lats), dtype=bool)
+        finite = np.isfinite(lats) & np.isfinite(lons)
+        if finite.any():
+            thetas, phis = _lonlat_to_thetaphi(
+                lats[finite].astype(np.float64), lons[finite].astype(np.float64)
+            )
+            cells = ang2pix(2**self.healpix_level, thetas, phis, nest=True)
+            mask[finite] = lookup[cells]
+        return mask
 
     # -----------------------------------------------------------------------
     # geometry, remapped to compact indexing
@@ -366,6 +555,11 @@ class Domain:
     def __repr__(self) -> str:
         if self.is_global:
             return f"Domain(global, hl={self.healpix_level}, num_cells={len(self)})"
+        if self.points_file is not None:
+            return (
+                f"Domain(points={self.points_file}, pad_rings={self.pad_rings}, "
+                f"hl={self.healpix_level}, num_cells={len(self)}/{self.num_total_cells})"
+            )
         return (
             f"Domain(bbox={self.bbox}, hl={self.healpix_level}, "
             f"num_cells={len(self)}/{self.num_total_cells})"
@@ -380,3 +574,124 @@ def _grow_one_ring(cells: NDArray[np.int64], nside: int) -> NDArray[np.int64]:
         nb = hp.neighbours(cells, nside, order="nested")
     nb = nb[nb >= 0]
     return np.unique(np.concatenate([cells, nb.astype(np.int64)]))
+
+
+_BBOX_KEYS = ("lon_min", "lon_max", "lat_min", "lat_max")
+
+
+def domain_config_key(healpix_level: int, dom_cfg) -> tuple:
+    """
+    Hashable key of a `domain` config block at `healpix_level`; also says which kind of
+    domain it is. Global: (hl, None). Box: (hl, "bbox", lon_min, lon_max, lat_min,
+    lat_max, pad_rings). Points: (hl, "points", abs path, pad_rings, lat_var, lon_var).
+    """
+    hl = int(healpix_level)
+    if dom_cfg is None or not dom_cfg.get("enabled", True):
+        return (hl, None)
+
+    has_points = dom_cfg.get("points_file", None) is not None
+    has_bbox = any(dom_cfg.get(k, None) is not None for k in _BBOX_KEYS)
+    kind = dom_cfg.get("type", None)
+    if kind is None:
+        if has_points and has_bbox:
+            raise ValueError(
+                "domain: both `points_file` and lon/lat bounds are given; set "
+                "`type: points` or `type: bbox` to say which one to use."
+            )
+        kind = "points" if has_points else "bbox"
+    pad_rings = int(dom_cfg.get("pad_rings", 0))
+
+    if kind == "points":
+        if not has_points:
+            raise ValueError("domain: `type: points` needs a `points_file`.")
+        path = os.path.abspath(os.path.expanduser(str(dom_cfg["points_file"])))
+        lat_var = dom_cfg.get("lat_var", None)
+        lon_var = dom_cfg.get("lon_var", None)
+        return (hl, "points", path, pad_rings, lat_var, lon_var)
+    if kind == "bbox":
+        missing = [k for k in _BBOX_KEYS if dom_cfg.get(k, None) is None]
+        if missing:
+            raise ValueError(f"domain: `type: bbox` is missing {missing}.")
+        return (hl, "bbox") + tuple(float(dom_cfg[k]) for k in _BBOX_KEYS) + (pad_rings,)
+    raise ValueError(f"domain: unknown type {kind!r} (use 'bbox' or 'points').")
+
+
+_LAT_NAMES = ("latitude", "latitudes", "lat", "XLAT")
+_LON_NAMES = ("longitude", "longitudes", "lon", "XLONG")
+
+
+def _pick(names, available, given, what, path):
+    if given is not None:
+        if given not in available:
+            raise KeyError(f"{what} variable {given!r} not found in {path}")
+        return given
+    for n in names:
+        if n in available:
+            return n
+    raise KeyError(
+        f"No {what} variable in {path} (looked for {list(names)}); set `lat_var` / `lon_var`."
+    )
+
+
+def _load_points(path: str, lat_var: str | None = None, lon_var: str | None = None):
+    """
+    Read point coordinates (degrees, flattened) from a NetCDF file, an anemoi-style
+    zarr or a `.npz`. Only the coordinate variables are read.
+    """
+    key = (path, lat_var, lon_var)
+    if key in _POINTS_CACHE:
+        return _POINTS_CACHE[key]
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"domain points_file not found: {path}")
+
+    lower = path.lower().rstrip("/")
+    if lower.endswith(".npz"):
+        with np.load(path) as f:
+            vlat = _pick(_LAT_NAMES + ("lats",), f.files, lat_var, "latitude", path)
+            vlon = _pick(_LON_NAMES + ("lons",), f.files, lon_var, "longitude", path)
+            lats, lons = np.asarray(f[vlat]), np.asarray(f[vlon])
+    elif lower.endswith(".zarr") or os.path.isdir(path):
+        import zarr
+
+        z = zarr.open(path, mode="r")
+        names = list(z.array_keys())
+        vlat = _pick(_LAT_NAMES, names, lat_var, "latitude", path)
+        vlon = _pick(_LON_NAMES, names, lon_var, "longitude", path)
+        lats, lons = np.asarray(z[vlat][:]), np.asarray(z[vlon][:])
+    else:  # NetCDF
+        try:
+            import xarray as xr
+
+            with xr.open_dataset(path) as ds:
+                names = list(ds.variables)
+                vlat = _pick(_LAT_NAMES, names, lat_var, "latitude", path)
+                vlon = _pick(_LON_NAMES, names, lon_var, "longitude", path)
+                lats, lons = np.asarray(ds[vlat].values), np.asarray(ds[vlon].values)
+                if lats.ndim == 1 and lons.ndim == 1 and ds[vlat].dims != ds[vlon].dims:
+                    lons, lats = np.meshgrid(lons, lats)  # regular lat/lon grid
+        except ImportError:
+            try:
+                import netCDF4
+            except ImportError as e:
+                raise ImportError(
+                    f"Reading the domain points_file {path} needs xarray or netCDF4; "
+                    "alternatively save the coordinates as a .npz with `lat` and `lon`."
+                ) from e
+            with netCDF4.Dataset(path) as ds:
+                names = list(ds.variables)
+                vlat = _pick(_LAT_NAMES, names, lat_var, "latitude", path)
+                vlon = _pick(_LON_NAMES, names, lon_var, "longitude", path)
+                lats = np.ma.filled(ds[vlat][:].astype(np.float64), np.nan)
+                lons = np.ma.filled(ds[vlon][:].astype(np.float64), np.nan)
+                if lats.ndim == 1 and lons.ndim == 1 and ds[vlat].dimensions != ds[vlon].dimensions:
+                    lons, lats = np.meshgrid(lons, lats)
+
+    lats = np.asarray(lats, dtype=np.float64).ravel()
+    lons = np.asarray(lons, dtype=np.float64).ravel()
+    if lats.shape != lons.shape:
+        raise ValueError(
+            f"{path}: latitude has {lats.size} values but longitude {lons.size}; they must "
+            "describe the same points."
+        )
+    _POINTS_CACHE[key] = (lats, lons)
+    return lats, lons

@@ -150,6 +150,9 @@ class DomainPyramid:
             latent_levels:
               - level: 5
                 domain: {enabled: True, lon_min: ..., ..., pad_rings: 1}
+              - level: 7
+                domain: {enabled: True, type: points,
+                         points_file: /abs/path/template.npz, pad_rings: 1}
               - level: 8
                 domain: {enabled: True, lon_min: ..., ..., pad_rings: 1}
 
@@ -165,18 +168,9 @@ class DomainPyramid:
         domains: dict[int, Domain] = {}
         for entry in levels_cfg:
             lvl = int(entry["level"])
-            dom_cfg = entry.get("domain", None)
-            if dom_cfg is None or not dom_cfg.get("enabled", True):
-                domains[lvl] = Domain.global_(lvl)
-            else:
-                domains[lvl] = Domain.from_bbox(
-                    lvl,
-                    lon_min=dom_cfg["lon_min"],
-                    lon_max=dom_cfg["lon_max"],
-                    lat_min=dom_cfg["lat_min"],
-                    lat_max=dom_cfg["lat_max"],
-                    pad_rings=dom_cfg.get("pad_rings", 0),
-                )
+            # global / bbox / points (footprint of a template file) -- see
+            # Domain.from_level_config and domain_config_key for the accepted keys
+            domains[lvl] = Domain.from_level_config(lvl, entry.get("domain", None))
         return cls(domains)
 
     # -----------------------------------------------------------------------
