@@ -45,7 +45,7 @@ from weathergen.model.engines import (
     TargetPredictionEngineClassic,
 )
 from weathergen.model.layers import MLP, NamedLinear
-from weathergen.model.utils import get_num_parameters
+from weathergen.model.utils import disable_dropout, get_num_parameters
 from weathergen.utils.distributed import (
     gather_ensemble_predictions,
     get_ensemble_parallel_size,
@@ -699,6 +699,11 @@ class Model(torch.nn.Module):
                 self.deep_ssl_level_projections[head_name] = nn.ModuleList(
                     [nn.Linear(out_dim, out_dim, bias=False) for _ in range(num_levels)]
                 )
+
+        if not cf.get("dropout_enabled", True):
+            self.apply(disable_dropout)
+            if is_root():
+                logger.info("Disabled all model dropout; noise injection is unchanged.")
 
         return self
 

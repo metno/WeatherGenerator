@@ -48,6 +48,10 @@ Validation inherits the training settings and count. Separate inference can over
 injector changes its first MLP layer's input size and requires a weight migration or reset.
 GPU/checkpoint validation must be done on the training server.
 
+The CRPS overlay sets `dropout_enabled: false`, disabling module and attention dropout
+throughout the model, including hard-coded rates, while leaving noise injection enabled.
+Set it to `true` for a new run to restore the configured per-component dropout rates.
+
 # Development guidelines
 
 The [main branch](https://github.com/ecmwf/WeatherGenerator/tree/main) is the most stable version. If you are running experiments, you should use this branch.

@@ -44,6 +44,14 @@ def set_to_eval(block):
     block.eval()
 
 
+def disable_dropout(block):
+    """Disable module and attention dropout without changing training mode."""
+    if isinstance(block, nn.Dropout):
+        block.p = 0.0
+    if hasattr(block, "dropout_rate"):
+        block.dropout_rate = 0.0
+
+
 def apply_fct_to_blocks(model, blocks, fct):
     """
     Apply a function to specific blocks of a model.

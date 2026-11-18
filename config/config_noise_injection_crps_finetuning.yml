@@ -1,3 +1,5 @@
+dropout_enabled: false
+
 general:
   desc: "Two-member two-step ERA5 almost-fair CRPS fine-tuning from sdnbfpve"
   istep: 0
