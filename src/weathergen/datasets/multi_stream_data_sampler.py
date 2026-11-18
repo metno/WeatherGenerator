@@ -820,12 +820,11 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         # the coarse one.
         if stream_name is None:
             stream_name = stream_ds[0].stream_info["name"]
-        spoof_level = self.stream_encode_level[stream_name]
-        spoof_domain = self.domain_pyramid.domain(spoof_level)
+        in_idxs, out_idxs = self._window_indices(base_idx, num_forecast_steps, num_steps_input_max)
 
         # source data: iterate overall input steps
         input_data = []
-        for idx in range(base_idx - num_steps_input_max + 1, base_idx + 1):
+        for idx in in_idxs:
             # TODO: check that we are not out of bounds when we go back in time
 
             rdata = collect_datasources(stream_ds, idx, "source", self.rng)
@@ -833,42 +832,89 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             if rdata.is_empty():
                 # work around for https://github.com/pytorch/pytorch/issues/158719
                 # create non-empty mean data instead of empty tensor
-                time_win = self.time_window_handler.window(idx)
-                rdata = spoof(
-                    spoof_level,
-                    time_win.start,
-                    stream_ds[0].get_geoinfo_size(),
-                    len(stream_ds[0].mean[stream_ds[0].source_idx]),
-                    domain=spoof_domain,
-                )
-                rdata.is_spoof = True
+                rdata = self._spoof_window(stream_ds, stream_name, idx, "source")
 
             input_data += [rdata]
 
         # target data: collect for all forecast steps
         output_data = []
-        num_output_steps = self._get_output_length(num_forecast_steps)
-        for timestep_idx in range(self.output_offset, num_output_steps):
-            step_forecast_dt = base_idx + (self.time_step * timestep_idx) // self.step_timedelta
-
+        for step_forecast_dt in out_idxs:
             rdata = collect_datasources(stream_ds, step_forecast_dt, "target", self.rng)
 
             if rdata.is_empty():
                 # work around for https://github.com/pytorch/pytorch/issues/158719
                 # create non-empty mean data instead of empty tensor
-                time_win = self.time_window_handler.window(step_forecast_dt)
-                rdata = spoof(
-                    spoof_level,
-                    time_win.start,
-                    stream_ds[0].get_geoinfo_size(),
-                    len(stream_ds[0].mean[stream_ds[0].target_idx]),
-                    domain=spoof_domain,
-                )
-                rdata.is_spoof = True
+                rdata = self._spoof_window(stream_ds, stream_name, step_forecast_dt, "target")
 
             output_data += [rdata]
 
         return (input_data, output_data)
+
+    def _window_indices(self, base_idx, num_forecast_steps, num_steps_input_max):
+        """Time-window indices of the input steps and of the output (target) steps."""
+        in_idxs = list(range(base_idx - num_steps_input_max + 1, base_idx + 1))
+        out_idxs = [
+            base_idx + (self.time_step * timestep_idx) // self.step_timedelta
+            for timestep_idx in range(
+                self.output_offset, self._get_output_length(num_forecast_steps)
+            )
+        ]
+        return in_idxs, out_idxs
+
+    def _spoof_window(self, stream_ds, stream_name, win_idx, kind):
+        """
+        Mean-valued stand-in for a window without usable data of one stream.
+
+        Spoofed points must lie in the domain of the level this stream is tokenized
+        at (its ENCODE level), otherwise the tokenizer drops them and the window is
+        empty again -- exactly what spoofing is meant to prevent.
+        """
+        spoof_level = self.stream_encode_level[stream_name]
+        ch_idx = stream_ds[0].source_idx if kind == "source" else stream_ds[0].target_idx
+        rdata = spoof(
+            spoof_level,
+            self.time_window_handler.window(win_idx).start,
+            stream_ds[0].get_geoinfo_size(),
+            len(stream_ds[0].mean[ch_idx]),
+            domain=self.domain_pyramid.domain(spoof_level),
+        )
+        rdata.is_spoof = True
+        return rdata
+
+    def _respoof_tokenless_windows(
+        self, stream_info, stream_ds, stream_name, data, tokens, win_idxs, kind, pad_tokens
+    ):
+        """
+        Replace windows that have data but ZERO tokens after tokenization by spoofed
+        windows (in place) and re-tokenize them.
+
+        The readers' domain pre-filter is deliberately permissive (bbox margin, or
+        one ring of cells around a points domain), so a window can hold points that
+        all fall outside the active cells, e.g. an AVHRR swath grazing the margin.
+        Such a window is not empty (so it was not spoofed) but yields no tokens:
+        the embedding / prediction of this stream is then skipped on this rank only,
+        the FSDP collectives get out of step across ranks and training deadlocks
+        (NCCL watchdog timeout). Checking after tokenization uses the tokenizer's
+        own cell assignment, so the test is exact; it costs nothing unless a window
+        actually comes out empty.
+        """
+        for i, (rdata, tok) in enumerate(zip(data, tokens, strict=True)):
+            if getattr(rdata, "is_spoof", False) or (tok[0] is None and tok[1] is None):
+                continue
+            idxs_lens = tok[1]
+            if any(len(lens) > 0 and sum(lens) > 0 for lens in idxs_lens):
+                continue
+            _log_once(
+                logging.WARNING,
+                ("respoof_tokenless", self._stage, stream_name, kind),
+                "[%s] %s: %s window with %d points but no tokens inside the domain "
+                "-> spoofed (logged once per stream)",
+                self._stage, stream_name, kind, len(rdata.data),
+            )
+            data[i] = self._spoof_window(stream_ds, stream_name, win_idxs[i], kind)
+            tokens[i] = self._tok(stream_info).get_tokens_windows(
+                stream_info, [data[i]], pad_tokens
+            )[0]
 
     def _get_source_target_masks(self, training_mode):
         """
@@ -985,6 +1031,18 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
             # *_tokens = [ (cells_idx, cells_idx_lens), ... ] with length = #time_steps
             input_tokens = self._tok(stream_info).get_tokens_windows(stream_info, input_data, True)
             output_tokens = self._tok(stream_info).get_tokens_windows(stream_info, output_data, False)
+
+            # windows with points but no tokens in the domain -> spoof, so that every
+            # rank runs the same modules (FSDP collectives stay aligned)
+            in_idxs, out_idxs = self._window_indices(idx, num_forecast_steps, i_max)
+            self._respoof_tokenless_windows(
+                stream_info, stream_ds, stream_name, input_data, input_tokens, in_idxs,
+                "source", True,
+            )
+            self._respoof_tokenless_windows(
+                stream_info, stream_ds, stream_name, output_data, output_tokens, out_idxs,
+                "target", False,
+            )
 
             for sidx, source_mask in enumerate(source_masks.masks):
                 # Map each source to its target
