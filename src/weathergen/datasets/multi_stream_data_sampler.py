@@ -122,6 +122,19 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         self.rank = cf.rank
         self.world_size = cf.world_size
         self.repeat_data = cf.data_loading.get("repeat_data_in_mini_epoch", False)
+        # Which windows to drop because of missing data (anemoi streams; checked once,
+        # deterministically, when the sample list is built):
+        #   "any"         : drop a window if ANY stream misses ANY input or target step
+        #                   (strict; previous behaviour, default)
+        #   "all_sources" : drop a window only if ALL streams miss ALL input steps; a
+        #                   stream missing in a kept window is spoofed (its targets get
+        #                   loss weight 0) -- as in the upstream / multires-haar sampler
+        #   "none"        : never drop; every missing stream is spoofed
+        self.drop_missing = str(cf.data_loading.get("drop_samples_with_missing", "any"))
+        assert self.drop_missing in ("any", "all_sources", "none"), (
+            "data_loading.drop_samples_with_missing must be 'any', 'all_sources' or 'none', "
+            f"got {self.drop_missing!r}"
+        )
 
         # initialise healpix
         self.healpix_level = cf.healpix_level
@@ -368,26 +381,49 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
         perms = np.arange(self.max_input_steps, perms_len)
 
-        # exclude windows overlapping missing dates: deterministic and identical on
-        # every rank, so ranks stay aligned without any collective
+        # exclude windows with missing data (policy: self.drop_missing); deterministic
+        # and identical on every rank, so ranks stay aligned without any collective
         n_out = self.output_offset + fsm + 1
 
-        def _bad(i):
+        def _missing(r, j) -> bool:
+            # readers without the check (obs, synop, ...) are treated as present
+            f = getattr(r, "window_has_missing", None)
+            if f is None:
+                return False
+            # a reader with no dataset (e.g. date range outside its coverage) has no data
+            return getattr(r, "ds", True) is None or f(j)
+
+        def _readers():
+            for sd in self.streams_datasets.values():
+                for r in sd.readers:
+                    yield r
+
+        def _bad_any(i):
             for j in range(i - self.max_input_steps + 1, i + n_out + 1):
-                for sd in self.streams_datasets.values():
-                    for r in sd.readers:
-                        f = getattr(r, "window_has_missing", None)
-                        if f is not None and f(j):
-                            return True
+                for r in _readers():
+                    if getattr(r, "window_has_missing", None) is not None and r.window_has_missing(j):
+                        return True
             return False
 
-        keep = np.array([i for i in perms if not _bad(i)], dtype=perms.dtype)
+        def _bad_all_sources(i):
+            # bad only if no stream has data at any input step
+            for j in range(i - self.max_input_steps + 1, i + 1):
+                for r in _readers():
+                    if not _missing(r, j):
+                        return False
+            return True
+
+        if self.drop_missing == "none":
+            keep = perms
+        else:
+            _bad = _bad_any if self.drop_missing == "any" else _bad_all_sources
+            keep = np.array([i for i in perms if not _bad(i)], dtype=perms.dtype)
         if len(keep) < len(perms):
             _log_once(
                 logging.WARNING,
-                ("dropping_windows", len(perms) - len(keep), len(perms)),
-                "Dropping %d of %d windows containing missing dates",
-                len(perms) - len(keep), len(perms),
+                ("dropping_windows", self.drop_missing, len(perms) - len(keep), len(perms)),
+                "Dropping %d of %d windows with missing data (drop_samples_with_missing=%s)",
+                len(perms) - len(keep), len(perms), self.drop_missing,
             )
         assert len(keep) > 0, "All windows contain missing dates; check date range vs coverage."
         return keep

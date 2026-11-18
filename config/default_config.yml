@@ -134,6 +134,13 @@ data_loading :
   rng_seed: ???
   repeat_data_in_mini_epoch : False
 
+  # windows with missing data in anemoi streams:
+  #   "any"         : drop if any stream misses any input/target step (default)
+  #   "all_sources" : drop only if all streams miss all input steps; otherwise train on it
+  #                   with the missing streams spoofed (their targets get loss weight 0)
+  #   "none"        : never drop
+  drop_samples_with_missing: "any"
+
   # pin GPU memory for faster transfer; it is possible that enabling memory_pinning with 
   # FSDP2 + DINOv2 can cause the job to hang and trigger a PyTorch timeout error.
   # If this happens, you can disable the flag, but performance will drop on GH200.
