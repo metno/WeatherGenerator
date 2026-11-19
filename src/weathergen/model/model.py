@@ -522,8 +522,20 @@ class ModelParams(torch.nn.Module):
             )
         )
 
+        # Longitude wraps: u_lon jumps from ~1 back to 0 at azimuth 2pi -> 0 (geographic
+        # +-180 deg). With a non-integer frequency f, sin(2 pi f u) differs on the two
+        # sides of the jump, so two neighbouring cells across the dateline get unrelated
+        # codes (a seam). Whole-number frequencies make every term periodic over 360 deg,
+        # i.e. continuous across the dateline (as in upstream pe_global_latlon, #3082).
+        # Opt-in: pe_global is not stored in checkpoints but recomputed at start-up, so
+        # changing it would alter continued runs and inference of existing models. It
+        # only matters for domains that touch +-180 deg (or global runs). Latitude does
+        # not wrap and keeps the original frequencies.
+        freqs_lon = freqs
+        if cf.get("pe_global_lon_integer_freqs", False):
+            freqs_lon = torch.clamp(torch.round(freqs), min=1.0)
         ang_lat = 2 * torch.pi * torch.outer(u_lat, freqs)
-        ang_lon = 2 * torch.pi * torch.outer(u_lon, freqs)
+        ang_lon = 2 * torch.pi * torch.outer(u_lon, freqs_lon)
         pe_geo = torch.cat(
             [torch.sin(ang_lat), torch.cos(ang_lat), torch.sin(ang_lon), torch.cos(ang_lon)],
             dim=-1,

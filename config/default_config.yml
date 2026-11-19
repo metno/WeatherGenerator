@@ -70,6 +70,10 @@ healpix_level: 5
 # When True: uses 2D RoPE based on healpix cell coordinates (lat/lon)
 # When False: uses traditional pe_global positional encoding
 rope_2D: False
+# pe_global (geographic, per cell): whole-number longitude frequencies, so the code is
+# continuous across +-180 deg. Only matters for domains touching the dateline or global
+# runs; False keeps the encoding of existing models (pe_global is not in checkpoints).
+pe_global_lon_integer_freqs: False
 
 with_mixed_precision: True
 with_flash_attention: True
@@ -174,6 +178,11 @@ training_config:
     policy_decay: "constant"
     policy_cooldown: "linear"
     parallel_scaling_policy: "sqrt"
+    # policy_warmup "cosine" uses OneCycleLR, which by default overwrites adamw beta1
+    # (0.95 -> 0.85 in warmup, then 0.85 for the rest of the run). False (default): the
+    # configured beta1 is used. True: old behaviour, needed to continue a run started
+    # before this option existed (its saved config has no cycle_momentum key).
+    cycle_momentum: False
 
   optimizer:
     grad_clip: 1.0
