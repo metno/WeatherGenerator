@@ -33,6 +33,7 @@ import weathergen.common.config as config
 from weathergen.common.config import Config
 from weathergen.datasets.multi_stream_data_sampler import MultiStreamDataSampler
 from weathergen.model.ema import EMAModel
+from weathergen.model.encoder_diag import get_encoder_diag
 from weathergen.model.model_interface import (
     init_model_and_shard,
 )
@@ -503,6 +504,9 @@ class Trainer(TrainerBase):
 #                                      f"nan={torch.isnan(_l).any().item()} "
 #                                      f"absmax={_l.abs().max().item():.3e}", flush=True)
 
+                    _diag = get_encoder_diag()
+                    if _diag is not None:
+                        _diag.begin_step(self.cf.general.istep, training=True)
                     preds = self.model(
                         model_params=self.model_params,
                         batch=batch.get_source_samples(),
@@ -559,9 +563,15 @@ class Trainer(TrainerBase):
                     if bidx % self.train_logging.metrics == 0:
                         self._log_instant_grad_norms(TRAIN)
 
-                # optimizer step
+                # optimizer step (encoder_diag: gradient / update sizes, every rank)
+                _diag = get_encoder_diag()
+                if _diag is not None:
+                    _diag.pre_opt(self.model, self.cf.general.istep)
                 self.grad_scaler.step(self.optimizer)
                 self.grad_scaler.update()
+                if _diag is not None and _diag.due(self.cf.general.istep):
+                    _diag.post_opt(self.model, self.cf.general.istep)
+                    _diag.report("train", self.cf.general.istep)  # collective, all ranks
                 # --- TEMP NaN diagnostics ---
 #                if check_params_after_step(self.model, self.cf.general.istep):
 #                    raise SystemExit(1)
@@ -640,6 +650,9 @@ class Trainer(TrainerBase):
         self.model.eval()
 
         dataset_val_iter = iter(self.data_loader_validation)
+        _diag = get_encoder_diag()
+        if _diag is not None:
+            _diag.begin_validation()
 
         num_samples_write = mode_cfg.get("output", {}).get("num_samples", 0) * batch_size
 
@@ -651,6 +664,8 @@ class Trainer(TrainerBase):
                 for bidx, batch in enumerate(dataset_val_iter):
                     batch.to_device(self.device)
 
+                    if _diag is not None:
+                        _diag.begin_step(self.cf.general.istep, training=False)
                     # evaluate model
                     with torch.autocast(
                         device_type=f"cuda:{cf.local_rank}",
@@ -710,6 +725,9 @@ class Trainer(TrainerBase):
                     if (bidx * batch_size) > mode_cfg.samples_per_mini_epoch:
                         break
 
+                if _diag is not None:
+                    _diag.report("val", self.cf.general.istep)  # collective, all ranks
+                    _diag.active = False
                 self._log_terminal(0, mini_epoch, VAL)
                 self._log(VAL)
 

@@ -131,6 +131,9 @@ class EncoderModule(torch.nn.Module):
         self.stream_encode_level, self.stream_decode_levels = assign_stream_levels(
             cf, ladder=self.domain_pyramid.levels
         )
+        # opt-in diagnostics (encoder_diag: True); plain object, no tensors
+        from weathergen.model.encoder_diag import setup_encoder_diag
+        setup_encoder_diag(cf, self.domain_pyramid.levels, self.stream_encode_level)
 
         self._q_cells_param_dict = torch.nn.ParameterDict()
         self._ae_aggregation_per_level = torch.nn.ModuleDict()
@@ -286,6 +289,11 @@ class EncoderModule(torch.nn.Module):
 
         _has_pyr = hasattr(model_params, "params_for")
 
+        from weathergen.model.encoder_diag import get_encoder_diag
+        diag = get_encoder_diag()
+        diag_on = diag is not None and diag.active
+        nq = self.cf.ae_local_num_queries
+
         tokens_global_by_level = {}
         posteriors_by_level = {}
         for lvl in levels:
@@ -303,12 +311,21 @@ class EncoderModule(torch.nn.Module):
                 lvl,
                 use_reentrant=False,
             )
+            if diag_on:
+                n_cell_tok = len(self.domain_pyramid.domain(lvl)) * nq
+                _tl = batch.tokens_lens
+                diag.tokens(lvl, _tl.get(lvl) if isinstance(_tl, dict) else _tl)
+                diag.latent("local", lvl, tokens_global_l, n_cell_tok)
+                tokens_local_l = tokens_global_l
             tokens_global_l = self._maybe_checkpoint(
                 ae_global_l,
                 tokens_global_l,
                 coords=mp_l.rope_coords,
                 use_reentrant=False,
             )
+            if diag_on:
+                diag.latent("global", lvl, tokens_global_l, n_cell_tok, ref=tokens_local_l)
+                del tokens_local_l
             tokens_global_by_level[lvl] = tokens_global_l
             # DEBUG: plot latent space
 #            if self.training and (self._plot_step % 10 == 0):
@@ -326,7 +343,15 @@ class EncoderModule(torch.nn.Module):
             posteriors_by_level[lvl] = posteriors_l
 
         # Phase 4: exchange information across levels (no-op unless enabled).
+        tokens_before_cascade = dict(tokens_global_by_level) if diag_on else None
         tokens_global_by_level = self.latent_cascade(tokens_global_by_level)
+        if diag_on:
+            for lvl in levels:
+                diag.latent(
+                    "cascade", lvl, tokens_global_by_level[lvl],
+                    len(self.domain_pyramid.domain(lvl)) * nq,
+                    ref=tokens_before_cascade[lvl],
+                )
 
         return tokens_global_by_level, posteriors_by_level
 

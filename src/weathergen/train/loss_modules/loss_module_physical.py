@@ -285,26 +285,33 @@ class LossPhysical(LossModuleBase):
     @staticmethod
     def _loss_global_haar_varweighted_crps(
         target, pred, target_coords_raw, weights_channels,
-        stream_name="", template_path="",
-        num_levels=3, var_weight_epsilon=1e-3,
-        fair=True, normalization="std",
-        ll_weight=0.0,
+        stream_name="", template_path="", **kwargs,
     ):
+        """kwargs: any option of loss_fns.global_haar_wavelet_reshape_varweighted_crps
+        (num_levels, var_weight_epsilon, fair, crps_alpha, normalization, ll_weight,
+        regrid_method, level_start, level_weights, member_ll_mse_weight)."""
         if target.shape[0] == 0:
             return (
                 torch.tensor(0.0, device=target.device, requires_grad=True),
                 torch.zeros(target.shape[-1], device=target.device),
             )
         target_coords_raw = target_coords_raw.to(target.device)
-        return loss_fns.global_haar_wavelet_reshape_varweighted_crps(
+        # haar_overrides is shared with the MSE variant: drop keys this loss does not
+        # know (reported once) instead of failing
+        import inspect
+
+        fn = loss_fns.global_haar_wavelet_reshape_varweighted_crps
+        known = set(inspect.signature(fn).parameters)
+        dropped = sorted(k for k in kwargs if k not in known)
+        if dropped and not getattr(fn, f"_dropped_reported_{stream_name}", False):
+            setattr(fn, f"_dropped_reported_{stream_name}", True)
+            print(f"[global_haar_varweighted_crps] stream={stream_name} ignores {dropped}")
+        return fn(
             target, pred, target_coords_raw,
             weights_channels=weights_channels, weights_points=None,
             template_path=template_path,
-            num_levels=num_levels,
-            var_weight_epsilon=var_weight_epsilon,
-            fair=fair, normalization=normalization,
-            ll_weight=ll_weight,
             stream_name=stream_name,
+            **{k: v for k, v in kwargs.items() if k in known},
         )
 
     @staticmethod
@@ -597,12 +604,17 @@ class LossPhysical(LossModuleBase):
                             )
 
                         elif loss_fct_name == "global_haar_wavelet_reshape_varweighted_crps":
+                            # same per-stream overrides as the MSE variant
+                            _ov = dict(loss_fct_params)
+                            _ov.update(stream_info.get("haar_overrides", {}))
+                            if "regrid_method" in stream_info:
+                                _ov["regrid_method"] = stream_info["regrid_method"]
+                            _ov.pop("template_path", None)
                             loss_lfct, loss_lfct_chs = self._loss_global_haar_varweighted_crps(
                                 target, pred, targets_coords_batch[target_idx],
                                 weights_channels, stream_name=stream_name,
                                 template_path=stream_info.get("template_path", ""),
-                                **{k: v for k, v in loss_fct_params.items()
-                                    if k != "template_path"},
+                                **_ov,
                             )
 
                         elif loss_fct_name == "global_haar_ll_reshape_varweighted":
