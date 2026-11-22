@@ -33,6 +33,9 @@ over the whole validation):
                 over cells, and number of directions holding 90% of the variance, out
                 of dim) and fraction of dead channels (std across cells < 1% of the
                 median channel std)
+  [diag noise]  stochastic latent: change made by the noise block and difference between
+                two members, both relative to the latent size (compare with the 6-h sample
+                change of [diag global] in validation)
   [diag grad]   per module group: gradient norm |g|, weight norm |w| and relative
                 update |dw|/|w| of the optimizer step (healthy ~1e-4..1e-2;
                 much smaller = not learning, much larger = unstable)
@@ -59,6 +62,7 @@ GRAD_GROUPS = (
     ("cascade", ("latent_cascade", "forecast_cascade")),
     ("forecast", ("_forecast_per_level", "forecast_engine")),
     ("decoder", ("embed_target_coords", "target_token_engines", "pred_heads")),
+    ("noise", ("latent_noise",)),
 )
 
 
@@ -100,6 +104,7 @@ class EncoderDiag:
             keys += [f"local/{lv}/{k}" for k in ("rms", "xcell", "dsample")]
             keys += [f"global/{lv}/{k}" for k in
                      ("change", "cascade", "rms", "dsample", "effdim", "dim90", "dead")]
+            keys += [f"noise/{lv}/{k}" for k in ("change", "spread")]
         for g, _ in GRAD_GROUPS + (("other", ()),):
             keys += [f"grad/{g}/{k}" for k in ("g2", "w2", "u2")]
         self.keys = keys
@@ -208,6 +213,30 @@ class EncoderDiag:
                 sd = c.std(dim=0)
                 med = sd.median().clamp(min=1e-12)
                 self._add(f"global/{lv}/dead", (sd < 0.01 * med).float().mean().item())
+
+    @torch.no_grad()
+    def noise(self, level, x_in, x_out, member, n_cell_tokens):
+        """
+        Stochastic latent. member 0: change made by the noise block, |out - in| / |in|;
+        member 1: difference between two members, |out_1 - out_0| / |in|. Both on the cells
+        of sample 0; compare them with the 6-h "sample change" of [diag global] (validation).
+        """
+        if not self.active or x_in is None or x_in.dim() != 3:
+            return
+        lv = int(level)
+        with torch.autocast(device_type=x_in.device.type, enabled=False):
+            n0 = x_in.shape[1] - int(n_cell_tokens)
+            a = x_in[0, n0:].float()
+            b = x_out[0, n0:].float()
+            ref = a.norm().clamp(min=1e-12)
+            if member == 0:
+                self._add(f"noise/{lv}/change", ((b - a).norm() / ref).item())
+                self._noise_m0 = b.detach().clone()
+            elif member == 1:
+                m0 = getattr(self, "_noise_m0", None)
+                if m0 is not None and m0.shape == b.shape:
+                    self._add(f"noise/{lv}/spread", ((b - m0).norm() / ref).item())
+                self._noise_m0 = None
 
     # ------------------------------------------------------- optimizer hooks
     @torch.no_grad()
@@ -318,6 +347,12 @@ class EncoderDiag:
                          f"sample change {mean(k + 'dsample'):.3g} | "
                          f"eff. dims {mean(k + 'effdim'):.0f} (90%: {mean(k + 'dim90'):.0f}) "
                          f"of {self.dim} | dead {100 * mean(k + 'dead'):.0f}%")
+        for lv in self.levels:
+            k = f"noise/{lv}/"
+            if r[k + "change"][1] == 0:
+                continue
+            lines.append(f"{hdr.format('noise')} hl{lv}: change by noise block "
+                         f"{mean(k + 'change'):.3g} | between members {mean(k + 'spread'):.3g}")
         if self.training:
             parts = []
             for g, _ in GRAD_GROUPS + (("other", ()),):

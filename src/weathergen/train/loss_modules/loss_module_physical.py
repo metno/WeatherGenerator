@@ -797,9 +797,12 @@ class LossPhysical(LossModuleBase):
         # rank only (e.g. because its sample was spoofed) would deadlock the collectives.
         # Hence the keys depend only on the config (streams with ens_size > 1), and a
         # stream without a valid spread in this batch logs NaN (dropped later by nanmean).
+        _stoch = bool((self.cf.get("stochastic", None) or {}).get("enabled", False))
         for sname, sinfo in self.cf.streams.items():
             ens_size = sinfo.get("pred_head", {}).get("ens_size", 1)
-            if ens_size is None or int(ens_size) <= 1:
+            # stochastic latent: every predicted (non-forcing) stream has members
+            has_members = _stoch and not sinfo.get("forcing", False)
+            if (ens_size is None or int(ens_size) <= 1) and not has_members:
                 continue
             vals = _spread_acc.get(sname, [])
             stddev_all[sname]["stddev_avg"] = (

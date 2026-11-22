@@ -28,6 +28,8 @@ from weathergen.datasets.utils import healpix_verts_rots, r3tos2
 from weathergen.model.encoder import EncoderModule
 from weathergen.model.forecast_diag import ForecastLatentDiag
 from weathergen.model.latent_cascade import LatentCascade
+from weathergen.model.stochastic import NeighbourAttention
+from weathergen.utils.step_timer import get_step_timer
 from weathergen.model.positional_encoding import dec_rope_frame, dec_rope_project
 from weathergen.model.engines import (
     BilinearDecoder,
@@ -122,6 +124,9 @@ def _reinit_parameter(modules: dict[str, nn.Module], key: str, done_owners: set)
 
     # ---- parameters that are not inside a leaf layer ----
     if isinstance(owner, TargetPredictionEngine) and pname == "pos_embed":
+        param.zero_()
+        return True
+    if isinstance(owner, NeighbourAttention) and pname == "slot":
         param.zero_()
         return True
     if owner_path.endswith("_q_cells_param_dict"):
@@ -781,6 +786,13 @@ class Model(torch.nn.Module):
             up_rope_wavelengths=_fc_cfg.get("up_rope_wavelengths", [0.25, 4.0]),
         )
 
+        # stochastic latent (ensemble members from noise); not built when disabled
+        from weathergen.model.stochastic import LatentNoise, stochastic_enabled
+
+        self.latent_noise = (
+            LatentNoise(cf, self.domain_pyramid.finest) if stochastic_enabled(cf) else None
+        )
+
         # embed coordinates yielding one query token for each target token
         dropout_rate = cf.embed_dropout_rate
         self.embed_target_coords = torch.nn.ModuleDict()
@@ -1054,6 +1066,9 @@ class Model(torch.nn.Module):
         print(f" Global assimilation engine: {num_params_ae_global:,}")
         print(f" Latent prediction heads and pre-norm: {num_params_latent_heads:,}")
         print(f" Forecast engine: {num_params_fe:,}")
+        if getattr(self, "latent_noise", None) is not None:
+            n_noise = sum(p.numel() for p in self.latent_noise.parameters() if p.requires_grad)
+            print(f" Stochastic latent (noise blocks): {n_noise:,}")
         print(" coordinate embedding, prediction networks and prediction heads:")
         zps = zip(
             self.streams.keys(),
@@ -2085,25 +2100,63 @@ class Model(torch.nn.Module):
             return out_c
 
         # roll-out in latent space, iterate and generate output over requested output steps
-        for step in batch.get_output_idxs():
-            without_grad = p_fwd and self.training and step != max(batch.get_output_idxs())
-            if without_grad:
-                # Pushforward mode: advance without grad; no decoding
+        def _rollout(tokens_lvl, output, with_latent=True):
+            tokens = tokens_lvl[_finest]
+            for step in batch.get_output_idxs():
+                without_grad = p_fwd and self.training and step != max(batch.get_output_idxs())
+                if without_grad:
+                    # Pushforward mode: advance without grad; no decoding
+                    tokens_lvl = _forecast_all(tokens_lvl, step)
+                    tokens = tokens_lvl[_finest]
+                    continue
+
                 tokens_lvl = _forecast_all(tokens_lvl, step)
                 tokens = tokens_lvl[_finest]
-                continue
+                # decoder predictions (fine streams read coarse+fine via tokens_lvl)
+                # (latent_blur_eval: the blurred copy is decoded only, never rolled forward)
+                tokens_dec = _blur_latents(tokens_lvl)
+                output = self.predict_decoders(
+                    model_params, step, tokens_dec[_finest], batch, output, tokens_lvl=tokens_dec
+                )
+                # latent predictions (raw and with SSL heads)
+                if with_latent:
+                    output = self.predict_latent(model_params, step, tokens, batch, output)
+            return output
 
-            tokens_lvl = _forecast_all(tokens_lvl, step)
-            tokens = tokens_lvl[_finest]
-            # decoder predictions (fine streams read coarse+fine via tokens_lvl)
-            # (latent_blur_eval: the blurred copy is decoded only, never rolled forward)
-            tokens_dec = _blur_latents(tokens_lvl)
-            output = self.predict_decoders(
-                model_params, step, tokens_dec[_finest], batch, output, tokens_lvl=tokens_dec
-            )
-            # latent predictions (raw and with SSL heads)
-            output = self.predict_latent(model_params, step, tokens, batch, output)
+        _timer = get_step_timer()
+        if _timer is not None:
+            _timer.mark("encoder")
 
+        noise = getattr(self, "latent_noise", None)
+        if noise is None:
+            return _rollout(tokens_lvl, output)
+
+        # stochastic latent: the encoder ran once; every member gets its own noise, then the
+        # forecast engine and the decoders. Members are stacked on the ensemble dimension
+        # (dim 0) of every physical prediction: [members * ens_size, points, channels].
+        from weathergen.model.encoder_diag import get_encoder_diag
+
+        _diag = get_encoder_diag()
+        noise.begin_forward()
+        lvl_n = noise.level
+        outs = []
+        for m in range(noise.num_members()):
+            tl_m = dict(tokens_lvl)
+            tl_m[lvl_n] = noise(tokens_lvl[lvl_n], model_params, m)
+            if _diag is not None and _diag.active:
+                _diag.noise(lvl_n, tokens_lvl[lvl_n], tl_m[lvl_n], m,
+                            len(self.domain_pyramid.domain(lvl_n)) * self.cf.ae_local_num_queries)
+            out_m = output if m == 0 else ModelOutput(batch.get_output_len())
+            outs.append(_rollout(tl_m, out_m, with_latent=(m == 0)))
+            if _timer is not None:
+                _timer.mark("members")
+        output = outs[0]
+        for fstep in range(len(output.physical)):
+            for sname, pred0 in list(output.physical[fstep].items()):
+                output.physical[fstep][sname] = tuple(
+                    torch.cat([o.physical[fstep][sname][i] for o in outs], dim=0)
+                    for i in range(len(pred0))
+                )
         return output
 
     def predict_latent(

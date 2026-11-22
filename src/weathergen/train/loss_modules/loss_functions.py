@@ -2156,6 +2156,8 @@ def _crps_pointwise_mixed(target: torch.Tensor, preds: torch.Tensor, alpha: floa
     """
     ens_size = preds.shape[0]
     skill = torch.mean(torch.abs(preds - target.unsqueeze(0)), dim=0)
+    if ens_size == 1:
+        return skill
     c_e = alpha / (ens_size * (ens_size - 1)) + (1.0 - alpha) / (ens_size**2)
     spread = torch.zeros_like(skill)
     for i in range(ens_size - 1):  # loop over members: bounded memory
@@ -2206,7 +2208,8 @@ def global_haar_wavelet_reshape_varweighted_crps(
 
     Args:
         target              : (num_points, num_channels)
-        pred                : (ens_size, num_points, num_channels), ens_size > 1
+        pred                : (ens_size, num_points, num_channels); with ens_size = 1 the
+                              standard CRPS (absolute error) is used
         target_coords_raw   : (num_points, 2) geographic (lat, lon) degrees
         weights_channels    : (num_channels,) or None
         weights_points      : unused
@@ -2237,12 +2240,16 @@ def global_haar_wavelet_reshape_varweighted_crps(
     dev = target.device
     ens_size = pred.shape[0]
     C, E = num_channels, ens_size
-    assert ens_size > 1, (
-        f"[global_haar_varweighted_crps] stream={stream_name}: an ensemble with more "
-        f"than one member is needed for CRPS (got {ens_size})."
-    )
     assert normalization in ("std", "var", "none")
     alpha = float(crps_alpha) if fair else 0.0
+    if ens_size == 1:
+        # one member: the fair CRPS is undefined; use the standard CRPS (= absolute error)
+        alpha = 0.0
+        _key = f"_vwc_single_member_reported_{stream_name}"
+        if not getattr(_self, _key, False):
+            setattr(_self, _key, True)
+            print(f"[global_haar_varweighted_crps] stream={stream_name}: one member only, "
+                  f"standard CRPS (absolute error) is used")
 
     # NaN in target -> 0 in both, remembered as an invalid-cell indicator
     nan_t = torch.isnan(target)

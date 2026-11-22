@@ -34,6 +34,7 @@ from weathergen.common.config import Config
 from weathergen.datasets.multi_stream_data_sampler import MultiStreamDataSampler
 from weathergen.model.ema import EMAModel
 from weathergen.model.encoder_diag import get_encoder_diag
+from weathergen.utils.step_timer import setup_step_timer
 from weathergen.model.model_interface import (
     init_model_and_shard,
 )
@@ -357,8 +358,25 @@ class Trainer(TrainerBase):
         beta2 = max(0.9, 1.0 - kappa * (1.0 - self.training_cfg.optimizer.adamw.beta2))
         eps = self.training_cfg.optimizer.adamw.get("eps", 2e-08) / np.sqrt(kappa)
 
+        # stochastic latent: the noise blocks start at zero and weight decay would pull them
+        # back, so they get their own group (stochastic.weight_decay, default 0)
+        _sc = cf.get("stochastic", None) or {}
+        if _sc.get("enabled", False):
+            _noise_p = [p for n, p in self.model.named_parameters() if "latent_noise." in n]
+            _noise_ids = {id(p) for p in _noise_p}
+            _params = [
+                {"params": [p for p in self.model.parameters() if id(p) not in _noise_ids]},
+                {"params": _noise_p, "weight_decay": float(_sc.get("weight_decay", 0.0))},
+            ]
+            if is_root():
+                logger.info(
+                    f"stochastic latent: {sum(p.numel() for p in _noise_p):,} noise-block "
+                    f"parameters, weight decay {float(_sc.get('weight_decay', 0.0))}"
+                )
+        else:
+            _params = self.model.parameters()
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
+            _params,
             lr=self.training_cfg.learning_rate_scheduling.lr_start,
             weight_decay=self.training_cfg.optimizer.weight_decay,
             betas=(beta1, beta2),
@@ -507,6 +525,9 @@ class Trainer(TrainerBase):
                     _diag = get_encoder_diag()
                     if _diag is not None:
                         _diag.begin_step(self.cf.general.istep, training=True)
+                    _timer = setup_step_timer(self.cf)
+                    if _timer is not None:
+                        _timer.begin(self.cf.general.istep, training=True)
                     preds = self.model(
                         model_params=self.model_params,
                         batch=batch.get_source_samples(),
@@ -530,6 +551,9 @@ class Trainer(TrainerBase):
                     targets_and_aux=targets_and_auxs,
                     metadata=extract_batch_metadata(batch),
                 )
+
+                if _timer is not None:
+                    _timer.mark("loss")
 
                 # TODO re-enable this, need to think on how to make it compatible with
                 # student-teacher training
@@ -556,6 +580,9 @@ class Trainer(TrainerBase):
                     self.model.parameters(), max_norm=self.training_cfg.optimizer.grad_clip
                 )
 
+                if _timer is not None:
+                    _timer.mark("backward")
+
                 # log gradient norms
                 if self.log_grad_norms:
                     if bidx % self.train_logging.terminal == 0:
@@ -572,6 +599,9 @@ class Trainer(TrainerBase):
                 if _diag is not None and _diag.due(self.cf.general.istep):
                     _diag.post_opt(self.model, self.cf.general.istep)
                     _diag.report("train", self.cf.general.istep)  # collective, all ranks
+                if _timer is not None:
+                    _timer.mark("optimizer")
+                    _timer.end()
                 # --- TEMP NaN diagnostics ---
 #                if check_params_after_step(self.model, self.cf.general.istep):
 #                    raise SystemExit(1)
