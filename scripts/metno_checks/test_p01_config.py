@@ -5,7 +5,9 @@ Usage:
     uv run --offline python scripts/metno_checks/test_p01_config.py <config.yml> [streams_dir]
 
 Checks:
-  - every loss term carries the same target_source_correspondence ("independent")
+  - every loss term carries the same target_source_correspondence ("independent"), with
+    QUOTED keys ("0"): config.save() looks keys up as strings (integer keys crash it)
+  - the config survives the save step (_strip_interpolation + json) that config.save() runs
   - SYNOP: geoinfos / stats_file / drop_empty_rows / single file
   - masks: input = random part of the cells (rate of the stream), target = every cell,
     for every stream, in train and val
@@ -16,10 +18,13 @@ from pathlib import Path
 import numpy as np
 from omegaconf import OmegaConf, open_dict
 
+import json
+
 from weathergen.common.config import (
     _load_base_conf,
     _load_overwrite_conf,
     _load_streams_in_config,
+    _strip_interpolation,
 )
 from weathergen.datasets.masking import Masker
 from weathergen.train.utils import get_active_stage_config
@@ -42,7 +47,13 @@ lf = cf.training_config.losses.physical.loss_fcts
 corrs = {k: OmegaConf.to_container(v.get("target_source_correspondence")) for k, v in lf.items()}
 for k, v in lf.items():
     print(f"  loss {k:42s} weight {v.weight:<6} corr {corrs[k]}")
-assert all(c == {0: {0: "independent"}} for c in corrs.values()), corrs
+assert all(c == {"0": {"0": "independent"}} for c in corrs.values()), (
+    f"keys must be quoted strings: {corrs}"
+)
+
+# the save step of config.save() (crashed with integer keys: "Missing key 0")
+json.dumps(OmegaConf.to_container(_strip_interpolation(cf)))
+print("config.save() step: ok")
 
 # SYNOP stream settings
 s = cf.streams.SYNOP
