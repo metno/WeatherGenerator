@@ -57,6 +57,7 @@ def _sampler_and_batch(
     )
 
     sampler = object.__new__(MultiStreamDataSampler)
+    sampler.initialization_stride = 1
     sampler.fft_crps_point_counts = {"MEPS": lat.size}
     sampler.streams_datasets = {
         "MEPS": SimpleNamespace(

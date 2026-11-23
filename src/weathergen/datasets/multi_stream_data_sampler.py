@@ -91,6 +91,18 @@ FORECAST_DEFAULTS = {
 }
 
 
+def _initialization_stride(mode_cfg, batch_size: int, repeat_data: bool) -> int:
+    stride = mode_cfg.get("initialization_stride", 1)
+    if isinstance(stride, bool) or not isinstance(stride, int) or stride < 1:
+        raise ValueError("initialization_stride must be a positive integer.")
+    if stride > 1 and (mode_cfg.shuffle or repeat_data or batch_size != 1):
+        raise ValueError(
+            "initialization_stride > 1 requires shuffle=False, "
+            "repeat_data_in_mini_epoch=False, and batch size 1."
+        )
+    return stride
+
+
 def collect_datasources(
     stream_datasets: list, idx: int, type: str, rng, domain: Domain | None = None
 ) -> IOReaderData:
@@ -207,6 +219,9 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
         # initialise fsm, but can change for future mini_epochs
         self.batch_size = get_batch_size_from_config(mode_cfg)
         self.shuffle = mode_cfg.shuffle
+        self.initialization_stride = _initialization_stride(
+            mode_cfg, self.batch_size, self.repeat_data
+        )
         self.fft_crps_point_counts = _load_fft_crps_point_counts(mode_cfg, cf.streams)
 
         self.len_timedelta = mode_cfg.time_window_len
@@ -260,6 +275,33 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
     def check_samples(self, fsm: int):
         """Check if samples_per_mini_epoch is suitable
         Repeated both to initialise the MultiStreamDataSampler and for each mini epoch"""
+
+        if self.initialization_stride > 1:
+            available_samples = len(self._calc_baseperms(fsm))
+            if available_samples < self.world_size:
+                raise ValueError(
+                    f"Only {available_samples} strided initializations are available for "
+                    f"{self.world_size} ranks."
+                )
+            if self.samples_per_mini_epoch <= 0:
+                raise ValueError("Strided sampling requires samples_per_mini_epoch > 0.")
+            requested = min(self.samples_per_mini_epoch, available_samples)
+            self.len = requested // self.world_size
+            if self.len == 0:
+                raise ValueError("samples_per_mini_epoch must be at least the number of ranks.")
+            self.samples_per_mini_epoch = self.len * self.world_size
+            logger.info(
+                "Using %s of %s strided initializations across %s ranks.",
+                self.samples_per_mini_epoch,
+                available_samples,
+                self.world_size,
+            )
+            if self.samples_per_mini_epoch != requested:
+                logger.warning(
+                    "Dropping %s initializations to divide samples evenly across ranks.",
+                    requested - self.samples_per_mini_epoch,
+                )
+            return
 
         max_index = self.index_range.end - (
             (  # max time units needed to make a forecast
@@ -319,7 +361,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         perms_len = int(self.index_range.end - self.index_range.start)
         perms_len -= (fsm + self.output_offset) * (self.time_step // self.step_timedelta)
 
-        return np.arange(self.max_input_steps, perms_len)
+        return np.arange(self.max_input_steps, perms_len, self.initialization_stride)
 
     def _fft_grid_issue(self, batch: ModelBatch) -> str | None:
         for sample in batch.target_samples.samples:
@@ -1080,6 +1122,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
             # use while loop due to the scattered nature of the data in time and to
             # ensure batches are not empty
+            skip_strided = False
             while True:
                 idx: TIndex = perms[idx_raw % perms.shape[0]]
                 idx_raw += 1
@@ -1087,6 +1130,13 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                 batch = self._get_batch(idx, num_forecast_steps)
                 fft_grid_issue = self._fft_grid_issue(batch)
                 if fft_grid_issue is not None:
+                    if self.initialization_stride > 1:
+                        # replacing it would duplicate another worker's initialization
+                        logger.warning(
+                            "Skipping strided initialization %s: %s", idx, fft_grid_issue
+                        )
+                        skip_strided = True
+                        break
                     fft_grid_skips += 1
                     logger.warning("Skipping incomplete FFT CRPS sample: %s", fft_grid_issue)
                     if fft_grid_skips >= len(perms):
@@ -1104,10 +1154,16 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
                 # skip completely empty batch item or when all targets are empty -> no grad
                 if not_valid:
+                    if self.initialization_stride > 1:
+                        logger.warning("Skipping strided initialization %s: empty or NaN.", idx)
+                        skip_strided = True
+                        break
                     logger.warning(f"Skipping empty batch with idx={idx}.")
                 else:
                     break
 
+            if skip_strided:
+                continue
             yield batch
 
     def __len__(self):
