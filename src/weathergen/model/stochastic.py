@@ -16,20 +16,35 @@ finest level) goes through a few small blocks whose LayerNorms are conditioned o
 already applied, forecast engine, decoders) then runs on that member's latent. The members are
 stacked along the existing ensemble dimension of the predictions: [members, points, channels].
 
-Noise: N(0, 1), `noise_dim` numbers per scale, one draw per parent cell at every level in
-`noise_levels` (HEALPix nested ordering: parent id = id >> 2 (level - parent level)), shared by
-all children of that parent. A level equal to `stochastic.level` gives every cell its own noise.
-Optional smoothing over the 1-ring neighbourhood (`smooth_passes`) softens the parent edges.
-The amplitude of the effect on the latent is learned (it starts at exactly zero).
+Noise, two ways (the amplitude of its effect on the latent is learned and starts at zero):
+
+  smooth (recommended, `noise_scales_km`): for every scale, `noise_dim` numbers of white
+      N(0, 1) noise per cell of `stochastic.level`, smoothed by k passes of averaging over the
+      1-ring (the cell and its 8 neighbours), then rescaled to unit variance. One pass has a
+      spread of sqrt(2/3) cells per direction, so k passes give a Gaussian-like smoothing with
+      sigma = cell * sqrt(2 k / 3). The scale in km is taken as 2 sigma (the width of a blob):
+          k = round(1.5 * (scale_km / 2 / cell_km)^2)
+      e.g. hl8 (cell 25.5 km): 50 km -> 1 pass (still nearly independent from cell to cell:
+      avoid), 80 km -> 4, 120 km -> 8, 160 km -> 15, 200 km -> 23 passes.
+      No blocks: the noise is continuous from cell to cell.
+
+  blocks (first version, `noise_levels`): one draw per parent cell at every level in
+      `noise_levels` (HEALPix nested ordering: parent id = id >> 2 (level - parent level)),
+      shared by all its children, plus `smooth_passes` neighbour averages. Leaves a mosaic of
+      parent cells (~100 km squares for hl6) in the members; kept for old runs.
+
+With the same number of scales, both give the same noise size per cell (noise_dim x scales),
+so a checkpoint trained with one can be continued with the other.
 
 Config (all optional except enabled):
 
     stochastic:
       enabled: True
       level: 8                 # latent level that receives the noise (default: finest)
-      noise_levels: [6, 7]     # scales of the noise (parent levels); add 8 for per-cell noise
+      noise_scales_km: [80, 160]   # smooth noise (recommended); overrides noise_levels
+      noise_levels: [6, 7]     # block noise (first version): parent levels
       noise_dim: 8             # numbers per scale
-      smooth_passes: 1         # neighbour averaging passes of the noise (0 = none)
+      smooth_passes: 1         # block noise only: neighbour averaging passes
       num_blocks: 1            # noise-conditioned blocks
       att_dim: 512             # inner width of the neighbour attention
       att_heads: 8
@@ -128,6 +143,14 @@ class LatentNoise(torch.nn.Module):
         )
         self.noise_dim = int(sc.get("noise_dim", 8))
         self.smooth_passes = int(sc.get("smooth_passes", 1))
+        # smooth noise: scales in km -> number of neighbour-averaging passes (python only)
+        scales = sc.get("noise_scales_km", None)
+        self.noise_scales_km = [float(v) for v in scales] if scales else []
+        self.cell_km = math.sqrt(4.0 * math.pi * 6371.0**2 / (12 * 4**self.level))
+        self.scale_passes = [
+            max(0, int(round(1.5 * (km / 2.0 / self.cell_km) ** 2))) for km in self.noise_scales_km
+        ]
+        self._reported = False
         self.members_train = int(sc.get("members_train", 2))
         self.members_val = int(sc.get("members_val", 8))
         self.seed = int(sc.get("seed", 1234))
@@ -135,7 +158,8 @@ class LatentNoise(torch.nn.Module):
         assert self.num_queries == 1, "stochastic latent: only ae_local_num_queries = 1"
         self.num_aux = int(cf.num_register_tokens + cf.num_class_tokens)
         dim = int(cf.ae_global_dim_embed)
-        self.z_dim = self.noise_dim * len(self.noise_levels)
+        n_scales = len(self.noise_scales_km) if self.noise_scales_km else len(self.noise_levels)
+        self.z_dim = self.noise_dim * n_scales
         hidden = int(sc.get("mlp_hidden_factor", 1) * dim)
         self.blocks = torch.nn.ModuleList(
             [
@@ -184,6 +208,8 @@ class LatentNoise(torch.nn.Module):
         s = (self.seed * 1_000_003 + rank * 7_919 + mode * 104_729 + calls * 9_973 + member) % (2**62)
         gen = torch.Generator(device=device)
         gen.manual_seed(int(s))
+        if self.noise_scales_km:
+            return self._draw_smooth(batch_size, cells.shape[0], nb, gen, device)
         zs = []
         for n_par, inv in self._parent_maps(cells, device):
             zp = torch.randn(batch_size, n_par, self.noise_dim, generator=gen, device=device)
@@ -194,6 +220,26 @@ class LatentNoise(torch.nn.Module):
         if self.smooth_passes > 0:
             z = z / z.std(dim=1, keepdim=True).clamp(min=1e-6)       # back to unit variance
         return z
+
+    def _draw_smooth(self, batch_size, n_cells, nb, gen, device):
+        if not self._reported:
+            self._reported = True
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            if rank == 0:
+                txt = ", ".join(f"{km:.0f} km -> {k} passes"
+                                for km, k in zip(self.noise_scales_km, self.scale_passes))
+                print(f"[stochastic] smooth noise on hl{self.level} cells "
+                      f"({self.cell_km:.1f} km): {txt}", flush=True)
+        zs = []
+        for k in self.scale_passes:
+            z = torch.randn(batch_size, n_cells, self.noise_dim, generator=gen, device=device)
+            for _ in range(k):
+                z = z[:, nb].mean(dim=2)
+            if k > 0:
+                z = z - z.mean(dim=1, keepdim=True)
+                z = z / z.std(dim=1, keepdim=True).clamp(min=1e-6)
+            zs.append(z)
+        return torch.cat(zs, dim=-1)                                  # (B, N, z_dim)
 
     # ---------------------------------------------------------------- forward
     def forward(self, tokens, model_params, member: int):
