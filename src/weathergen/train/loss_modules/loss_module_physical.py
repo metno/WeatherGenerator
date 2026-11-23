@@ -131,7 +131,13 @@ class LossPhysical(LossModuleBase):
                 fn,
                 params.get("weight", 1.0),
                 name,
-                {k: v for k, v in params.items() if k != "weight"},
+                # target_source_correspondence is read by the Masker, not by the loss
+                # functions (their signatures do not accept it)
+                {
+                    k: v
+                    for k, v in params.items()
+                    if k not in ("weight", "target_source_correspondence")
+                },
             ])
 
         # neighbourhood structure for haar_wavelet_cell — set externally via

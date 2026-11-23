@@ -147,18 +147,41 @@ class DataReaderSynop(DataReaderTimestep):
             "stream_id": 0,
         }
 
+        # stations with a NaN in any selected geoinfo are removed later, silently, by
+        # remove_nan_coords_and_geoinfos(): report how many, once
+        if self.geoinfo_data.shape[1] > 0:
+            n_nan_geo = int(np.isnan(self.geoinfo_data).any(axis=1).sum())
+            if n_nan_geo > 0:
+                _logger.warning(
+                    "%s: %d of %d stations have a NaN geoinfo and will be dropped",
+                    ds_name, n_nan_geo, len(self.geoinfo_data),
+                )
+
+        # drop_empty_rows: drop station rows where every requested channel is missing in
+        # the window (otherwise they enter the network as 0 = the mean value)
+        self.drop_empty_rows = bool(stream_info.get("drop_empty_rows", False))
+
+        # stats_file: take mean / stdev from another file (e.g. the training-period file),
+        # so that every file of the stream (and every period) is normalised the same way
+        stats_file = stream_info.get("stats_file", None)
         # TODO: this should be stored/cached
-        self.mean, self.stdev = self._compute_mean_stdev()
+        if stats_file is not None:
+            _logger.info(f"{ds_name}: mean / stdev from stats_file {stats_file}")
+            with xr.open_dataset(stats_file, engine="netcdf4") as ds_stats:
+                self.mean, self.stdev = self._compute_mean_stdev(ds_stats)
+        else:
+            self.mean, self.stdev = self._compute_mean_stdev(self.ds)
         self.mean_geoinfo = self.mean[self.geoinfo_idx]
         self.stdev_geoinfo = self.stdev[self.geoinfo_idx]
 
-    def _compute_mean_stdev(self) -> (np.array, np.array):
+    def _compute_mean_stdev(self, ds) -> (np.array, np.array):
         _logger.info("Starting computation of mean and stdev.")
 
         mean, stdev = [], []
 
         for ch in self.channels_file:
-            data = np.array(self.ds[ch], np.float64)
+            assert ch in ds, f"channel {ch} not in the file used for mean / stdev"
+            data = np.array(ds[ch], np.float64)
             if self.fillvalue is not None:
                 data[data == self.fillvalue] = np.nan
             mean += [np.nanmean(data.flatten())]
@@ -250,6 +273,12 @@ class DataReaderSynop(DataReaderTimestep):
 
         # date time matching #data points of data
         datetimes = np.repeat(self.ds.time[didx_start:didx_end].values, len(data) // len(t_idxs))
+
+        # drop rows (station x time) where every requested channel is missing
+        if self.drop_empty_rows and data.shape[1] > 0:
+            keep = np.isfinite(data).any(axis=1)
+            coords, geoinfos = coords[keep], geoinfos[keep]
+            data, datetimes = data[keep], datetimes[keep]
 
         rd = ReaderData(
             coords=coords,
