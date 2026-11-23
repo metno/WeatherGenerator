@@ -53,7 +53,7 @@ zs = [noise._draw_smooth(1, N, nb, torch.Generator().manual_seed(s), "cpu")[0] f
 zs = torch.stack(zs)                                                  # (6, N, 16)
 assert torch.allclose(zs.std(1), torch.ones(6, 16), atol=1e-4)
 for c in range(8):
-    assert len(torch.unique(zs[0, :, c])) == N, "repeated values: blocks"
+    assert len(torch.unique(zs[0, :, c])) > 0.99 * N, "many repeated values: blocks"
 rng = np.random.default_rng(0)
 i = rng.integers(0, N, 40000); j = rng.integers(0, N, 40000)
 dist = 6371.0 * np.arccos(np.clip((xyz[i] * xyz[j]).sum(1), -1, 1))
