@@ -226,29 +226,26 @@ class DataReaderObs(DataReaderBase):
         ## Handle situations where the requested dataset span
         #  goes beyond the hourly index stored in the zarr
         if diff_in_hours_end > (self.hrly_index.shape[0] - 1):
-            if diff_in_hours_start > (self.hrly_index.shape[0] - 1):
-                n = (diff_in_hours_end - diff_in_hours_start) // step_hrs
-                self.indices_start = np.zeros(n, dtype=int)
-                self.indices_end = np.zeros(n, dtype=int)
-            else:
-                self.indices_start = np.append(
-                    self.indices_start,
-                    np.ones(
-                        (diff_in_hours_end - (self.hrly_index.shape[0] - 1)) // step_hrs, dtype=int
-                    )
-                    * self.indices_start[-1],
-                )
-
-                self.indices_end = np.append(
-                    self.indices_end,
-                    np.ones(
-                        # add (len_hrs + 1) since above we also have diff_in_hours_start + len_hrs
-                        (diff_in_hours_end - (self.hrly_index.shape[0] - 1) + (len_hrs + 1))
-                        // step_hrs,
-                        dtype=int,
-                    )
-                    * self.indices_end[-1],
-                )
+            coverage_end = self.base_datetime + np.timedelta64(self.hrly_index.shape[0] - 1, "h")
+            _logger.warning(
+                "%s: requested observation range [%s, %s) extends beyond the hourly index "
+                "ending at %s in %s. Windows outside coverage will be empty.",
+                self.stream_info["name"],
+                self.start_dt,
+                self.end_dt,
+                coverage_end,
+                self.filename,
+            )
+            num_windows = (diff_in_hours_end - diff_in_hours_start) // step_hrs
+            terminal_row = int(self.hrly_index[-1])
+            indices_start = np.full(num_windows, terminal_row, dtype=np.int64)
+            indices_end = np.full(num_windows, terminal_row, dtype=np.int64)
+            num_starts = min(num_windows, len(self.indices_start))
+            num_ends = min(num_windows, len(self.indices_end))
+            indices_start[:num_starts] = self.indices_start[:num_starts]
+            indices_end[:num_ends] = self.indices_end[:num_ends]
+            self.indices_start = indices_start
+            self.indices_end = indices_end
 
         # Prevent -1 in samples before we have data
         self.indices_end = np.maximum(self.indices_end, 0)

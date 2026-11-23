@@ -1,0 +1,33 @@
+dropout_enabled: false
+
+general:
+  desc: "ezslwer9: 10-member ERA5 verification, six-hourly initializations in 2024"
+
+data_loading:
+  num_workers: 1
+  repeat_data_in_mini_epoch: false
+
+test_config:
+  start_date: "2024-01-01T00:00"
+  end_date: "2025-01-01T00:00"
+  time_window_step: "06:00:00"
+  samples_per_mini_epoch: 1464
+  shuffle: false
+  compute_full_validation_loss: false
+  forecast:
+    num_steps: 8
+    num_members: 10
+    policy: "fixed"
+    pushforward: false
+    chunk_size: 1
+  losses:
+    physical:
+      type: LossPhysical
+      loss_fcts:
+        kernel_crps:
+          weight: 1.0
+          alpha: 0.0
+  output:
+    num_samples: 1464
+    normalized_samples: false
+    streams: [ERA5]
