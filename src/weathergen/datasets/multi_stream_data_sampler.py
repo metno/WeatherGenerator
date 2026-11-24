@@ -271,6 +271,11 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
                 streams_datasets[stream_name].readers += [ds]
 
+            if len(streams_datasets[stream_name].readers == 0):
+                streams_datasets.pop(stream_name, None)
+                continue
+                
+
             stream_info[str(self._stage) + "_source_channels"] = ds.source_channels
             stream_info[str(self._stage) + "_target_channels"] = ds.target_channels
             stream_info["target_channel_weights"] = (
