@@ -245,6 +245,9 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
             for fname in stream_info.get("filenames", [pathlib.Path()]):
                 fname = pathlib.Path(fname)
+
+                found = True
+
                 # dont check if file exists since zarr stores might be directories
                 if fname.exists():
                     # check if fname is a valid path to allow for simple overwriting
@@ -259,22 +262,20 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                             f"stream '{stream_name}': {filenames}."
                         )
                         logger.info(msg)
-                        continue
+                        found = False
 
-                ds_type = stream_info["type"]
-                if is_root():
-                    logger.info(
-                        f"Opening dataset with type: {ds_type}"
-                        + f" from stream config {stream_name}.",
-                    )
-                ds = dataset(filename=filename, **kwargs)
+                if found:
+                    ds_type = stream_info["type"]
+                    if is_root():
+                        logger.info(
+                            f"Opening dataset with type: {ds_type}"
+                            + f" from stream config {stream_name}.",
+                        )
+                    ds = dataset(filename=filename, **kwargs)
+                else:
+                    ds = dataset.init_empty()
 
                 streams_datasets[stream_name].readers += [ds]
-
-            if (len(streams_datasets[stream_name].readers) == 0):
-                streams_datasets.pop(stream_name, None)
-                continue
-                
 
             stream_info[str(self._stage) + "_source_channels"] = ds.source_channels
             stream_info[str(self._stage) + "_target_channels"] = ds.target_channels
