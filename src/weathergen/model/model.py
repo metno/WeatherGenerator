@@ -26,6 +26,7 @@ from weathergen.datasets.utils import healpix_verts_rots, r3tos2
 from weathergen.model.encoder import EncoderModule
 from weathergen.model.engines import (
     BilinearDecoder,
+    DeepSSLFusion,
     EnsPredictionHead,
     ForecastingEngine,
     IdentityEngine,
@@ -38,6 +39,11 @@ from weathergen.model.engines import (
 )
 from weathergen.model.init_utils import reinit_parameters
 from weathergen.model.latent_cascade import LatentCascade
+from weathergen.model.latent_predictor import (
+    MultiLevelLatentPredictor,
+    cell_xyz,
+    jepa_multilevel_cfg,
+)
 from weathergen.model.layers import MLP, NamedLinear
 from weathergen.model.utils import get_num_parameters
 from weathergen.utils.distributed import is_root
@@ -466,6 +472,16 @@ class Model(torch.nn.Module):
         self.register_token_idxs = list(range(cf.num_register_tokens))
         self.aux_token_idxs = list(range(cf.num_register_tokens + cf.num_class_tokens))
         self.num_aux_tokens = cf.num_register_tokens + cf.num_class_tokens
+        # multi-level JEPA (head multilevel_transformer): {"levels", "target_norm"} or None;
+        # also set on SSL teachers (prepare_encoder_teacher)
+        self.ssl_ml: dict | None = None
+        self.latent_pre_norm_levels: nn.ModuleDict | None = None
+        self.deep_ssl_fusion: nn.ModuleDict | None = None
+        # deep SSL with the single-level JEPA heads: one projection per representation
+        self.deep_ssl_level_projections: nn.ModuleDict | None = None
+        # latent downscaler: frozen decoder of another run applied to the JEPA prediction
+        # (train/latent_decoder.py; a plain attribute, not a submodule)
+        self.latent_decoder = None
 
     def _create_latent_pred_head(
         self, global_cfg, name, loss_cfg, use_class_token, use_patch_token
@@ -489,8 +505,57 @@ class Model(torch.nn.Module):
             )
         elif loss_cfg["head"].lower() == "identity":
             return LatentPredictionHeadIdentity()
+        elif loss_cfg["head"].lower() == "multilevel_transformer":
+            pyramid = self.encoder.domain_pyramid
+            dims = self.encoder.dims_embed
+            levels = self.ssl_ml["levels"]
+            out_dims = {
+                lvl: int(lv["out_dim"] or dims[lvl]) for lvl, lv in levels.items() if lvl in dims
+            }
+            missing = [lvl for lvl in levels if lvl not in dims]
+            assert not missing, (
+                f"JEPA levels {missing} are not latent levels of the model {sorted(dims)}"
+            )
+            xyz = {lvl: cell_xyz(*pyramid.domain(lvl).centres_lonlat()) for lvl in pyramid.levels}
+            num_deep = len(self.encoder_deep_taps()) + 1 if self.encoder.deep_ssl else 0
+            return MultiLevelLatentPredictor(
+                global_cfg,
+                name,
+                loss_cfg,
+                dims_in=dict(dims),
+                out_dims=out_dims,
+                cells_xyz=xyz,
+                num_aux_tokens=self.num_aux_tokens,
+                num_deep_targets=num_deep,
+            )
         else:
             assert False, f"Unknown latent prediction head type {loss_cfg['head']}"
+
+    def encoder_deep_taps(self) -> list[str]:
+        """Deep SSL taps in canonical order (the final latent not included)."""
+        enc = self.encoder
+        taps = ["local2global"] if enc.tap_local2global else []
+        taps += [f"global:{k}" for k in sorted(enc.tap_global_layers or [])]
+        return taps
+
+    def create_ssl_multilevel_modules(self, ssl_ml: dict) -> None:
+        """
+        Per-level SSL modules of a multi-level JEPA: post-norm of every coarser latent level
+        (the finest level uses latent_pre_norm) and, with deep SSL, one DeepSSLFusion per
+        latent level. Created on student and EMA teacher (same config, EMA by name); a
+        frozen teacher gets them in prepare_encoder_teacher.
+        """
+        self.ssl_ml = ssl_ml
+        dims = self.encoder.dims_embed
+        self.latent_pre_norm_levels = nn.ModuleDict(
+            {str(lvl): nn.LayerNorm(d) for lvl, d in dims.items() if lvl != self.healpix_level}
+        )
+        if self.encoder.deep_ssl:
+            hidden_factor = self.cf.training_config.deep_ssl.get("fusion_hidden_factor", 2)
+            num = len(self.encoder_deep_taps()) + 1
+            self.deep_ssl_fusion = nn.ModuleDict(
+                {str(lvl): DeepSSLFusion(num, d, hidden_factor) for lvl, d in dims.items()}
+            )
 
     def _decoder_kv_dims(self, stream_name: str) -> tuple[int, dict[int, int]]:
         """
@@ -722,6 +787,9 @@ class Model(torch.nn.Module):
 
         # TODO: support multiple LossLatentSSLStudentTeacher terms
         assert len(ssl_losses_cfgs) <= 1, "To be implemented."
+        ssl_ml = jepa_multilevel_cfg(cf.training_config)
+        if ssl_ml is not None:
+            self.create_ssl_multilevel_modules(ssl_ml)
         for ssl_target_losses in ssl_losses_cfgs:
             self.latent_pre_norm = nn.LayerNorm(latent_dims[self.healpix_level])
             for loss, loss_conf in ssl_target_losses.loss_fcts.items():
@@ -750,7 +818,41 @@ class Model(torch.nn.Module):
                         use_patch_token=False,
                     )
 
+        # deep SSL (V-JEPA 2.1) with a single-level JEPA head (mlp / transformer), as ecmwf
+        # develop-ssl-diffusion-v2: the student fuses all representations of the finest level,
+        # predicts once and projects per representation (identity head = teacher: no modules)
+        jepa_head = self.latent_heads["JEPA"] if "JEPA" in self.latent_heads else None
+        if (
+            self.ssl_ml is None
+            and self.encoder.deep_ssl
+            and jepa_head is not None
+            and not isinstance(jepa_head, LatentPredictionHeadIdentity)
+        ):
+            num = len(self.encoder_deep_taps()) + 1
+            hidden_factor = cf.training_config.deep_ssl.get("fusion_hidden_factor", 2)
+            dim = latent_dims[self.healpix_level]
+            self.deep_ssl_fusion = nn.ModuleDict(
+                {str(self.healpix_level): DeepSSLFusion(num, dim, hidden_factor)}
+            )
+            out_dim = self._jepa_out_dim(cf)
+            self.deep_ssl_level_projections = nn.ModuleDict(
+                {
+                    "JEPA": nn.ModuleList(
+                        [nn.Linear(out_dim, out_dim, bias=False) for _ in range(num)]
+                    )
+                }
+            )
+
         return self
+
+    def _jepa_out_dim(self, cf) -> int:
+        """Output size of the single-level JEPA head (loss config out_dim)."""
+        for v in cf.training_config.losses.values():
+            if v.get("type", None) == "LossLatentSSLStudentTeacher":
+                conf = v.loss_fcts.get("JEPA", None)
+                if conf is not None:
+                    return int(conf["out_dim"])
+        raise ValueError("deep_ssl: no JEPA loss config with out_dim found")
 
     def reset_parameters(self):
         """
@@ -764,6 +866,17 @@ class Model(torch.nn.Module):
         # learnable cell queries are plain Parameters (one bank per latent level): re-draw
         # them with the constructor's initialisation
         self.encoder.reset_q_cells()
+
+        # multi-level JEPA predictor: plain Parameters (level / mask embeddings)
+        for module in self.latent_heads.modules() if self.latent_heads is not None else []:
+            if isinstance(module, MultiLevelLatentPredictor):
+                module.reset_extra_parameters()
+
+    def rebuild_ssl_buffers(self, device) -> None:
+        """Non-persistent buffers of the multi-level JEPA predictor (after to_empty, FSDP)."""
+        for module in self.latent_heads.modules() if self.latent_heads is not None else []:
+            if isinstance(module, MultiLevelLatentPredictor):
+                module.rebuild_buffers(device)
 
     def latent_cascades(self) -> list[LatentCascade]:
         """The latent cascades of a multi-resolution latent (empty for one level)."""
@@ -896,6 +1009,14 @@ class Model(torch.nn.Module):
         output = ModelOutput(batch.get_output_len())
 
         tokens, posteriors = self.encoder(model_params, batch)
+        # deep SSL (V-JEPA 2.1): {level: [intermediate tokens]} of the encoder, else None
+        ssl_intermediates = self.encoder.pop_ssl_intermediates()
+        if ssl_intermediates is not None:
+            n_steps = batch.get_num_source_steps()
+            ssl_intermediates = {
+                lvl: [t.reshape((len(batch), n_steps, *t.shape[1:])).sum(axis=1) for t in ts]
+                for lvl, ts in ssl_intermediates.items()
+            }
 
         # multi-resolution latent: the encoder returns one latent per level. The finest
         # level plays the role of the single latent (latent outputs, SSL heads); all levels
@@ -943,8 +1064,21 @@ class Model(torch.nn.Module):
             )
             # latent predictions (raw and with SSL heads)
             output = self.predict_latent(
-                model_params, step, tokens, batch, output, tokens_lvl=tokens_lvl
+                model_params,
+                step,
+                tokens,
+                batch,
+                output,
+                tokens_lvl=tokens_lvl,
+                intermediates=ssl_intermediates,
             )
+            # latent downscaler: decode the JEPA prediction with the frozen decoder
+            if self.latent_decoder is not None and step == 0:
+                pred = output.get_latent_prediction(step).get("JEPA", None)
+                if pred is not None:
+                    output = self.latent_decoder.decode(
+                        step, pred, batch, output, self.num_aux_tokens, self.training
+                    )
 
         return output
 
@@ -960,7 +1094,8 @@ class Model(torch.nn.Module):
             else:
                 engine = self._forecast_per_level[str(lvl)]
             out[lvl] = engine(t, step, model_params.params_for(lvl).rope_coords)
-        return self.forecast_cascade(out)
+        # SSL teachers have no forecast cascade (prepare_encoder_teacher)
+        return out if self.forecast_cascade is None else self.forecast_cascade(out)
 
     def predict_latent(
         self,
@@ -970,6 +1105,7 @@ class Model(torch.nn.Module):
         batch: ModelBatch,
         output: ModelOutput,
         tokens_lvl: dict | None = None,
+        intermediates: dict | None = None,
     ) -> ModelOutput:
         """
         Compute latent predictions
@@ -977,6 +1113,7 @@ class Model(torch.nn.Module):
         tokens_lvl : multi-resolution latent only: {level: tokens}. The finest level is the
             latent_state above; every coarser level is also stored, as the raw latent
             "latent_state_hl<level>" (no SSL heads), so that it can be written to the output.
+        intermediates : deep SSL only: {level: [intermediate tokens]} of the encoder.
         """
 
         # safe latent prediction
@@ -986,7 +1123,15 @@ class Model(torch.nn.Module):
 
         # latent predictions for SSL training
         for name, head in self.latent_heads.items():
+            if name == "JEPA" and self.ssl_ml is not None:
+                continue  # multi-level JEPA, below
             output.add_latent_prediction(step, name, head(latent_state))
+
+        if self.ssl_ml is not None and "JEPA" in self.latent_heads and step == 0:
+            tokens_by_level = tokens_lvl if tokens_lvl is not None else {self.healpix_level: tokens}
+            self.predict_latent_multilevel(step, tokens_by_level, batch, output, intermediates)
+        elif intermediates is not None and "JEPA" in self.latent_heads and step == 0:
+            self.predict_latent_deep_single(step, tokens, output, intermediates)
 
         if tokens_lvl is not None:
             for lvl, tokens_l in tokens_lvl.items():
@@ -996,6 +1141,102 @@ class Model(torch.nn.Module):
                     )
 
         return output
+
+    def predict_latent_deep_single(self, step, tokens, output, intermediates) -> None:
+        """
+        Deep SSL with a single-level JEPA head (ecmwf develop-ssl-diffusion-v2 scheme), on the
+        finest latent level: "JEPA_deep" = [one prediction / target per representation], in
+        the order [taps..., final].
+        Student: fuse all representations (DeepSSLFusion), post-norm, head once, then one
+        Linear projection per representation. Teacher (identity head): post-norm of every
+        representation, independently.
+        """
+        head = self.latent_heads["JEPA"]
+        reps = intermediates[self.healpix_level] + [tokens]
+        if isinstance(head, LatentPredictionHeadIdentity) or self.deep_ssl_fusion is None:
+            preds = [head(self.tokens_to_latent_state(self.latent_pre_norm(t), t)) for t in reps]
+        else:
+            fused = self.deep_ssl_fusion[str(self.healpix_level)](reps)
+            pred = head(self.tokens_to_latent_state(self.latent_pre_norm(fused), fused))
+            preds = [proj(pred) for proj in self.deep_ssl_level_projections["JEPA"]]
+        output.add_latent_prediction(step, "JEPA_deep", preds)
+
+    def _ssl_post_norm(self, level: int, tokens: torch.Tensor) -> torch.Tensor:
+        if level == self.healpix_level:
+            return self.latent_pre_norm(tokens)
+        return self.latent_pre_norm_levels[str(level)](tokens)
+
+    def student_hidden_cells(self, batch) -> dict[int, torch.Tensor]:
+        """
+        {level: (B, N_l) bool}: cells without any input token of the student (hidden by the
+        mask, or no data). Same notion as in the encoder, where these cells keep their query.
+        """
+        tokens_lens = batch.tokens_lens
+        if not isinstance(tokens_lens, dict):
+            tokens_lens = {self.healpix_level: tokens_lens}
+        # (num_steps, num_samples, num_streams, num_cells) -> (num_samples, num_cells)
+        return {lvl: tl.sum(dim=(0, 2)) == 0 for lvl, tl in tokens_lens.items()}
+
+    def predict_latent_multilevel(
+        self,
+        step: int,
+        tokens_by_level: dict[int, torch.Tensor],
+        batch,
+        output: ModelOutput,
+        intermediates: dict | None,
+    ) -> None:
+        """
+        Multi-level JEPA: student predictions / teacher targets for every configured level.
+
+        Student (MultiLevelLatentPredictor): "JEPA" = {level: (B, N_l, out_l)} and, with deep
+        SSL, "JEPA_deep" = {level: [one prediction per representation]}: the representations
+        of each level (taps + final) are fused (DeepSSLFusion), predicted once, and projected
+        per representation (as in ecmwf develop-ssl-diffusion-v2).
+        Teacher (identity head): "JEPA" = {level: post-norm (or raw) cell tokens} and
+        "JEPA_deep" = {level: [post-norm tokens of every representation]}.
+        """
+        aux = self.num_aux_tokens
+        head = self.latent_heads["JEPA"]
+        deep = intermediates is not None
+
+        if isinstance(head, MultiLevelLatentPredictor):
+            if deep:
+                assert self.deep_ssl_fusion is not None
+                inputs = {
+                    lvl: self.deep_ssl_fusion[str(lvl)](intermediates[lvl] + [t])
+                    for lvl, t in tokens_by_level.items()
+                }
+            else:
+                inputs = tokens_by_level
+            states = {lvl: self._ssl_post_norm(lvl, t) for lvl, t in inputs.items()}
+            hidden = self.student_hidden_cells(batch)
+            preds, preds_deep = head(states, hidden)
+            output.add_latent_prediction(step, "JEPA", preds)
+            # cells the student did not see: JEPA loss region (context loss elsewhere)
+            output.add_latent_prediction(step, "JEPA_hidden", hidden)
+            if preds_deep is not None:
+                output.add_latent_prediction(step, "JEPA_deep", preds_deep)
+            return
+
+        # teacher
+        raw = self.ssl_ml["target_norm"] == "none"
+
+        def target(lvl, t):
+            return t[:, aux:] if raw else self._ssl_post_norm(lvl, t)[:, aux:]
+
+        levels = [lvl for lvl in self.ssl_ml["levels"] if lvl in tokens_by_level]
+        output.add_latent_prediction(
+            step, "JEPA", {lvl: target(lvl, tokens_by_level[lvl]) for lvl in levels}
+        )
+        if deep:
+            output.add_latent_prediction(
+                step,
+                "JEPA_deep",
+                {
+                    lvl: [target(lvl, t) for t in intermediates[lvl] + [tokens_by_level[lvl]]]
+                    for lvl in levels
+                },
+            )
 
     def predict_decoders(
         self,

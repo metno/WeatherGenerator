@@ -1,0 +1,173 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# ---------------------------------------------------------------------------------------
+# Stage 3 of the CARRA2 downscaler: supervised ERA5 + SEVIRI + AVHRR -> CARRA2, EXAMPLE BLOCKS
+# ---------------------------------------------------------------------------------------
+#   stage 1: CARRA2 autoencoder (single latent level hl8)               -> run AE_RUN
+#   stage 2: JEPA, student encoders (ERA5 @ hl5, SEVIRI / AVHRR @ hl8) learn to predict the
+#            frozen CARRA2 latent (FrozenTeacher = AE_RUN)            -> run JEPA_RUN
+#   stage 3: this file. The JEPA predictor is discarded; the stage-2 encoders (+ latent
+#            cascade) feed the stage-1 CARRA2 decoder directly, trained with a physical
+#            loss on CARRA2. Which parts stay frozen is configurable (fixed .. flexible).
+#
+# Copy the blocks into your full stage-3 base config (--base-config). model_input,
+# target_input and losses must replace the base config's entries (not merge with them).
+#
+# Requirement: the student's hl8 latent size must equal the autoencoder's latent size
+# (set latent_levels[hl8].dim_embed already in stage 2), otherwise the decoder weights do
+# not fit; init_from stops with a shape-mismatch error.
+# ---------------------------------------------------------------------------------------
+
+# ---- latent: same levels / domains / sizes as stage 2 ---------------------------------
+latent_levels:
+  - level: 5
+    domain: {type: points, points_file: carra2_scandi_domain.npz, pad_rings: 2}
+  - level: 8
+    domain: {type: points, points_file: carra2_scandi_domain.npz, pad_rings: 0}
+    # dim_embed: 2048                 # = CARRA2 autoencoder latent size
+
+# encoder-side cascade (loaded from stage 2). Its cycles share weights, so num_cycles can
+# be raised in stage 3 (more hl5 <-> hl8 exchange, same weights, no new parameters).
+latent_cascade:
+  num_cycles: 3
+  num_blocks: 1
+  num_heads: 8
+  down_rings: 1
+
+# EXTRA FLEXIBILITY between encoder and decoder (new weights, not in any checkpoint):
+#  - forecast_cascade: a second hl5 <-> hl8 cascade, applied at step 0 (offset 0) after the
+#    encoder. zero_init: true makes it start as the identity, so the pretrained
+#    encoder -> decoder path is unchanged at step 0 and the cascade learns the correction.
+#  - fe_num_blocks: per-level transformer blocks at step 0 (near-identity N(0, 0.001) init).
+# Fixed configuration: num_cycles 0 / fe_num_blocks 0.
+forecast_cascade:
+  num_cycles: 2            # 0 = off
+  num_blocks: 1
+  num_heads: 8
+  down_rings: 1
+  zero_init: true
+fe_num_blocks: 0
+
+# ---- streams ------------------------------------------------------------------------------
+# ERA5, SEVIRI, AVHRR: input only           -> `forcing: true` (or no target channels)
+# CARRA2:              target only           -> `diagnostic: true` (or no source channels)
+# CARRA2 decode_levels:
+#   [8]    : the decoder reads exactly what it read in the autoencoder (hl8 1-ring): the
+#            pretrained decoder is reproduced as is (fixed configurations)
+#   [5, 8] : the decoder also reads the hl5 ancestor ring (ERA5 context); the extra
+#            key/value projection is new (flexible configurations)
+# Example (stream yml files):
+#   ERA5:   {..., latent_level: 5, forcing: true}
+#   SEVIRI: {..., latent_level: 8, forcing: true}
+#   AVHRR:  {..., latent_level: 8, forcing: true}
+#   CARRA2: {..., latent_level: 8, diagnostic: true, decode_levels: [8],
+#            train_target_channels: [...], val_target_channels: [...]}
+# The CARRA2 stream keeps the same name, channels and normalisation as in stage 1.
+# If the stage-1 autoencoder learned increments w.r.t. interpolated ERA5
+# (`increment_baseline` block on CARRA2), give CARRA2 the SAME increment_baseline block
+# here: its decoder predicts increments and the data loader must build the baseline
+# (init_from warns when the setting differs from the source run).
+
+# ---- warm start: encoders from stage 2, CARRA2 decoder from stage 1 ----------------------
+# Each source: run_id, mini_epoch (-1 = latest), include / exclude (regexes on parameter
+# names, re.match), rename ({regex: replacement}, optional). Later sources override earlier
+# ones. Everything not loaded keeps its fresh initialisation (e.g. the forecast cascade).
+# Not used when continuing a run (--from-run-id) and not together with load_chkpt.
+init_from:
+  - run_id: "JEPA_RUN"                 # stage 2
+    mini_epoch: -1
+    include: ['encoder\..*']           # embedders, local / global engines, latent cascade, q_cells
+    exclude: ['encoder\.embed_engine\.embeds\.CARRA2\..*']   # untrained in the student
+  - run_id: "AE_RUN"                   # stage 1
+    mini_epoch: -1
+    include:
+      - 'embed_target_coords\.CARRA2\..*'
+      - 'target_token_engines\.CARRA2\..*'
+      - 'pred_heads\.CARRA2\..*'
+
+# ---- what is trained ---------------------------------------------------------------------
+# freeze_modules: regex or list of regexes, full match on module names (model.named_modules();
+# "q_cells" also freezes the learnable cell queries of all levels). trainable_modules:
+# exceptions, made trainable again after freezing. Parameter counts (trainable / frozen)
+# per module are logged at start-up.
+#
+# A) fixed: pretrained encoder and decoder frozen, only the cascades train
+freeze_modules: ['encoder', 'embed_target_coords', 'target_token_engines', 'pred_heads', 'q_cells']
+trainable_modules: ['encoder\.latent_cascade']
+#
+# B) partially unfrozen: + the decoder's last mapping (pred_heads) and the hl8 global engine
+# freeze_modules: ['encoder', 'embed_target_coords', 'target_token_engines', 'q_cells']
+# trainable_modules: ['encoder\.latent_cascade', 'encoder\.ae_global_engine']
+#
+# C) flexible: everything trains except the input embedders, with lower learning rates
+#    for the pretrained parts (optimizer.param_groups below)
+# freeze_modules: ['encoder\.embed_engine']
+# trainable_modules: []
+#
+# Module names of the multi-level encoder: finest level (hl8) = the single-level modules
+# encoder.ae_local_engine, encoder.ae_local_global_engine, encoder.ae_aggregation_engine,
+# encoder.ae_global_engine; coarser levels = encoder._ae_<...>_per_level.<l> (e.g.
+# encoder._ae_global_per_level.5); encoder.embed_engine (one embedder per stream);
+# encoder.latent_cascade. Print model.named_modules() for the complete list.
+
+training_config:
+  training_mode: ["masking"]
+
+  # same time step: offset 0, no forecast
+  forecast:
+    time_step: 00:00:00
+    num_steps: 0
+    offset: 0
+    policy: null
+
+  model_input:
+    forecasting:
+      masking_strategy: forecast       # full input, full target
+      num_samples: 1
+      num_steps_input: 1
+  target_input: {}
+
+  losses:
+    physical:
+      type: LossPhysical
+      weight: 1.0
+      loss_fcts:
+        mse: {weight: 1.0}
+        global_haar_wavelet_reshape_varweighted:
+          weight: 1.0
+          template_path: carra2_scandi_template.npz
+          detail_weight: 2.0
+          num_levels: 3
+
+  optimizer:
+    grad_clip: 1.0
+    weight_decay: 0.1
+    # learning rate per parameter group: lr_group = scheduled lr * lr_scale. A parameter goes
+    # to the first matching group (regexes on parameter names, re.match); the rest is the
+    # default group (lr_scale 1). Frozen parameters are simply never updated.
+    param_groups:
+      - modules: ['encoder\.(?!latent_cascade).*']     # pretrained encoders
+        lr_scale: 0.1
+      - modules: ['pred_heads\..*', 'target_token_engines\..*', 'embed_target_coords\..*']
+        lr_scale: 0.3                                  # pretrained decoder
+      # encoder.latent_cascade, forecast_cascade: default group (full lr)
+    adamw:
+      beta1: 0.975
+      beta2: 0.9875
+      eps: 2e-08
+
+# [JEPA-MON] run monitor (stage 3: init_from sources, frozen weights, gradient per block,
+# lr per group) (train/jepa_monitor.py): lines in the terminal / slurm log.
+#   grep JEPA-MON slurm-<jobid>.out            everything
+#   grep 'JEPA-MON\]\[WARN' slurm-<jobid>.out  only what needs a look
+# On by default; this block only changes its defaults.
+# train_logging:
+#   jepa_monitor:
+#     enabled: true
+#     every: 100          # steps between step reports (default: train_logging.terminal)
+#     max_tokens: 2048    # tokens per level used for the latent statistics
+#     erank: true         # effective rank of the targets (one SVD per level and report)
+#     collapse_std: 1.0e-3  # warn when the target spread falls below this

@@ -11,6 +11,7 @@
 
 import itertools
 import logging
+import re
 
 import torch
 from torch.distributed.fsdp import (
@@ -30,7 +31,7 @@ from weathergen.model.attention import (
 from weathergen.model.init_utils import materialize_and_init_missing
 from weathergen.model.layers import MLP
 from weathergen.model.model import Model, build_model_params
-from weathergen.model.utils import apply_fct_to_blocks, freeze_weights
+from weathergen.model.utils import apply_fct_to_blocks, freeze_weights, unfreeze_weights
 from weathergen.utils.distributed import is_root
 from weathergen.utils.performance import register_nvtx_hooks
 from weathergen.utils.utils import get_dtype
@@ -61,14 +62,8 @@ def init_model_and_shard(
         logger.info("Registering NVTX hooks for model.")
         register_nvtx_hooks(model)
 
-    # freeze request model part
-    apply_fct_to_blocks(model, cf.freeze_modules, freeze_weights)
-
-    # TODO: this should be handled in the encoder to be close where q_cells is defined
-    if "q_cells" in cf.freeze_modules:
-        # all latent levels (only model.encoder.q_cells for a single latent level)
-        for q_cells in model.encoder.q_cells_all_levels():
-            q_cells.requires_grad = False
+    # freeze request model part (freeze_modules), minus trainable_modules
+    apply_freezing(cf, model)
 
     if with_ddp and not with_fsdp:
         # create DDP model if running without FSDP
@@ -188,11 +183,16 @@ def init_model_and_shard(
             logger.info(f"Continuing run with id={run_id_contd} at mini_epoch {mini_epoch_contd}.")
         model = load_model(cf, model, device, run_id_contd, mini_epoch_contd)
     elif cf.get("load_chkpt", {}).get("run_id", None):
+        assert not cf.get("init_from", None), "Use either load_chkpt or init_from, not both."
         run_id = cf.load_chkpt.run_id
         mini_epoch = cf.load_chkpt.get("mini_epoch", -1)
         if is_root():
             logger.info(f"Loading checkpoint from id={run_id} at mini_epoch {mini_epoch}.")
         model = load_model(cf, model, device, run_id, mini_epoch)
+    elif cf.get("init_from", None):
+        # warm start from parts of several runs (e.g. encoder of a JEPA run + decoder of an
+        # autoencoder run); everything not loaded keeps its fresh initialisation
+        model = load_init_from(cf, model, device)
     else:
         if with_ddp and with_fsdp:
             model.to_empty(device="cuda")
@@ -205,6 +205,15 @@ def init_model_and_shard(
     if with_ddp and with_fsdp:
         for cascade in model.latent_cascades():
             cascade.rebuild_index_buffers(torch.device(f"cuda:{cf.local_rank}"))
+        # same for the cell centres of the multi-level JEPA predictor
+        model.rebuild_ssl_buffers(torch.device(f"cuda:{cf.local_rank}"))
+
+    # FSDP loads with assign=True, which replaces the parameters (requires_grad=True):
+    # freeze again after loading
+    if with_ddp and with_fsdp:
+        apply_freezing(cf, model, log=False)
+    if is_root():
+        log_trainable_parameters(model)
 
     # model params (one set per latent level for a multi-resolution latent)
     model_params = build_model_params(cf).create(cf)
@@ -214,6 +223,182 @@ def init_model_and_shard(
     return model, model_params
 
 
+def _as_regex(patterns) -> str:
+    """A regex string, or a list of them (alternatives); "" matches nothing."""
+    if patterns is None:
+        return ""
+    if isinstance(patterns, str):
+        return patterns
+    patterns = [str(p) for p in patterns]
+    return "|".join(f"(?:{p})" for p in patterns) if patterns else ""
+
+
+def apply_freezing(cf, model, log: bool = True) -> None:
+    """
+    Freeze the modules whose name fully matches `freeze_modules` (a regex or a list of
+    regexes), then make the modules matching `trainable_modules` trainable again (exceptions,
+    e.g. freeze `encoder\\..*` but train `encoder\\.latent_cascade.*`). Module names are
+    those of model.named_modules() (or a module's own `name` attribute, e.g. "JEPA-head").
+    """
+    base = getattr(model, "module", model)
+    freeze = _as_regex(cf.get("freeze_modules", ""))
+    trainable = _as_regex(cf.get("trainable_modules", ""))
+    if freeze:
+        apply_fct_to_blocks(base, freeze, freeze_weights if log else _freeze_quiet)
+        # TODO: this should be handled in the encoder to be close where q_cells is defined
+        if "q_cells" in freeze:
+            # all latent levels (only model.encoder.q_cells for a single latent level)
+            for q_cells in base.encoder.q_cells_all_levels():
+                q_cells.requires_grad = False
+    if trainable:
+        apply_fct_to_blocks(base, trainable, unfreeze_weights if log else _unfreeze_quiet)
+        if "q_cells" in trainable:
+            for q_cells in base.encoder.q_cells_all_levels():
+                q_cells.requires_grad = True
+
+
+def _freeze_quiet(block):
+    for p in block.parameters():
+        p.requires_grad = False
+
+
+def _unfreeze_quiet(block):
+    for p in block.parameters():
+        p.requires_grad = True
+
+
+def log_trainable_parameters(model) -> None:
+    """Trainable / frozen parameter counts per top-level module."""
+    base = getattr(model, "module", model)
+    counts: dict[str, list[int]] = {}
+    for name, p in base.named_parameters():
+        top = name.split(".")[0]
+        c = counts.setdefault(top, [0, 0])
+        c[0 if p.requires_grad else 1] += p.numel()
+    if not any(c[1] for c in counts.values()):
+        return
+    lines = [f"  {k}: trainable {c[0]:,}, frozen {c[1]:,}" for k, c in sorted(counts.items())]
+    logger.info("Parameters per module:\n" + "\n".join(lines))
+
+
+def _checkpoint_file(cf, run_id: str, mini_epoch=-1):
+    path_run = get_path_model(cf, run_id=run_id)
+    mini_epoch_id = (
+        f"chkpt{mini_epoch:05d}" if mini_epoch != -1 and mini_epoch is not None else "latest"
+    )
+    return path_run / f"{run_id}_{mini_epoch_id}.chkpt"
+
+
+# what load_init_from loaded, for the run monitor (train/jepa_monitor.py):
+# {"loaded": {parameter name: run_id}}; None when init_from is not used
+INIT_FROM_REPORT: dict | None = None
+
+
+_DECODER_PREFIXES = ("embed_target_coords.", "target_token_engines.", "pred_heads.")
+
+
+def _check_increment_baseline(cf, run_id, mini_epoch, keys) -> None:
+    """
+    Warn when a decoder is taken from a run whose stream had a different `increment_baseline`
+    setting than the stream in this run (datasets/increment_baseline.py): a decoder trained on
+    increments w.r.t. the baseline must be run with the baseline, and vice versa.
+    """
+    dec_streams = {k.split(".")[1] for k in keys if k.startswith(_DECODER_PREFIXES)}
+    if not dec_streams or not is_root():
+        return
+    try:
+        from weathergen.common.config import load_run_config
+
+        src_cf = load_run_config(run_id, mini_epoch, model_path=cf.get("model_path", None))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"init_from: config of {run_id} not readable ({e!r}); "
+            "increment_baseline consistency of its decoders not checked"
+        )
+        return
+    for s in sorted(dec_streams):
+        src = ((src_cf.get("streams", None) or {}).get(s, None) or {}).get("increment_baseline")
+        own = ((cf.get("streams", None) or {}).get(s, None) or {}).get("increment_baseline")
+        if (src is None) != (own is None):
+            logger.warning(
+                f"init_from: the {s} decoder of {run_id} was trained "
+                f"{'with' if src is not None else 'without'} increment_baseline, but stream {s} "
+                f"is configured {'with' if own is not None else 'without'} it in this run: the "
+                "decoder output will be interpreted differently"
+            )
+
+
+def load_init_from(cf, model, device):
+    """
+    Warm start from parts of several runs (config `init_from`, a list of sources):
+
+        init_from:
+          - run_id: <JEPA run>         # e.g. stage 2: student encoders + latent cascade
+            mini_epoch: -1
+            include: ["encoder\\..*"]   # regexes on parameter names (re.match), default all
+            exclude: ["encoder\\.embed_engine\\.embeds\\.CARRA2\\..*"]
+          - run_id: <autoencoder run>  # e.g. stage 1: the CARRA2 decoder
+            include: ["embed_target_coords\\.CARRA2\\..*", "target_token_engines\\.CARRA2\\..*",
+                      "pred_heads\\.CARRA2\\..*"]
+            rename: {"^old_prefix": "new_prefix"}   # optional re.sub on the names
+
+    Later sources override earlier ones for the same parameter. Parameters found in no
+    source keep their fresh initialisation (FSDP: constructor init, as for load_chkpt).
+    A selected parameter whose shape differs from the model's is an error.
+    """
+    global INIT_FROM_REPORT
+    merged: dict = {}
+    origin: dict[str, str] = {}
+    for src in cf.init_from:
+        run_id = src["run_id"]
+        mini_epoch = src.get("mini_epoch", -1)
+        include = _as_regex(src.get("include", None)) or ".*"
+        exclude = _as_regex(src.get("exclude", None))
+        rename = dict(src.get("rename", None) or {})
+        filename = _checkpoint_file(cf, run_id, mini_epoch)
+        params = torch.load(
+            filename, map_location=torch.device("cpu"), mmap=True, weights_only=True
+        )
+        n = 0
+        for k, v in params.items():
+            k = k.removeprefix("module.")
+            if re.match(include, k) is None or (exclude and re.match(exclude, k) is not None):
+                continue
+            for pat, repl in rename.items():
+                k = re.sub(pat, repl, k)
+            if k in merged and is_root():
+                logger.info(f"init_from: {k} from {run_id} overrides an earlier source")
+            merged[k] = v
+            origin[k] = str(run_id)
+            n += 1
+        assert n > 0, f"init_from: no parameter of run {run_id} matches include/exclude"
+        _check_increment_baseline(
+            cf, run_id, mini_epoch, [k for k, r in origin.items() if r == str(run_id)]
+        )
+        if is_root():
+            logger.info(f"init_from: {n} tensors selected from {filename.name}")
+
+    base = getattr(model, "module", model)
+    model_sd = base.state_dict()
+    unknown = [k for k in merged if k not in model_sd]
+    mismatch = [
+        f"{k}: checkpoint {tuple(v.shape)} vs model {tuple(model_sd[k].shape)}"
+        for k, v in merged.items()
+        if k in model_sd and tuple(v.shape) != tuple(model_sd[k].shape)
+    ]
+    assert not mismatch, (
+        "init_from: shape mismatch (e.g. a decoder needs the latent size of the run it was "
+        "trained with):\n  " + "\n  ".join(mismatch[:20])
+    )
+    if unknown and is_root():
+        logger.warning(
+            f"init_from: {len(unknown)} selected tensors not in the model: {unknown[:20]}"
+        )
+    merged = {k: v for k, v in merged.items() if k in model_sd}
+    INIT_FROM_REPORT = {"loaded": {k: origin[k] for k in merged}}
+    return load_params_into_model(cf, model, device, merged, "init_from")
+
+
 def load_model(cf, model, device, run_id: str, mini_epoch=-1):
     """Loads model state from checkpoint and checks for missing and unused keys.
     Args:
@@ -221,16 +406,13 @@ def load_model(cf, model, device, run_id: str, mini_epoch=-1):
         mini_epoch : The mini_epoch to load. Default (-1) is the latest mini_epoch
     """
 
-    path_run = get_path_model(cf, run_id=run_id)
-    mini_epoch_id = (
-        f"chkpt{mini_epoch:05d}" if mini_epoch != -1 and mini_epoch is not None else "latest"
-    )
-    filename = f"{run_id}_{mini_epoch_id}.chkpt"
+    path = _checkpoint_file(cf, run_id, mini_epoch)
+    params = torch.load(path, map_location=torch.device("cpu"), mmap=True, weights_only=True)
+    return load_params_into_model(cf, model, device, params, path.name)
 
-    params = torch.load(
-        path_run / filename, map_location=torch.device("cpu"), mmap=True, weights_only=True
-    )
 
+def load_params_into_model(cf, model, device, params: dict, filename: str):
+    """Load a state dict (full tensors) into a (possibly FSDP-sharded) model."""
     is_model_sharded = cf.with_ddp and cf.with_fsdp
     if is_model_sharded:
         meta_sharded_sd = model.state_dict()

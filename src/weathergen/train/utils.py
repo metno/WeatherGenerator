@@ -127,12 +127,28 @@ def unflatten_dict(d, separator="."):
     return unflattened
 
 
+def select_sample_metadata(sample):
+    """
+    Metadata of one sample used by the latent (SSL) losses.
+
+    Every stream has its own SampleMetaData. With a multi-resolution latent the masks of the
+    streams have the cell count of the stream's latent level, so the metadata of a stream at
+    the finest level (longest mask) is taken: the single-level SSL heads act on the finest
+    level. With a mask plan, every stream carries the same plan (masks of all levels).
+    """
+    metas = list(sample.meta_info.values())
+    with_mask = [m for m in metas if getattr(m, "mask", None) is not None]
+    if len(with_mask) == 0:
+        return metas[0]
+    return max(with_mask, key=lambda m: m.mask.shape[0])
+
+
 def extract_batch_metadata(batch):
     return (
         batch.source2target_matching_idxs,
-        [list(sample.meta_info.values())[0] for sample in batch.source_samples.get_samples()],
+        [select_sample_metadata(sample) for sample in batch.source_samples.get_samples()],
         batch.target2source_matching_idxs,
-        [list(sample.meta_info.values())[0] for sample in batch.target_samples.get_samples()],
+        [select_sample_metadata(sample) for sample in batch.target_samples.get_samples()],
     )
 
 

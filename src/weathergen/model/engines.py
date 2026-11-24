@@ -475,16 +475,32 @@ class QueryAggregationEngine(torch.nn.Module):
 class GlobalAssimilationEngine(torch.nn.Module):
     name: "GlobalAssimilationEngine"
 
-    def __init__(self, cf: Config, num_healpix_cells: int, dim_embed: int | None = None) -> None:
+    def __init__(
+        self,
+        cf: Config,
+        num_healpix_cells: int,
+        dim_embed: int | None = None,
+        tap_global_layers: set[int] | None = None,
+    ) -> None:
         """
         Initialize the GlobalAssimilationEngine with the configuration.
 
         :param cf: Configuration object containing parameters for the engine.
         :param num_healpix_cells: Number of healpix cells used for local queries.
         :param dim_embed: size of the latent vectors (default cf.ae_global_dim_embed).
+        :param tap_global_layers: logical layer indices (0-based, one per attention + MLP
+            pair) after which the tokens are collected for deep self-supervision
+            (V-JEPA 2.1). None: disabled, forward returns the tokens only; otherwise forward
+            returns (tokens, intermediates).
         """
         super(GlobalAssimilationEngine, self).__init__()
         self.cf = cf
+        self.tap_global_layers = tap_global_layers
+        if tap_global_layers:
+            assert max(tap_global_layers) < cf.ae_global_num_blocks, (
+                f"deep_ssl.tap_after: global layer {max(tap_global_layers)} does not exist "
+                f"(ae_global_num_blocks={cf.ae_global_num_blocks})"
+            )
         dim_embed = dim_embed or self.cf.ae_global_dim_embed
         self.num_healpix_cells = num_healpix_cells
 
@@ -544,9 +560,47 @@ class GlobalAssimilationEngine(torch.nn.Module):
 
     def forward(self, tokens, coords=None):
         aux_info = None
+        intermediates = []
+        logical_layer = 0
         for block in self.ae_global_blocks:
+            if isinstance(block, torch.nn.LayerNorm):
+                tokens = block(tokens)
+                continue
             tokens = checkpoint(block, tokens, coords, aux_info, use_reentrant=False)
-        return tokens
+            if isinstance(block, MLP):
+                if self.tap_global_layers and logical_layer in self.tap_global_layers:
+                    intermediates.append(tokens)
+                logical_layer += 1
+        if self.tap_global_layers is None:
+            return tokens
+        return tokens, intermediates
+
+
+class DeepSSLFusion(torch.nn.Module):
+    """Concatenate multi-level representations along channel dim, fuse with MLP.
+
+    Used by the student in deep self-supervision (V-JEPA 2.1 style): all intermediate
+    encoder levels are concatenated and projected back to the embedding dimension.
+    (Port of the ecmwf develop-ssl-diffusion-v2 module.)
+    """
+
+    def __init__(self, num_levels: int, dim_embed: int, hidden_factor: int = 2):
+        super().__init__()
+        # Intermediate encoder levels are tapped before any final normalisation, so they
+        # arrive on very different scales than the final level. Normalize each level before
+        # concatenating so the fusion and the downstream SSL head see a common scale.
+        self.level_norms = torch.nn.ModuleList(
+            [torch.nn.LayerNorm(dim_embed) for _ in range(num_levels)]
+        )
+        self.proj = torch.nn.Sequential(
+            torch.nn.Linear(num_levels * dim_embed, hidden_factor * dim_embed, bias=False),
+            torch.nn.GELU(),
+            torch.nn.Linear(hidden_factor * dim_embed, dim_embed, bias=False),
+        )
+
+    def forward(self, levels: list[torch.Tensor]) -> torch.Tensor:
+        normed = [norm(level) for norm, level in zip(self.level_norms, levels, strict=True)]
+        return self.proj(torch.cat(normed, dim=-1))
 
 
 class IdentityEngine(torch.nn.Module):

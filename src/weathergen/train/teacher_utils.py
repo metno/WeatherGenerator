@@ -17,10 +17,12 @@ import torch.nn as nn
 
 from weathergen.common.config import get_path_model
 from weathergen.model.engines import (
+    IdentityEngine,
     LatentPredictionHeadIdentity,
     LatentPredictionHeadMLP,
     LatentPredictionHeadTransformer,
 )
+from weathergen.model.latent_predictor import jepa_multilevel_cfg
 
 logger = logging.getLogger(__name__)
 
@@ -67,10 +69,18 @@ def prepare_encoder_teacher(model: nn.Module, training_cfg, override_cfg) -> Non
     """
     # Strip non-encoder components
     teacher_dim_embed = override_cfg.ae_global_dim_embed
-    model.forecast_engine = None
+    encoder = getattr(model, "encoder", None)
+    if encoder is not None and getattr(encoder, "dims_embed", None) is not None:
+        # multi-resolution latent: latent size of the finest level
+        teacher_dim_embed = encoder.dims_embed[model.healpix_level]
+    # the teacher target is the encoder output: no forecast step (an identity engine, as
+    # Model.forward always runs one forecast step) and no forecast cascade
+    model.forecast_engine = IdentityEngine()
     if getattr(model, "_forecast_per_level", None) is not None:
         # multi-resolution latent: forecast engines of the coarser levels
         model._forecast_per_level = None
+    if hasattr(model, "forecast_cascade"):
+        model.forecast_cascade = None
     model.embed_target_coords = nn.ModuleDict()
     model.target_token_engines = nn.ModuleDict()
     model.pred_heads = nn.ModuleDict()
@@ -78,6 +88,24 @@ def prepare_encoder_teacher(model: nn.Module, training_cfg, override_cfg) -> Non
     # Ensure latent_pre_norm exists (teacher may not have had SSL training)
     if model.latent_pre_norm is None:
         model.latent_pre_norm = nn.LayerNorm(teacher_dim_embed)
+
+    # multi-level JEPA (head multilevel_transformer): the teacher returns one target per
+    # configured latent level it has (see Model.predict_latent_multilevel)
+    ssl_ml = jepa_multilevel_cfg(training_cfg)
+    if hasattr(model, "ssl_ml"):
+        model.ssl_ml = ssl_ml
+    if (
+        ssl_ml is not None
+        and encoder is not None
+        and getattr(model, "latent_pre_norm_levels", None) is None
+    ):
+        model.latent_pre_norm_levels = nn.ModuleDict(
+            {
+                str(lvl): nn.LayerNorm(d)
+                for lvl, d in encoder.dims_embed.items()
+                if lvl != model.healpix_level
+            }
+        )
 
     # Create fresh latent heads from student's SSL config
     model.latent_heads = nn.ModuleDict()

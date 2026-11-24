@@ -30,6 +30,7 @@ from weathergen.datasets.data_reader_obs import DataReaderObs
 from weathergen.datasets.domain import Domain
 from weathergen.datasets.domain_pyramid import build_domain_pyramid
 from weathergen.datasets.increment_baseline import IncrementBaseline, has_increment_baseline
+from weathergen.datasets.mask_plan import MaskPlanner, get_stream_roles, uses_mask_plan
 from weathergen.datasets.masking import Masker
 from weathergen.datasets.stream_data import StreamData, spoof
 from weathergen.datasets.stream_levels import assign_stream_levels
@@ -39,7 +40,7 @@ from weathergen.datasets.utils import (
     get_tokens_lens,
 )
 from weathergen.readers_extra.registry import get_extra_reader
-from weathergen.train.utils import Stage, get_batch_size_from_config
+from weathergen.train.utils import TRAIN, Stage, get_batch_size_from_config
 from weathergen.utils.distributed import is_root
 
 type AnyDataReader = DataReaderBase | DataReaderAnemoi | DataReaderObs
@@ -135,6 +136,12 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
 
         self.mode_cfg = mode_cfg
         self._stage = stage
+        # latent downscaler (train/latent_decoder.py): the student samples need the target
+        # coordinates of the decoded streams and the targets their values (output / metrics)
+        ld_cfg = cf.get("latent_decoder", None) or {}
+        self._decode_latent = bool(ld_cfg.get("enabled", False)) and (
+            stage != TRAIN or bool(ld_cfg.get("during_training", False))
+        )
 
         self.mini_epoch = 0
         self.mask_value = 0.0
@@ -181,6 +188,18 @@ class MultiStreamDataSampler(torch.utils.data.IterableDataset):
             )
         self.masker = self._maskers[self.healpix_level]
         self.tokenizer = self._tokenizers[self.healpix_level]
+
+        # mask plan (masking_strategy: mask_plan): one student/teacher plan per sample, shared
+        # by all streams and latent levels (see datasets/mask_plan.py)
+        self.mask_planner: MaskPlanner | None = None
+        if uses_mask_plan(self.mode_cfg):
+            self.mask_planner = MaskPlanner(
+                self.domain_pyramid,
+                self.mode_cfg.get("mask_plan", None),
+                get_stream_roles(cf.streams),
+            )
+            for masker in self._maskers.values():
+                masker.planner = self.mask_planner
         if self.multi_level and is_root():
             for lvl in self.domain_pyramid.levels:
                 streams_l = [n for n, sl in self.stream_encode_level.items() if sl == lvl]
@@ -751,6 +770,11 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         Generate source and target masks for all streams.
         """
         masks = {}
+        # new data item: forget the masks shared across streams (and levels) of the last one
+        for masker in self._maskers.values():
+            masker.start_item()
+        if self.mask_planner is not None:
+            self.mask_planner.start_item(self.rng)
         for stream_name, stream_data in self.streams_datasets.items():
             stream_info = stream_data.info
             # Build source and target sample masks
@@ -806,6 +830,9 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
         if "student_teacher" in mode or "latent_loss" in mode:
             source_select += ["network_input"]
             target_select += ["network_input"]
+            if self._decode_latent:
+                source_select += ["target_coords"]
+                target_select += ["target_values"]
         # remove duplicates
         source_select, target_select = list(set(source_select)), list(set(target_select))
         if len(source_select) == 0 or len(target_select) == 0:

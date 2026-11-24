@@ -502,8 +502,9 @@ def get_latent_output(batch, model_output):
                         if tensor is not None:
                             sample_tensor = tensor[i_sample]
                             per_sample[field_name] = sample_tensor.detach().to(fp32).cpu().numpy()
-                else:
+                elif isinstance(lval, torch.Tensor):
                     per_sample[lname] = lval[i_sample].detach().to(fp32).cpu().numpy()
+                # multi-level JEPA predictions ({level: tensor}) are not written
             latents_all[-1].append(per_sample)
 
     return latents_all

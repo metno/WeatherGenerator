@@ -29,6 +29,13 @@ def freeze_weights(block):
         p.requires_grad = False
 
 
+def unfreeze_weights(block):
+    if hasattr(block, "name"):
+        logger.info(f"Unfreeze block {block.name}")
+    for p in block.parameters():
+        p.requires_grad = True
+
+
 def set_to_eval(block):
     if hasattr(block, "name"):
         logger.info(f"Set block {block.name} to eval mode")

@@ -1,0 +1,261 @@
+# (C) Copyright 2025 WeatherGenerator contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# ---------------------------------------------------------------------------------------
+# Multi-resolution JEPA (V-JEPA 2.1 style) on a regional hl5 + hl8 latent: EXAMPLE BLOCKS
+# ---------------------------------------------------------------------------------------
+# This file lists every config entry used by the multi-level JEPA code (mask plan,
+# multi-level predictor, context loss, deep SSL, frozen-teacher downscaler). It is NOT a
+# complete config: copy the blocks into your own full base config (the one you train the
+# hl5 + hl8 model with) and pass that with --base-config.
+#
+# IMPORTANT: `model_input`, `target_input` and `losses` must REPLACE the ones of your base
+# config, not be merged with them (an extra `forecasting` entry in model_input would add a
+# second student view / break the source-target correspondence).
+#
+# Two set-ups are shown:
+#   A) EMA teacher  : self-supervised pretraining on ERA5 + satellites (V-JEPA 2.1)
+#   B) FrozenTeacher: latent downscaler, frozen CARRA2 autoencoder encoder (hl8) as teacher,
+#                     ERA5 + satellites as students
+# Set-up B is active below; the lines to change for A are marked "A)".
+# ---------------------------------------------------------------------------------------
+
+# ---- latent ---------------------------------------------------------------------------
+# hl5 and hl8 latent levels. For set-up B the hl8 entry (domain, pad_rings, ...) must be
+# IDENTICAL to the domain the CARRA2 autoencoder was trained on (same cells, same order):
+# the frozen teacher checks it and stops otherwise. dim_embed may differ per level.
+latent_levels:
+  - level: 5
+    domain: {type: points, points_file: carra2_scandi_domain.npz, pad_rings: 2}
+    # dim_embed: 1024                  # optional, default ae_global_dim_embed
+  - level: 8
+    domain: {type: points, points_file: carra2_scandi_domain.npz, pad_rings: 0}
+
+# coarse <-> fine exchange inside the encoder, before the predictor. num_cycles V-cycles
+# (down: hl8 cells attend to their hl5 parent + down_rings rings; up: hl5 cells attend to
+# their hl8 children). The cycles share weights; num_blocks adds capacity per pass.
+latent_cascade:
+  num_cycles: 3          # 0 = no exchange
+  num_blocks: 1
+  num_heads: 8
+  down_rings: 1          # 1: parent + 8 neighbours (~600 km at hl5); try 2
+  operator: attention
+
+# The SSL targets / predictions are taken after one (identity) forecast step at step 0:
+# keep the forecast engine out of the SSL path for pretraining / downscaling.
+fe_num_blocks: 0
+ae_local_num_queries: 1  # the multi-level predictor assumes one token per cell
+num_register_tokens: 4   # registers are predictor input; they are not in the loss
+num_class_tokens: 0
+
+# ---- streams ---------------------------------------------------------------------------
+# New stream key `ssl_view` (default both): which view of the student/teacher pair sees
+# the stream.
+#   both    : student (masked) and teacher (full)         -> set-up A, all streams
+#   student : student only (never reaches the teacher)    -> set-up B: ERA5, SEVIRI, AVHRR
+#   teacher : teacher only (never reaches the student)    -> set-up B: CARRA2
+# Example (in the stream yml files):
+#   ERA5:   {..., latent_level: 5, ssl_view: student}
+#   SEVIRI: {..., latent_level: 8, ssl_view: student}
+#   AVHRR:  {..., latent_level: 8, ssl_view: student}
+#   CARRA2: {..., latent_level: 8, ssl_view: teacher}
+# For set-up B the CARRA2 stream must have the SAME name, channels and normalisation as in
+# the autoencoder run (its embedder is taken from the checkpoint). In the student its
+# embedder receives no data (unused parameters: keep ddp_find_unused_parameters: true).
+
+training_config:
+
+  training_mode: ["student_teacher"]
+
+  # SSL: no forecast. offset must be 0 (the default 1 would leave no output step).
+  forecast:
+    time_step: 00:00:00
+    num_steps: 0
+    offset: 0
+    policy: null
+
+  losses:
+    student-teacher:
+      type: LossLatentSSLStudentTeacher
+      weight: 1.0
+      loss_fcts:
+        JEPA:
+          weight: 4.0                    # alpha: weight of the JEPA (hidden-cell) loss
+          loss_extra_args: {}
+          head: multilevel_transformer   # multi-level predictor (one pass over hl5 + hl8)
+          num_blocks: 6                  # predictor depth
+          num_heads: 8
+          intermediate_dim: 512          # predictor width (bottleneck)
+          dropout_rate: 0.0
+          with_qk_lnorm: true
+          geo_num_freqs: 8               # Fourier features of the cell centres
+          geo_max_freq: 256.0            # ~ 1 / (hl8 cell size in radians)
+          # levels that get a prediction and a loss; all latent levels are predictor input.
+          #   weight : w_l, weight of the level in the loss
+          #   out_dim: size of the target vectors (default: the student's latent size of the
+          #            level). Set-up B: the latent size of the CARRA2 autoencoder.
+          levels:
+            8: {weight: 1.0, out_dim: 2048}
+            # 5: {weight: 0.5}           # A) also predict hl5 (EMA teacher has hl5)
+          # target normalisation (teacher side):
+          #   layernorm: LayerNorm of the teacher latent (as ECMWF JEPA; scale-free targets)
+          #   none     : raw teacher latent (set-up B: the prediction is then directly a
+          #              CARRA2 latent the autoencoder decoder can decode)
+          target_norm: layernorm
+          target_source_correspondence: {0: {0: "subset"}}
+
+      target_and_aux_calc:
+        # B) frozen pretrained encoder (CARRA2 autoencoder run). Only encoder weights are
+        #    loaded; its architecture comes from that run's config; it runs on the
+        #    student's batch (streams with ssl_view teacher | both at its latent levels).
+        FrozenTeacher:
+          teacher_run_id: "abcd1234"     # run id of the CARRA2 autoencoder
+          teacher_mini_epoch: -1         # -1 = latest checkpoint
+        # A) EMA teacher instead:
+        # EMATeacher:
+        #   ema_ramp_up_ratio: null
+        #   ema_halflife_in_thousands: 400000 # half-life in SAMPLES despite the name (ECMWF value)
+        #   model_param_overrides:
+        #     training_config: {losses: {student-teacher: {loss_fcts: {JEPA: {head: identity}}}}}
+
+  # student and teacher views both come from the per-sample mask plan below
+  model_input:
+    student:
+      masking_strategy: mask_plan
+      num_samples: 1                     # >1: several student views (plans) per sample
+      num_steps_input: 1
+  target_input:
+    teacher:
+      masking_strategy: mask_plan        # teacher sees the full domain
+      num_samples: 1
+
+  # ---- mask plan: drawn once per sample, shared by all streams and latent levels ----------
+  mask_plan:
+    # level-l cells whose unit ancestor is outside the unit domain: visible | hidden
+    unit_outside: visible
+    # default block families of pattern `blocks` (V-JEPA multi-block): a block is a disk of
+    # `rings` neighbour rings (0 = one unit cell) around a random centre; blocks are added,
+    # family drawn with `prob`, until the hidden fraction is reached.
+    blocks:
+      families:
+        short: {prob: 0.7, rings: [0, 1]}
+        long: {prob: 0.3, rings: [2, 3]}
+    # strategies: drawn per sample with probability `prob` (normalised). One strategy = no
+    # mixture. Per latent level one spec:
+    #   {pattern: random | blocks | crop | none, unit_level: u, hidden: f or [f_min, f_max],
+    #    blocks: {...}}        own draw; cells chosen at unit level u (<= level), children
+    #                          of a hidden unit hidden; `hidden` = fraction of unit cells
+    #   "follow:<coarser>"     hidden iff the ancestor at that latent level is hidden
+    #   "visible"              nothing hidden
+    #   "drop"                 the whole level hidden (modality / level dropout)
+    # Levels not listed are visible.
+    strategies:
+      # (2) coarse mask reflected onto the fine level: in-filling of ~200 km blocks
+      joint:
+        prob: 0.35
+        levels:
+          5: {pattern: blocks, hidden: [0.4, 0.6]}
+          8: "follow:5"
+      # downscaling-shaped: ERA5 (hl5) visible, satellite blocks hidden at hl8
+      fine_only:
+        prob: 0.35
+        levels:
+          5: visible
+          8: {pattern: blocks, unit_level: 5, hidden: [0.4, 0.6]}
+      # (1) one spatial mask per latent level, uncorrelated
+      uncorrelated:
+        prob: 0.15
+        levels:
+          5: {pattern: blocks, hidden: 0.4}
+          8: {pattern: blocks, unit_level: 6, hidden: 0.4}
+      # (3) classical random masking (keep the hidden fraction high at hl8)
+      random:
+        prob: 0.15
+        levels:
+          5: {pattern: random, hidden: 0.5}
+          8: {pattern: random, hidden: 0.75}
+      # other examples (enabled: false = not drawn):
+      coarse_only:
+        enabled: false
+        prob: 0.1
+        levels: {5: {pattern: blocks, hidden: 0.5}, 8: visible}
+      era5_dropout:
+        enabled: false
+        prob: 0.1
+        levels: {5: drop, 8: visible}
+      crop:
+        enabled: false
+        prob: 0.1
+        levels: {5: {pattern: crop, hidden: 0.5}, 8: "follow:5"}
+
+  # ---- V-JEPA 2.1 context loss: L1 on the cells the student DID see -----------------------
+  # total = sum_l w_l sum_k a_k (JEPA.weight * L_jepa + weight * warmup(t) * L_context)
+  context_loss:
+    enabled: true
+    weight: 0.4
+    warmup_steps: 10000                  # linear 0 -> weight over these steps
+    distance_weighting:                  # V-JEPA 2.1: lambda / sqrt(d_min), d_min = distance
+      enabled: false                     # to the nearest hidden cell in cell sizes (>= 1)
+      lambda: 1.0
+
+  # ---- V-JEPA 2.1 deep self-supervision ------------------------------------------------
+  # Representations per latent level, in this order: [local2global] + [global:k ascending]
+  # + [final, after the latent cascade]. Student: fused (DeepSSLFusion), predicted once,
+  # projected per representation. Teacher: the same layers of its encoder (also a frozen
+  # teacher: its encoder must have these layers). Works with head multilevel_transformer
+  # (every predicted level) and with the single-level JEPA heads mlp / transformer (finest
+  # level, as ECMWF); DINO / iBOT use the final representation only.
+  deep_ssl:
+    enabled: false
+    tap_after: ["local2global", "global:0", "global:1"]
+    level_weights: [0.25, 0.25, 0.25, 0.25]   # len(tap_after) + 1, default uniform
+    fusion_hidden_factor: 2
+
+# ---- latent downscaler output: decode the JEPA prediction with the CARRA2 decoder --------
+# The predicted hl8 latent is decoded by the decoder of the (frozen) CARRA2 autoencoder run;
+# the result is written as the CARRA2 physical prediction (validation / inference output).
+# Use JEPA target_norm: none so that the predictor regresses the latent the decoder was
+# trained on (or point run_id to a run whose decoder was fine-tuned on the predictions).
+# For output files / metrics add a LossPhysical term on CARRA2 to the validation (test)
+# config, with target_source_correspondence {0: {0: "subset"}}.
+# CARRA2 increment_baseline: if the autoencoder run was trained with an increment_baseline
+# block on CARRA2, this run's CARRA2 stream needs the same block (checked: error otherwise).
+latent_decoder:
+  enabled: false
+  run_id: "abcd1234"          # CARRA2 autoencoder (or decoder fine-tuning) run
+  mini_epoch: -1
+  level: 8                    # latent level of the decoded prediction
+  streams: [CARRA2]           # default: all streams of that run
+  during_training: false      # decode in training steps too
+  backprop: false             # training: a physical loss (MSE + Haar on CARRA2) trains the
+                              # student + predictor through the frozen decoder
+                              # (needs during_training: true and a LossPhysical term)
+
+# validation_config is merged on top of training_config, so validation uses the same plan.
+# For comparable validation curves, keep a single fixed strategy (disable the others):
+# validation_config:
+#   mask_plan:
+#     strategies:
+#       joint: {prob: 1.0, levels: {5: {pattern: blocks, hidden: 0.5}, 8: "follow:5"}}
+#       fine_only: {enabled: false}
+#       uncorrelated: {enabled: false}
+#       random: {enabled: false}
+
+# collapse monitoring (EMA teacher): effective rank etc. of the finest predicted level
+# train_logging:
+#   collapse_monitoring:
+#     enabled: true
+
+# [JEPA-MON] run monitor (train/jepa_monitor.py): lines in the terminal / slurm log.
+#   grep JEPA-MON slurm-<jobid>.out            everything
+#   grep 'JEPA-MON\]\[WARN' slurm-<jobid>.out  only what needs a look
+# On by default; this block only changes its defaults.
+# train_logging:
+#   jepa_monitor:
+#     enabled: true
+#     every: 100          # steps between step reports (default: train_logging.terminal)
+#     max_tokens: 2048    # tokens per level used for the latent statistics
+#     erank: true         # effective rank of the targets (one SVD per level and report)
+#     collapse_std: 1.0e-3  # warn when the target spread falls below this

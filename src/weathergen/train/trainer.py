@@ -31,8 +31,10 @@ from weathergen.model.model_interface import (
 )
 from weathergen.model.utils import apply_fct_to_blocks, set_to_eval
 from weathergen.train.collapse_monitor import CollapseMonitor
+from weathergen.train.jepa_monitor import JepaMonitor
+from weathergen.train.latent_decoder import attach_latent_decoder
 from weathergen.train.loss_calculator import LossCalculator
-from weathergen.train.lr_scheduler import LearningRateScheduler
+from weathergen.train.lr_scheduler import LearningRateScheduler, optimizer_param_groups
 from weathergen.train.target_and_aux_utils import get_target_aux_calculator
 from weathergen.train.trainer_base import TrainerBase
 from weathergen.train.utils import (
@@ -164,6 +166,8 @@ class Trainer(TrainerBase):
         # Initialize collapse monitor for SSL training
         collapse_config = cf.train_logging.get("collapse_monitoring", {})
         self.collapse_monitor = CollapseMonitor(collapse_config, None)  # device set later in run()
+        # [JEPA-MON] lines in the terminal / slurm log (train/jepa_monitor.py)
+        self.jepa_monitor = JepaMonitor(cf)
 
         if cf.train_logging.get("track_performance_metrics"):
             self.perf_tracker = ThroughputTracker(
@@ -232,6 +236,9 @@ class Trainer(TrainerBase):
             cf.with_ddp,
             cf.with_fsdp,
         )
+
+        # latent downscaler: decoder of a frozen run for the JEPA prediction (if configured)
+        attach_latent_decoder(self.model, cf, self.dataset, self.device)
 
         # get target_aux calculators for different loss terms
         self.target_and_aux_calculators_val = self.get_target_aux_calculators(self.test_cfg)
@@ -315,6 +322,11 @@ class Trainer(TrainerBase):
                 is_model_sharded=(cf.with_ddp and cf.with_fsdp),
             )
 
+        # latent downscaler: decoder of a frozen run for the JEPA prediction (if configured)
+        attach_latent_decoder(self.model, cf, self.dataset, self.device)
+        if self.ema_model is not None:
+            attach_latent_decoder(self.ema_model.ema_model, cf, self.dataset, self.device)
+
         # get target_aux calculators for different loss terms
         self.target_and_aux_calculators = self.get_target_aux_calculators(self.training_cfg)
         self.target_and_aux_calculators_val = self.get_target_aux_calculators(self.validation_cfg)
@@ -336,7 +348,7 @@ class Trainer(TrainerBase):
         eps = self.training_cfg.optimizer.adamw.get("eps", 2e-08) / np.sqrt(kappa)
 
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
+            optimizer_param_groups(self.model, self.training_cfg.optimizer),
             lr=self.training_cfg.learning_rate_scheduling.lr_start,
             weight_decay=self.training_cfg.optimizer.weight_decay,
             betas=(beta1, beta2),
@@ -386,6 +398,10 @@ class Trainer(TrainerBase):
         if is_root():
             config.save(self.cf, None)
             logger.info(config.format_cf(self.cf))
+
+        self.jepa_monitor.log_setup(
+            self.model, self.optimizer, self.target_and_aux_calculators, self.training_cfg
+        )
 
         # run validation before training if requested
         self.validate_before_training()
@@ -487,10 +503,12 @@ class Trainer(TrainerBase):
                             self.model,
                         )
 
+                metadata = extract_batch_metadata(batch)
                 loss = self.loss_calculator.compute_loss(
                     preds=preds,
                     targets_and_aux=targets_and_auxs,
-                    metadata=extract_batch_metadata(batch),
+                    metadata=metadata,
+                    istep=self.cf.general.istep,
                 )
 
                 # TODO re-enable this, need to think on how to make it compatible with
@@ -516,6 +534,20 @@ class Trainer(TrainerBase):
                 self.grad_scaler.unscale_(self.optimizer)
                 total_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), max_norm=self.training_cfg.optimizer.grad_clip
+                )
+
+                # [JEPA-MON]: latent statistics, teacher, gradients per block, frozen weights
+                self.jepa_monitor.on_train_step(
+                    self.cf.general.istep,
+                    preds,
+                    targets_and_auxs,
+                    metadata,
+                    loss,
+                    self.model,
+                    self.optimizer,
+                    self.target_and_aux_calculators,
+                    ema_step=self.get_batch_size_total(self.batch_size_per_gpu)
+                    * self.cf.general.istep,
                 )
 
                 # log gradient norms
@@ -631,6 +663,7 @@ class Trainer(TrainerBase):
                         preds=preds,
                         targets_and_aux=targets_and_auxs,
                         metadata=extract_batch_metadata(batch),
+                        istep=self.cf.general.istep,
                     )
 
                     # log output
@@ -812,6 +845,10 @@ class Trainer(TrainerBase):
                 loss_calculator.loss_hist,
                 loss_calculator.losses_unweighted_hist,
                 loss_calculator.stddev_unweighted_hist,
+            )
+
+            self.jepa_monitor.log_loss_breakdown(
+                "val" if stage == VAL else "train", self.cf.general.istep, losses_all
             )
 
             if is_root():

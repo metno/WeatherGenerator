@@ -8,6 +8,7 @@
 # nor does it submit to any jurisdiction.
 
 import logging
+import re
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -180,6 +181,7 @@ class LearningRateScheduler:
         # explicitly track steps to be able to switch between optimizers
         self.i_step = 0
         self.lr = self.cur_scheduler.get_last_lr()
+        self._apply_lr_scales()
 
         # advance manually to step_contd (last_mini_epoch parameter for schedulers is not working
         # and this is also more brittle with the different phases)
@@ -234,8 +236,21 @@ class LearningRateScheduler:
             logging.getLogger("obslearn").info(str)
 
         self.i_step += 1
+        self._apply_lr_scales()
 
         return self.lr
+
+    def _apply_lr_scales(self) -> None:
+        """
+        Param groups with an `lr_scale` (optimizer.param_groups) follow the schedule of the
+        first (unscaled) group, scaled: lr_group = lr_group0 * lr_scale.
+        """
+        groups = self.optimizer.param_groups
+        if len(groups) < 2:
+            return
+        lr0 = groups[0]["lr"]
+        for g in groups[1:]:
+            g["lr"] = lr0 * g.get("lr_scale", 1.0)
 
     def get_lr(self):
         return self.lr
@@ -332,3 +347,52 @@ class LearningRateScheduler:
 
         plt.plot(lrs, "r")
         plt.savefig("./plots/lr_schedule.png")
+
+
+def optimizer_param_groups(model, optimizer_cfg) -> list[dict] | object:
+    """
+    Parameter groups of the optimizer from `training_config.optimizer.param_groups`:
+
+        optimizer:
+          param_groups:
+            - modules: ["encoder\\..*"]     # regexes on parameter names (re.match)
+              lr_scale: 0.1                 # lr of the group = scheduled lr * lr_scale
+            - modules: ["pred_heads\\..*", "target_token_engines\\..*"]
+              lr_scale: 0.3
+
+    A parameter goes to the first group whose regex matches; the others form the default
+    group (first, unscaled). Without param_groups: all parameters, one group.
+    """
+    groups_cfg = list(optimizer_cfg.get("param_groups", None) or [])
+    if not groups_cfg:
+        return model.parameters()
+    patterns = []
+    for g in groups_cfg:
+        mods = g["modules"]
+        mods = [mods] if isinstance(mods, str) else list(mods)
+        patterns.append("|".join(f"(?:{m})" for m in mods))
+    default, scaled = [], [[] for _ in groups_cfg]
+    for name, p in model.named_parameters():
+        name = name.removeprefix("module.")
+        for i, pat in enumerate(patterns):
+            if re.match(pat, name) is not None:
+                scaled[i].append(p)
+                break
+        else:
+            default.append(p)
+    groups = [{"params": default, "name": "default"}]
+    for g, params in zip(groups_cfg, scaled, strict=True):
+        if params:
+            mods = [g["modules"]] if isinstance(g["modules"], str) else list(g["modules"])
+            groups.append(
+                {
+                    "params": params,
+                    "lr_scale": float(g.get("lr_scale", 1.0)),
+                    "name": "|".join(str(m) for m in mods),
+                }
+            )
+        else:
+            logging.getLogger(__name__).warning(
+                f"optimizer.param_groups: no parameter matches {g['modules']}"
+            )
+    return groups

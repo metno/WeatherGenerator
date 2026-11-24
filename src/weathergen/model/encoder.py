@@ -32,6 +32,30 @@ from weathergen.model.parametrised_prob_dist import LatentInterpolator
 from weathergen.model.positional_encoding import positional_encoding_harmonic
 
 
+def deep_ssl_taps(cf: Config) -> tuple[bool, set[int] | None]:
+    """
+    Deep self-supervision (V-JEPA 2.1) taps of the encoder, from training_config.deep_ssl:
+    (tap after the local->global adapter, set of global-engine logical layers or None).
+
+    Canonical order of the collected representations of a latent level:
+    [local2global] + [global:k for k ascending] + [final]  (final = after the cascade).
+    """
+    deep_cfg = cf.get("training_config", {}).get("deep_ssl", None)
+    if not deep_cfg or not deep_cfg.get("enabled", False) or not deep_cfg.get("tap_after"):
+        return False, None
+    tap_local2global, tap_global = False, set()
+    for tap in deep_cfg.tap_after:
+        tap = str(tap)
+        if tap == "local2global":
+            tap_local2global = True
+        elif tap.startswith("global:"):
+            tap_global.add(int(tap.split(":")[1]))
+        else:
+            raise ValueError(f"deep_ssl.tap_after: unknown tap {tap!r}")
+    # an empty set still switches the (tokens, intermediates) return on in the global engine
+    return tap_local2global, tap_global
+
+
 class EncoderModule(torch.nn.Module):
     name: "EncoderModule"
 
@@ -110,8 +134,16 @@ class EncoderModule(torch.nn.Module):
         # query aggregation engine
         self.ae_aggregation_engine = QueryAggregationEngine(cf, self.num_healpix_cells, dim_embed)
 
+        # deep self-supervision (V-JEPA 2.1): intermediate representations collected per
+        # latent level during forward, see pop_ssl_intermediates()
+        self.tap_local2global, self.tap_global_layers = deep_ssl_taps(cf)
+        self.deep_ssl = self.tap_global_layers is not None
+        self._ssl_intermediates: dict[int, list[torch.Tensor]] | None = None
+
         # global assimilation engine
-        self.ae_global_engine = GlobalAssimilationEngine(cf, self.num_healpix_cells, dim_embed)
+        self.ae_global_engine = GlobalAssimilationEngine(
+            cf, self.num_healpix_cells, dim_embed, tap_global_layers=self.tap_global_layers
+        )
 
         # multi-resolution latent: modules of the coarser levels, keyed by str(level).
         # Embedding engine, local assimilation engine and local->global adapter are shared
@@ -149,7 +181,7 @@ class EncoderModule(torch.nn.Module):
                     cf, len(dom_l), dim_l
                 )
                 self._ae_global_per_level[str(lvl)] = GlobalAssimilationEngine(
-                    cf, len(dom_l), dim_l
+                    cf, len(dom_l), dim_l, tap_global_layers=self.tap_global_layers
                 )
 
             # coarse <-> fine exchange after encoding (inert with num_cycles: 0)
@@ -301,12 +333,17 @@ class EncoderModule(torch.nn.Module):
             self.assimilate_local, model_params, stream_cell_tokens, batch, use_reentrant=False
         )
 
+        intermediates = [tokens_global] if self.tap_local2global else []
         tokens_global = self._checkpoint(
             self.ae_global_engine,
             tokens_global,
             coords=model_params.rope_coords,
             use_reentrant=False,
         )
+        if self.deep_ssl:
+            tokens_global, global_intermediates = tokens_global
+            intermediates += global_intermediates
+            self._ssl_intermediates = {self.healpix_level: intermediates}
 
         return tokens_global, posteriors
 
@@ -320,7 +357,7 @@ class EncoderModule(torch.nn.Module):
         parameters (`model_params.params_for(level)`). The latent cascade then exchanges
         information between adjacent levels.
         """
-        tokens_by_level, posteriors_by_level = {}, {}
+        tokens_by_level, posteriors_by_level, intermediates_by_level = {}, {}, {}
         for lvl in self.domain_pyramid.levels:
             mp_l = model_params.params_for(lvl)
             ae_global_l = self._level_modules(lvl)[2]
@@ -344,18 +381,32 @@ class EncoderModule(torch.nn.Module):
                 use_reentrant=False,
             )
 
+            intermediates = [tokens_global] if self.tap_local2global else []
             tokens_global = self._checkpoint(
                 ae_global_l,
                 tokens_global,
                 coords=mp_l.rope_coords,
                 use_reentrant=False,
             )
+            if self.deep_ssl:
+                tokens_global, global_intermediates = tokens_global
+                intermediates_by_level[lvl] = intermediates + global_intermediates
             tokens_by_level[lvl] = tokens_global
             posteriors_by_level[lvl] = posteriors
 
         tokens_by_level = self.latent_cascade(tokens_by_level)
+        if self.deep_ssl:
+            self._ssl_intermediates = intermediates_by_level
 
         return tokens_by_level, posteriors_by_level
+
+    def pop_ssl_intermediates(self) -> dict[int, list[torch.Tensor]] | None:
+        """
+        Deep SSL: {level: [intermediate tokens]} of the last forward (canonical tap order, the
+        final latent is not included), None without deep_ssl. Cleared on read.
+        """
+        out, self._ssl_intermediates = self._ssl_intermediates, None
+        return out
 
     def interpolate_latents(self, tokens: torch.Tensor) -> (torch.Tensor, torch.Tensor):
         """ "

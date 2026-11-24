@@ -648,6 +648,10 @@ class CollapseMonitor:
             if isinstance(latent_data, list) and len(latent_data) > 0:
                 return extract_latent_tensor(latent_data[0])
             if isinstance(latent_data, dict):
+                # multi-level JEPA: {latent level: tensor} -> finest level
+                int_keys = [k for k in latent_data if isinstance(k, int)]
+                if int_keys:
+                    return extract_latent_tensor(latent_data[max(int_keys)])
                 # Try common keys
                 for key in ["latent", "patch_tokens", "z_pre_norm"]:
                     if key in latent_data:

@@ -11,6 +11,8 @@ from numpy.typing import NDArray
 from weathergen.common.config import Config
 from weathergen.datasets.batch import SampleMetaData
 from weathergen.datasets.domain import Domain
+from weathergen.datasets.domain_pyramid import cells_parent
+from weathergen.datasets.mask_plan import MASK_PLAN_STRATEGY
 from weathergen.train.utils import Stage
 from weathergen.utils.utils import is_stream_diagnostic, is_stream_forcing
 
@@ -127,6 +129,13 @@ class Masker:
 
         self.stage = stage
 
+        # optional MaskPlanner (masking_strategy: mask_plan), shared by the maskers of all
+        # latent levels; set by the data sampler
+        self.planner = None
+
+        # masks shared across the streams of the current sample (data item), see start_item()
+        self._item_cache: dict = {}
+
         # Build and store per-stream effective masking configs
         if streams is not None and mode_cfg is not None:
             self._effective_masking_cfgs = self.build_effective_masking_cfgs(streams, mode_cfg)
@@ -138,6 +147,22 @@ class Masker:
         Reset rng after mini_epoch to ensure proper randomization
         """
         self.rng = rng
+
+    def start_item(self) -> None:
+        """
+        Start a new data item: forget the masks shared across its streams
+        (masking_strategy_config.shared_across_streams). Has to be called before
+        build_samples_for_stream() is called for the first stream of the item.
+        """
+        self._item_cache = {}
+
+    def _shared(self, key: tuple, shared: bool, fct, **kwargs):
+        """Return fct(**kwargs), drawn once per item and key if shared (else on every call)."""
+        if not shared:
+            return fct(**kwargs)
+        if key not in self._item_cache:
+            self._item_cache[key] = fct(**kwargs)
+        return self._item_cache[key]
 
     def merge_masking_config(self, mode_cfg, override):
         """Merge a stream's masking override into the base mode config.
@@ -368,14 +393,27 @@ class Masker:
         i_target = 0
         for i_cfg, (_, target_cfg) in enumerate(target_cfgs.items()):
             # different samples/view per strategy
-            for _ in range(target_cfg.get("num_samples", 1)):
-                # determine if forcing dataset => mask is empty
-                if is_stream_forcing(stream_info, self.stage):
+            for i_sample in range(target_cfg.get("num_samples", 1)):
+                # determine if forcing dataset => mask is empty; in student-teacher / latent
+                # modes the target is the teacher's network input, which forcing streams
+                # (no target channels) also provide (as ecmwf develop-ssl-diffusion-v2)
+                needs_target_network_input = (
+                    "student_teacher" in training_mode or "latent_loss" in training_mode
+                )
+                if is_stream_forcing(stream_info, self.stage) and not needs_target_network_input:
                     target_mask, mask_params = torch.zeros(num_cells, dtype=torch.bool), {}
+                elif target_cfg.get("masking_strategy") == MASK_PLAN_STRATEGY:
+                    # teacher view of the per-sample mask plan (shared by all streams/levels)
+                    target_mask, mask_params = self._plan().teacher_mask(
+                        i_target, self.healpix_level_data, stream_info["name"]
+                    )
                 else:
                     masking_config = target_cfg.get("masking_strategy_config", {})
                     # targets are never randomly dropped
-                    target_mask, mask_params = self._get_mask(
+                    target_mask, mask_params = self._shared(
+                        ("target", i_cfg, i_sample),
+                        masking_config.get("shared_across_streams", False),
+                        self._get_mask,
                         num_cells=num_cells,
                         strategy=target_cfg.get("masking_strategy"),
                         masking_strategy_config=masking_config,
@@ -427,8 +465,18 @@ class Masker:
                 # determine if diagnostic dataset or randomly dropped => mask is empty
                 if is_stream_diagnostic(stream_info, self.stage) or is_stream_dropped:
                     source_mask, mask_params = torch.zeros(num_cells, dtype=torch.bool), {}
+                elif source_cfg.get("masking_strategy") == MASK_PLAN_STRATEGY:
+                    # student masks of the per-sample mask plan (shared by all streams and
+                    # latent levels); the plan defines student and teacher masks together,
+                    # target_relationship is not applied
+                    source_mask, mask_params = self._plan().student_mask(
+                        i_source, self.healpix_level_data, stream_info["name"]
+                    )
                 else:
-                    source_mask, mask_params = self._get_mask(
+                    source_mask, mask_params = self._shared(
+                        ("source", i_src_cfg, i_sample),
+                        masking_config.get("shared_across_streams", False),
+                        self._get_mask,
                         num_cells=num_cells,
                         strategy=source_cfg.get("masking_strategy"),
                         masking_strategy_config=masking_config,
@@ -446,6 +494,13 @@ class Masker:
         source_target_mapping = np.array(source_target_mapping, dtype=np.int32)
 
         return (target_masks, source_masks, source_target_mapping)
+
+    def _plan(self):
+        assert self.planner is not None, (
+            f"masking_strategy '{MASK_PLAN_STRATEGY}' requires a mask_plan block in the stage "
+            "config; the MaskPlanner was not set up by the data sampler."
+        )
+        return self.planner
 
     def _get_mask(
         self,
@@ -545,11 +600,11 @@ class Masker:
             "num_cells inconsistent with configured healpix level."
         )
 
-        if not self.domain.is_global and strategy in ("healpix", "cropping_healpix"):
+        if not self.domain.is_global and strategy == "cropping_healpix":
             raise NotImplementedError(
                 f"Masking strategy '{strategy}' uses healpix nested-index parent/child "
                 "arithmetic, which does not hold for the compact cell indices of a regional "
-                "domain. Use 'random', 'forecast' or 'causal' with a regional domain."
+                "domain. Use 'healpix', 'random' or masking_strategy 'mask_plan' (pattern crop)."
             )
 
         # generate cell mask
@@ -563,6 +618,21 @@ class Masker:
 
             if "diffusion_rn" in masking_strategy_config:
                 masking_params["noise_level_rn"] = self.rng.normal(0.0, 1.0)
+
+        elif strategy == "healpix" and not self.domain.is_global:
+            # regional domain: the parents at hl_mask of the active cells are the mask units
+            keep_rate = self._get_sampling_rate(masking_strategy_config)
+            hl_mask = masking_strategy_config.get("hl_mask")
+            assert hl_mask is not None and hl_mask <= self.healpix_level_data, (
+                "For healpix keep mask generation, cfg['hl_mask'] must be set and <= data level."
+            )
+            parents = cells_parent(self.domain.active_cells, self.healpix_level_data, hl_mask)
+            units, unit_of_cell = np.unique(parents, return_inverse=True)
+            num_keep = int(np.round(keep_rate * len(units)))
+            keep_units = np.zeros(len(units), dtype=bool)
+            if num_keep > 0:
+                keep_units[self.rng.choice(len(units), num_keep, replace=False)] = True
+            mask = keep_units[unit_of_cell]
 
         elif strategy == "healpix":
             # prepare healpix-based masking

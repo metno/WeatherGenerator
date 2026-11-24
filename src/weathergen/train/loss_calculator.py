@@ -10,6 +10,7 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+import inspect
 import logging
 from collections import defaultdict
 from copy import deepcopy
@@ -83,6 +84,7 @@ class LossCalculator:
         preds: ModelOutput,
         targets_and_aux: TargetAuxOutput,
         metadata: dict,
+        istep: int = 0,
     ):
         losses_all = defaultdict(dict)
         stddev_all = defaultdict(dict)
@@ -91,8 +93,15 @@ class LossCalculator:
             target = targets_and_aux[loss_term_name]
             for weight, calculator in calc_term:
                 if weight > 0.0:
+                    # the global step is passed to loss modules that take it (context-loss
+                    # warmup of LossLatentSSLStudentTeacher)
+                    kwargs = (
+                        {"istep": istep}
+                        if "istep" in inspect.signature(calculator.compute_loss).parameters
+                        else {}
+                    )
                     loss_values = calculator.compute_loss(
-                        preds=preds, targets=target, metadata=metadata
+                        preds=preds, targets=target, metadata=metadata, **kwargs
                     )
                     loss = loss + weight * loss_values.loss
                     losses_all[calculator.name] = loss_values.losses_all

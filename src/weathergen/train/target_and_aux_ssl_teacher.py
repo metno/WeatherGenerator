@@ -13,8 +13,10 @@ import logging
 from typing import Any
 
 import torch
+from omegaconf import OmegaConf
 
 from weathergen.common.config import Config, load_run_config, merge_configs
+from weathergen.datasets.domain_pyramid import build_domain_pyramid
 from weathergen.model.model import build_model_params
 from weathergen.model.model_interface import get_model
 from weathergen.model.ssl_target_processing import (
@@ -22,13 +24,43 @@ from weathergen.model.ssl_target_processing import (
     JEPATargetProcessing,
     iBOTPatchTargetProcessing,
 )
+from weathergen.train.frozen_run_utils import DatasetStreamSubset, frozen_run_streams
 from weathergen.train.target_and_aux_module_base import TargetAndAuxModuleBase, TargetAuxOutput
 from weathergen.train.teacher_utils import (
     load_encoder_from_checkpoint,
     prepare_encoder_teacher,
 )
+from weathergen.train.utils import select_sample_metadata
 
 logger = logging.getLogger(__name__)
+
+
+def teacher_valid_cells(batch) -> dict[int, torch.Tensor]:
+    """{level: (num_samples, num_cells) bool}: cells with >= 1 input token of the teacher."""
+    tokens_lens = batch.tokens_lens
+    if not isinstance(tokens_lens, dict):
+        # single latent level: the level is not known here; key -1 = "the only level"
+        tokens_lens = {-1: tokens_lens}
+    return {lvl: tl.sum(dim=(0, 2)) > 0 for lvl, tl in tokens_lens.items()}
+
+
+class _LevelSubsetBatch:
+    """
+    View of a (multi-level) BatchSamples for a frozen teacher whose latent has a subset of the
+    student's latent levels: `tokens_lens` is restricted to the teacher's levels (a plain
+    tensor for a single-level teacher); everything else is the student batch.
+    """
+
+    def __init__(self, batch, levels: list[int]):
+        self._batch = batch
+        tl = batch.tokens_lens
+        self.tokens_lens = tl[levels[0]] if len(levels) == 1 else {lvl: tl[lvl] for lvl in levels}
+
+    def __len__(self):
+        return len(self._batch)
+
+    def __getattr__(self, name):
+        return getattr(self._batch, name)
 
 
 class EncoderTeacher(TargetAndAuxModuleBase):
@@ -58,10 +90,21 @@ class EncoderTeacher(TargetAndAuxModuleBase):
             outputs = self.forward_teacher(model_params, batch).get_latent_prediction(0)
             targets = {}
             for loss_name, target_module in self.postprocess_targets.items():
-                targets[loss_name] = target_module(outputs[loss_name])
+                if isinstance(outputs[loss_name], dict):
+                    # multi-level JEPA: {level: targets} (identity target processing)
+                    assert isinstance(target_module, JEPATargetProcessing)
+                    targets[loss_name] = outputs[loss_name]
+                else:
+                    targets[loss_name] = target_module(outputs[loss_name])
+            if "JEPA_deep" in outputs:
+                targets["JEPA_deep"] = outputs["JEPA_deep"]
+            if isinstance(targets.get("JEPA"), dict):
+                # cells of each latent level with at least one teacher input token: targets
+                # elsewhere are inferred by the teacher itself and are not used by the loss
+                targets["JEPA_valid"] = teacher_valid_cells(batch)
 
             # collect target meta-information for selected samples
-            aux_outputs = [list(sample.meta_info.values())[0] for sample in batch.get_samples()]
+            aux_outputs = [select_sample_metadata(sample) for sample in batch.get_samples()]
 
             targets_out = TargetAuxOutput(batch.get_output_len(), batch.get_output_idxs())
             targets_out.latent = targets
@@ -117,9 +160,12 @@ class FrozenTeacher(EncoderTeacher):
     SSL loss config.
     """
 
-    def __init__(self, teacher_model, training_cfg, teacher_model_params=None):
+    def __init__(self, teacher_model, training_cfg, teacher_model_params=None, teacher_levels=None):
         super().__init__(teacher_model, training_cfg)
         self.teacher_model_params = teacher_model_params
+        # latent levels of the teacher when they are a strict subset of the student's
+        # (e.g. CARRA2 autoencoder at hl8 only, student at hl5 + hl8); None otherwise
+        self.teacher_levels = teacher_levels
 
         # Freeze all parameters
         for param in self.teacher_model.parameters():
@@ -144,23 +190,41 @@ class FrozenTeacher(EncoderTeacher):
         teacher_config = load_run_config(teacher_run_id, teacher_mini_epoch, model_path=None)
         teacher_config = merge_configs(teacher_config, {"with_ddp": False, "with_fsdp": False})
 
-        teacher_model = get_model(teacher_config, "student", dataset, {})
+        # deep SSL: the teacher has to tap the same encoder layers as the student
+        deep_ssl = cf.training_config.get("deep_ssl", None)
+        if deep_ssl is not None and deep_ssl.get("enabled", False):
+            teacher_config = merge_configs(
+                teacher_config, {"training_config": {"deep_ssl": OmegaConf.to_container(deep_ssl)}}
+            )
+
+        # The teacher runs on the student's batch. Build it on the student's streams at the
+        # teacher's latent levels, in the student's order, so that its embedders and the
+        # stream axis of the batch's tokens_lens line up (see frozen_run_streams).
+        teacher_config, stream_idxs, teacher_levels = frozen_run_streams(cf, teacher_config)
+        teacher_dataset = DatasetStreamSubset(dataset, stream_idxs)
+
+        teacher_model = get_model(teacher_config, "student", teacher_dataset, {})
 
         # Load only encoder weights
         load_encoder_from_checkpoint(teacher_model, cf, teacher_run_id, teacher_mini_epoch, device)
 
-        # Strip to encoder + create fresh heads
+        # Strip to encoder + create fresh heads (modules created here still have to be moved)
         prepare_encoder_teacher(teacher_model, cf.training_config, teacher_config)
+        teacher_model.to(device)
 
         # Create model params matching teacher's architecture
         teacher_model_params = build_model_params(teacher_config).create(teacher_config).to(device)
 
-        return cls(teacher_model, cf.training_config, teacher_model_params)
+        student_levels = build_domain_pyramid(cf).levels
+        subset = teacher_levels if sorted(teacher_levels) != sorted(student_levels) else None
+        return cls(teacher_model, cf.training_config, teacher_model_params, subset)
 
     def forward_teacher(self, model_params, batch):
         params = (
             self.teacher_model_params if self.teacher_model_params is not None else model_params
         )
+        if self.teacher_levels is not None:
+            batch = _LevelSubsetBatch(batch, self.teacher_levels)
         return self.teacher_model(params, batch)
 
     def reset(self, batch_size=None):
