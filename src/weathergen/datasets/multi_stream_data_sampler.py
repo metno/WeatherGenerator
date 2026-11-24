@@ -258,7 +258,8 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                             f"Did not find input data for {stream_info['type']} "
                             f"stream '{stream_name}': {filenames}."
                         )
-                        raise FileNotFoundError(msg)
+                        logger.info(msg)
+                        continue
 
                 ds_type = stream_info["type"]
                 if is_root():
