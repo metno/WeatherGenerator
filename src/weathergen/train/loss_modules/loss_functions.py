@@ -9,6 +9,7 @@
 
 import os
 import math
+import random
 
 import numpy as np
 import torch
@@ -1172,6 +1173,27 @@ def _reshape_regrid_to_grid(
     return t_flat, p_flat, valid_cell, empty
 
 
+def _haar_grid_offset(factor: int, enabled: bool, owner=None, stream_name: str = ""):
+    """
+    Random offset (dy, dx), each in [0, factor), of the Haar block lattice ("cycle
+    spinning"). The Haar losses cut the template grid into fixed squares of 2..2**L
+    points; with a fixed lattice, a model rewarded for variability (CRPS, energy) can
+    learn steps exactly on the block edges (seen as 16/32/64-point blocks in e05/e05b
+    members). A new random offset every training step moves the edges, so such steps no
+    longer pay. Only while gradients are on (training): validation keeps offset (0, 0)
+    and stays comparable. Target and members always get the same offset.
+    """
+    if not enabled or factor <= 1 or not torch.is_grad_enabled():
+        return 0, 0
+    if owner is not None:
+        _key = f"_haar_shift_reported_{stream_name}"
+        if not getattr(owner, _key, False):
+            setattr(owner, _key, True)
+            print(f"[{owner.__name__}] stream={stream_name}: random Haar grid offset "
+                  f"0..{factor - 1} per training step (haar_random_shift)")
+    return random.randrange(factor), random.randrange(factor)
+
+
 def global_haar_wavelet_reshape_varweighted(
     target: torch.Tensor,
     pred: torch.Tensor,
@@ -1185,9 +1207,12 @@ def global_haar_wavelet_reshape_varweighted(
     stream_name: str = "",
     regrid_method: str = "nearest",
     level_start: int = 0,
+    haar_random_shift: bool = False,
 ):
     """
     Global 2D Haar wavelet MSE with inverse-variance spatial weighting.
+    haar_random_shift: random offset of the Haar block lattice in training
+    (see _haar_grid_offset).
 
     Identical to global_haar_wavelet_reshape except that at each Haar level
     the detail subband MSE is weighted by the inverse of the local target
@@ -1321,19 +1346,21 @@ def global_haar_wavelet_reshape_varweighted(
 
     # --- pad to next multiple of 2^num_levels ---
     factor = 2 ** num_levels
-    ny_p   = int(_math_vw.ceil(ny / factor)) * factor
-    nx_p   = int(_math_vw.ceil(nx / factor)) * factor
+    sy, sx = _haar_grid_offset(factor, haar_random_shift,
+                               global_haar_wavelet_reshape_varweighted, stream_name)
+    ny_p   = int(_math_vw.ceil((ny + sy) / factor)) * factor
+    nx_p   = int(_math_vw.ceil((nx + sx) / factor)) * factor
 
     valid_grid_raw = valid_cell.view(ny, nx)  # (ny, nx) bool
     if ny_p > ny or nx_p > nx:
         t_grid = torch.zeros(ny_p, nx_p, num_channels, device=dev)
         p_grid = torch.zeros(ny_p, nx_p, num_channels, device=dev)
-        t_grid[:ny, :nx, :] = t_grid_raw
-        p_grid[:ny, :nx, :] = p_grid_raw
+        t_grid[sy:sy + ny, sx:sx + nx, :] = t_grid_raw
+        p_grid[sy:sy + ny, sx:sx + nx, :] = p_grid_raw
         # padded region is invalid too (target==pred==0 there, so it is already
         # loss-neutral, but exclude it from the field_var normaliser)
         valid_grid = torch.zeros(ny_p, nx_p, dtype=torch.bool, device=dev)
-        valid_grid[:ny, :nx] = valid_grid_raw
+        valid_grid[sy:sy + ny, sx:sx + nx] = valid_grid_raw
     else:
         t_grid = t_grid_raw
         p_grid = p_grid_raw
@@ -1393,8 +1420,8 @@ def global_haar_wavelet_reshape_varweighted(
         os.makedirs(DEBUG_OUT_DIR, exist_ok=True)
 
         for c in range(num_channels):
-            t_np    = t_grid[:ny, :nx, c].detach().cpu().float().numpy()
-            p_np    = p_grid[:ny, :nx, c].detach().cpu().float().numpy()
+            t_np    = t_grid[sy:sy + ny, sx:sx + nx, c].detach().cpu().float().numpy()
+            p_np    = p_grid[sy:sy + ny, sx:sx + nx, c].detach().cpu().float().numpy()
             diff_np = t_np - p_np
 
             t_plot,    _ext, _zstr = _apply_zoom_vw(t_np)
@@ -2184,6 +2211,7 @@ def global_haar_wavelet_reshape_varweighted_crps(
     level_weights: list | None = None,
     member_ll_mse_weight: float = 0.0,
     crps_alpha: float = 1.0,
+    haar_random_shift: bool = False,
 ):
     """
     Global 2D Haar wavelet kernel CRPS with inverse-variance spatial weighting.
@@ -2228,6 +2256,8 @@ def global_haar_wavelet_reshape_varweighted_crps(
                               divided by the target variance. Asks every member to
                               agree with the target at the large scale.
         crps_alpha          : 1 = fair CRPS, <1 = "almost fair" mix with the standard CRPS
+        haar_random_shift   : random offset of the Haar block lattice in training
+                              (see _haar_grid_offset)
 
     Returns:
         loss     : scalar
@@ -2294,21 +2324,23 @@ def global_haar_wavelet_reshape_varweighted_crps(
     # invalid cells: every member equals the target -> CRPS contribution exactly 0
     p_g = torch.where(valid.unsqueeze(0), p_g, t_g.detach().unsqueeze(0))
 
-    # --- pad to a multiple of 2**num_levels (zeros in both: loss-neutral) ---
-    factor = 2**num_levels
-    ny_p = int(math.ceil(ny / factor)) * factor
-    nx_p = int(math.ceil(nx / factor)) * factor
-    if ny_p > ny or nx_p > nx:
-        t_g = F.pad(t_g, (0, nx_p - nx, 0, ny_p - ny))
-        p_g = F.pad(p_g, (0, nx_p - nx, 0, ny_p - ny))
-
-    # per-channel normaliser from the valid target cells
+    # per-channel normaliser from the valid target cells (before any padding)
     n_valid = valid.sum(dim=(1, 2)).clamp(min=2).float()                    # (C,)
     vmask = valid.float()
-    t_raw = t_g[:, :ny, :nx]
-    t_mean = (t_raw * vmask).sum(dim=(1, 2)) / n_valid
-    t_var = (((t_raw - t_mean.view(C, 1, 1)) ** 2) * vmask).sum(dim=(1, 2)) / (n_valid - 1)
+    t_mean = (t_g * vmask).sum(dim=(1, 2)) / n_valid
+    t_var = (((t_g - t_mean.view(C, 1, 1)) ** 2) * vmask).sum(dim=(1, 2)) / (n_valid - 1)
     t_var = t_var.clamp(min=1e-8)
+
+    # --- offset (training, optional) and pad to a multiple of 2**num_levels ---
+    # zeros in both target and members: loss-neutral
+    factor = 2**num_levels
+    sy, sx = _haar_grid_offset(factor, haar_random_shift, _self, stream_name)
+    ny_p = int(math.ceil((ny + sy) / factor)) * factor
+    nx_p = int(math.ceil((nx + sx) / factor)) * factor
+    if ny_p > ny or nx_p > nx:
+        pad4 = (sx, nx_p - nx - sx, sy, ny_p - ny - sy)
+        t_g = F.pad(t_g, pad4)
+        p_g = F.pad(p_g, pad4)
 
     if level_weights is None:
         lw = [1.0] * num_levels
@@ -2510,6 +2542,7 @@ def global_haar_energy_reshape(
     energy_window_min_valid: float = 0.5,
     energy_window_stride: int = 0,
     energy_window_random_shift: bool = False,
+    haar_random_shift: bool = False,
 ):
     """
     Haar detail-energy matching loss. Meant as an ADDITIONAL term next to an
@@ -2665,12 +2698,14 @@ def global_haar_energy_reshape(
     nan_g = t_flat[:, E * C :].reshape(ny, nx, C).permute(2, 0, 1) > 0     # (C,ny,nx)
     valid = valid_cell.view(1, ny, nx) & ~nan_g                            # (C,ny,nx)
 
-    # --- pad to a multiple of 2^num_levels (padding is invalid) ---
+    # --- offset of the Haar lattice (training, optional; see _haar_grid_offset) and
+    #     pad to a multiple of 2^num_levels (padding is invalid) ---
     factor = 2**num_levels
-    ny_p = int(math.ceil(ny / factor)) * factor
-    nx_p = int(math.ceil(nx / factor)) * factor
-    pad = (0, nx_p - nx, 0, ny_p - ny)
-    if pad[1] or pad[3]:
+    sy, sx = _haar_grid_offset(factor, haar_random_shift, _self, stream_name)
+    ny_p = int(math.ceil((ny + sy) / factor)) * factor
+    nx_p = int(math.ceil((nx + sx) / factor)) * factor
+    pad = (sx, nx_p - nx - sx, sy, ny_p - ny - sy)
+    if any(pad):
         t_g = F.pad(t_g, pad)
         p_g = F.pad(p_g, pad)
         valid = F.pad(valid.float(), pad) > 0.5

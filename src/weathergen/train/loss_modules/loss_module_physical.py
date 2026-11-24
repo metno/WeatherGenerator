@@ -269,7 +269,7 @@ class LossPhysical(LossModuleBase):
         target, pred, target_coords_raw, weights_channels,
         stream_name="", template_path="",
         detail_weight=2.0, num_levels=3, var_weight_epsilon=1e-3,
-        regrid_method="nearest", level_start=0,
+        regrid_method="nearest", level_start=0, haar_random_shift=False,
     ):
         if target.shape[0] == 0:
             return (
@@ -286,6 +286,7 @@ class LossPhysical(LossModuleBase):
             stream_name=stream_name,
             regrid_method=regrid_method,
             level_start=level_start,
+            haar_random_shift=haar_random_shift,
         )
 
     @staticmethod
@@ -355,6 +356,7 @@ class LossPhysical(LossModuleBase):
         regrid_method="nearest", monitor_every_n=0,
         energy_window=0, energy_window_min_valid=0.5,
         energy_window_stride=0, energy_window_random_shift=False,
+        haar_random_shift=False,
     ):
         if target.shape[0] == 0:
             return (
@@ -374,6 +376,7 @@ class LossPhysical(LossModuleBase):
             energy_window=energy_window, energy_window_min_valid=energy_window_min_valid,
             energy_window_stride=energy_window_stride,
             energy_window_random_shift=energy_window_random_shift,
+            haar_random_shift=haar_random_shift,
         )
 
     @staticmethod
