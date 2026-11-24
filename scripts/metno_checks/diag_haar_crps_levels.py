@@ -1,4 +1,4 @@
-"""Per-level diagnostic of the Haar CRPS loss on an inference / validation output.
+"""Per-level diagnostic of the Haar CRPS and Haar MSE losses on an inference / validation output.
 
 For every channel and every Haar level l it prints:
   s_l        RMS of the target detail coefficients (LH, HL, HH) at level l, over valid
@@ -7,6 +7,10 @@ For every channel and every Haar level l it prints:
              (inverse-variance weighted mean over positions, mean over the 3 bands)
   share      L_l / sum_l L_l: the share of each level in the CRPS loss as it is now
   share_n    the same share if each level were divided by s_l (proposed level_norm)
+  mse        the level loss M_l of global_haar_wavelet_reshape_varweighted (Haar MSE of the
+             ensemble mean, same weights), mean over the 3 bands
+  mshare     M_l / sum_l M_l: the share of each level in the Haar MSE as it is now
+  mshare_n   the same share if each level were divided by s_l**2 (proposed level_norm)
   flat_w     fraction of valid positions where the target detail energy is < eps, i.e.
              where the weight w = 1/(energy + eps) is ~flat (no relative weighting)
   energy     RMS of the member coefficients / s_l (1 = members as energetic as the target)
@@ -144,7 +148,7 @@ with zarrio_reader(fname) as zio:
         Vp[:, :ny, :nx] = valid.double()
 
         if acc is None:
-            keys = ["crps", "s2", "nv", "flat", "xe2", "spr", "skl"]
+            keys = ["crps", "mse", "s2", "nv", "flat", "xe2", "spr", "skl"]
             acc = {k: torch.zeros(C, L, dtype=torch.double) for k in keys}
         gE = alpha / (E * (E - 1)) + (1 - alpha) / E**2 if E > 1 else 0.0
         Yl, Xl, Vl = Yp, Xp, Vp
@@ -157,7 +161,9 @@ with zarrio_reader(fname) as zio:
             en = Yb[0] ** 2 + Yb[1] ** 2 + Yb[2] ** 2
             w = 1.0 / (en + eps)
             Ll = 0.0
+            Ml = 0.0
             for yb, xb in zip(Yb, Xb):
+                Ml = Ml + (w * (xb.mean(0) - yb) ** 2).sum((1, 2)) / w.sum((1, 2))
                 crps = (xb - yb).abs().mean(0)
                 for i in range(E - 1):
                     crps = crps - gE * (xb[i].unsqueeze(0) - xb[i + 1:]).abs().sum(0)
@@ -168,6 +174,7 @@ with zarrio_reader(fname) as zio:
                     acc["spr"][:, lvl] += (vb * xb.var(0, unbiased=True)).sum((1, 2))
                     acc["skl"][:, lvl] += (vb * (xb.mean(0) - yb) ** 2).sum((1, 2)) * E / (E + 1)
             acc["crps"][:, lvl] += Ll / 3
+            acc["mse"][:, lvl] += Ml / 3
             acc["nv"][:, lvl] += 3 * vb.sum((1, 2))
             acc["flat"][:, lvl] += (vb * (en < eps)).sum((1, 2))
             Yl, Xl, Vl = YLL, XLL, vb
@@ -179,18 +186,23 @@ s_l = (acc["s2"] / acc["nv"]).sqrt()
 share = crps / crps.sum(1, keepdim=True)
 cn = crps / s_l
 share_n = cn / cn.sum(1, keepdim=True)
+mse = acc["mse"] / n_used
+mshare = mse / mse.sum(1, keepdim=True)
+mn = mse / s_l**2
+mshare_n = mn / mn.sum(1, keepdim=True)
 flat = acc["flat"] / (acc["nv"] / 3)
 energy = (acc["xe2"] / acc["nv"]).sqrt() / s_l
 ratio = (acc["spr"] / acc["skl"].clamp(min=1e-30)).sqrt()
 
 km = [f"{2.5 * 2**l:g}-{2.5 * 2**(l + 1):g} km" for l in range(L)]
 print(f"\n{n_used} samples, levels: " + ", ".join(f"L{l} {km[l]}" for l in range(L)))
-cols = ["s_l", "crps", "share", "share_n", "flat_w", "energy", "spr/skl"]
+cols = ["s_l", "crps", "share", "share_n", "mse", "mshare", "mshare_n", "flat_w", "energy", "spr/skl"]
 for c, ch in enumerate(chans):
     print(f"\n{ch}")
     print("  level " + "".join(f"{h:>10}" for h in cols))
     for lvl in range(L):
-        vals = [s_l[c, lvl], crps[c, lvl], share[c, lvl], share_n[c, lvl], flat[c, lvl],
+        vals = [s_l[c, lvl], crps[c, lvl], share[c, lvl], share_n[c, lvl], mse[c, lvl],
+                mshare[c, lvl], mshare_n[c, lvl], flat[c, lvl],
                 energy[c, lvl], ratio[c, lvl]]
         print(f"  L{lvl}    " + "".join(f"{float(v):10.4f}" for v in vals))
 
@@ -198,6 +210,8 @@ print("\nmean over channels")
 print("  level " + "".join(f"{h:>10}" for h in cols))
 for lvl in range(L):
     vals = [s_l[:, lvl].mean(), crps[:, lvl].mean(), share[:, lvl].mean(), share_n[:, lvl].mean(),
+            mse[:, lvl].mean(), mshare[:, lvl].mean(), mshare_n[:, lvl].mean(),
             flat[:, lvl].mean(), energy[:, lvl].mean(), ratio[:, lvl].mean()]
     print(f"  L{lvl}    " + "".join(f"{float(v):10.4f}" for v in vals))
-print("\nshare: share of each level in the Haar CRPS now; share_n: if each level were divided by s_l")
+print("\nshare / mshare: share of each level in the Haar CRPS / Haar MSE now; "
+      "share_n / mshare_n: if each level were divided by s_l / s_l**2")
