@@ -271,7 +271,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
                 streams_datasets[stream_name].readers += [ds]
 
-            if len(streams_datasets[stream_name].readers == 0):
+            if (len(streams_datasets[stream_name].readers) == 0):
                 streams_datasets.pop(stream_name, None)
                 continue
                 
