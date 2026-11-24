@@ -1220,6 +1220,8 @@ def global_haar_wavelet_reshape_varweighted(
     (without it the coarsest levels dominate). The level losses are then dimensionless,
     so they are not divided by the field variance; only fully valid positions enter the
     weighted means (see _haar_level_valid).
+    Missing (NaN) target values are handled as in the Haar CRPS: set to 0 in the target
+    and the prediction (error 0 there) and left out of the statistics.
 
     Identical to global_haar_wavelet_reshape except that at each Haar level
     the detail subband MSE is weighted by the inverse of the local target
@@ -1263,6 +1265,15 @@ def global_haar_wavelet_reshape_varweighted(
     num_points, num_channels = target.shape
     dev       = target.device
     pred_mean = pred.mean(0)
+
+    # missing (NaN) target values, as in the Haar CRPS: set to 0 in the target and in the
+    # prediction (so the prediction equals the target there and the error is 0), and
+    # marked invalid for the statistics (field variance, s_l). Without NaN nothing changes.
+    nan_t = torch.isnan(target)
+    has_nan = bool(nan_t.any())
+    if has_nan:
+        target = torch.where(nan_t, torch.zeros_like(target), target)
+        pred_mean = torch.where(nan_t, torch.zeros_like(pred_mean), pred_mean)
 
     # --- load and cache template output grid ---
     _grid_key  = f'_vw_template_grid_{template_path}'
@@ -1330,11 +1341,28 @@ def global_haar_wavelet_reshape_varweighted(
     ny, nx = ny_nx
 
     # --- regrid scattered points onto template grid (shared helper) ---
-    t_flat, p_flat, valid_cell, _empty = _reshape_regrid_to_grid(
-        target, pred_mean, target_coords_raw, template_grid, ny, nx,
-        num_channels, dev, regrid_method=regrid_method, stream_name=stream_name,
-        _report_owner=global_haar_wavelet_reshape_varweighted,
-    )
+    if has_nan:
+        # the NaN indicator is regridded with the data (extra columns)
+        _nan_cols = nan_t.to(target.dtype)
+        t_flat, p_flat, valid_cell, _empty = _reshape_regrid_to_grid(
+            torch.cat([target, _nan_cols], dim=1), torch.cat([pred_mean, _nan_cols], dim=1),
+            target_coords_raw, template_grid, ny, nx,
+            2 * num_channels, dev, regrid_method=regrid_method, stream_name=stream_name,
+            _report_owner=global_haar_wavelet_reshape_varweighted,
+        )
+        nan_grid_raw = t_flat[:, num_channels:].reshape(ny, nx, num_channels) > 0
+        t_flat = t_flat[:, :num_channels]
+        p_flat = p_flat[:, :num_channels]
+        # an invalid cell holds the value of its nearest point: make the prediction equal
+        # to the target there as well (both 0 on NaN points already)
+        p_flat = torch.where(nan_grid_raw.reshape(ny * nx, num_channels), t_flat.detach(), p_flat)
+    else:
+        t_flat, p_flat, valid_cell, _empty = _reshape_regrid_to_grid(
+            target, pred_mean, target_coords_raw, template_grid, ny, nx,
+            num_channels, dev, regrid_method=regrid_method, stream_name=stream_name,
+            _report_owner=global_haar_wavelet_reshape_varweighted,
+        )
+        nan_grid_raw = None
     if _empty:
         _key = f'_vw_empty_domain_reported_{stream_name}'
         if not getattr(global_haar_wavelet_reshape_varweighted, _key, False):
@@ -1368,10 +1396,19 @@ def global_haar_wavelet_reshape_varweighted(
         # loss-neutral, but exclude it from the field_var normaliser)
         valid_grid = torch.zeros(ny_p, nx_p, dtype=torch.bool, device=dev)
         valid_grid[sy:sy + ny, sx:sx + nx] = valid_grid_raw
+        if nan_grid_raw is not None:
+            nan_grid = torch.zeros(ny_p, nx_p, num_channels, dtype=torch.bool, device=dev)
+            nan_grid[sy:sy + ny, sx:sx + nx, :] = nan_grid_raw
     else:
         t_grid = t_grid_raw
         p_grid = p_grid_raw
         valid_grid = valid_grid_raw
+        if nan_grid_raw is not None:
+            nan_grid = nan_grid_raw
+
+    def _valid_c(c):
+        # valid cells of channel c: near a data point and target not missing
+        return valid_grid if nan_grid_raw is None else (valid_grid & ~nan_grid[:, :, c])
 
     # --- debug parameters ---
     DEBUG_VW_PLOT      = HAAR_DEBUG_ENABLE
@@ -1487,7 +1524,7 @@ def global_haar_wavelet_reshape_varweighted(
         p_field    = p_grid[:, :, c]
         level_loss = torch.tensor(0.0, device=dev)
         level_norm_loss = torch.tensor(0.0, device=dev)
-        v_all = valid_grid.float()
+        v_all = _valid_c(c).float()
 
         for lvl in range(num_levels):
             t_LL, t_LH, t_HL, t_HH = haar_2d(t_field)
@@ -1688,8 +1725,9 @@ def global_haar_wavelet_reshape_varweighted(
         # values) would bias this normaliser; restrict to valid_grid. Falls back
         # to the full-grid variance if for some reason nothing is valid.
         _tvals = t_grid[:, :, c]
-        if bool(valid_grid.any()):
-            field_var = _tvals[valid_grid].var().clamp(min=1e-8)
+        _vc = _valid_c(c)
+        if bool(_vc.any()):
+            field_var = _tvals[_vc].var().clamp(min=1e-8)
         else:
             field_var = _tvals.var().clamp(min=1e-8)
         _n_active_lvl = max(num_levels - level_start, 1)
