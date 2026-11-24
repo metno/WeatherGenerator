@@ -1,0 +1,353 @@
+diff --git a/scripts/metno_checks/test_smooth_crps.py b/scripts/metno_checks/test_smooth_crps.py
+new file mode 100644
+index 0000000..7549a65
+--- /dev/null
++++ b/scripts/metno_checks/test_smooth_crps.py
+@@ -0,0 +1,137 @@
++"""global_smooth_crps: CRPS of Gaussian-smoothed fields (CPU).
++Usage: python test_smooth_crps.py
++  1) equal to an independent implementation (scipy Gaussian filter), with a hole in the
++     domain and missing target values
++  2) no block lattice: blocky members cost the same wherever their block edges are
++  3) dimensionless: multiplying all values by a constant does not change the loss
++  4) large-scale anchor: members shifted together away from the target cost more and more;
++     a perfect forecast costs 0
++  5) one member: absolute error of the smoothed fields
++  6) missing values: finite, gradients finite and 0 at the missing points; a hole does
++     not blow up the loss (no edge artefact)"""
++import numpy as np
++import torch
++from scipy.ndimage import gaussian_filter
++
++import weathergen.train.loss_modules.loss_functions as lf
++
++torch.manual_seed(0)
++ny, nx, C, E = 96, 80, 3, 2
++lat = np.linspace(55.0, 70.0, ny)[:, None].repeat(nx, 1)
++lon = np.linspace(0.0, 30.0, nx)[None, :].repeat(ny, 0)
++tmpl = "/tmp/tmpl_smooth_crps.npz"
++np.savez(tmpl, lat=lat.ravel(), lon=lon.ravel(), ny=ny, nx=nx)
++coords = torch.tensor(np.stack([lat.ravel(), lon.ravel()], 1), dtype=torch.float32)
++g = torch.Generator().manual_seed(1)
++Y = torch.randn(ny, nx, C, generator=g).cumsum(0).cumsum(1).reshape(-1, C) * 0.02
++X = Y.unsqueeze(0) + 0.3 * torch.randn(E, ny * nx, C, generator=g)
++SIG_KM, GRID_KM, ALPHA = 10.0, 2.5, 0.95          # sigma = 4 grid points
++KW = dict(template_path=tmpl, sigma_km=SIG_KM, grid_km=GRID_KM, crps_alpha=ALPHA)
++
++
++def loss_chs(y, x, c, **kw):
++    return lf.global_smooth_crps(y, x, c, None, None, **{**KW, **kw})[1]
++
++
++# 1) independent implementation -------------------------------------------------------------
++def reference(y, x, c, alpha=ALPHA, min_cov=0.5):
++    tm, (gy, gx) = lf._load_haar_template(reference, tmpl, "", "ref")
++    P = y.shape[0]
++    Ee = x.shape[0]
++    nan = torch.isnan(y)
++    y0 = torch.where(nan, torch.zeros_like(y), y)
++    x0 = torch.where(nan.unsqueeze(0), torch.zeros_like(x), x)
++    t_flat, p_flat, valid_cell, _ = lf._reshape_regrid_to_grid(
++        torch.cat([y0.repeat(1, Ee), nan.float()], 1),
++        torch.cat([x0.permute(1, 0, 2).reshape(P, Ee * C), nan.float()], 1),
++        c, tm, gy, gx, Ee * C + C, torch.device("cpu"))
++    Yg = t_flat[:, :C].reshape(gy, gx, C).permute(2, 0, 1).double().numpy()
++    Xg = p_flat[:, :Ee * C].reshape(gy, gx, Ee, C).permute(2, 3, 0, 1).double().numpy()
++    nan_g = (t_flat[:, Ee * C:].reshape(gy, gx, C).permute(2, 0, 1) > 0).numpy()
++    v = (valid_cell.view(gy, gx).numpy()[None] & ~nan_g).astype(float)
++    s = SIG_KM / GRID_KM
++    gam = alpha / (Ee * (Ee - 1)) + (1 - alpha) / Ee**2 if Ee > 1 else 0.0
++    out = []
++    for k in range(C):
++        blur = lambda f: gaussian_filter(f, s, mode="constant", cval=0.0, truncate=3.0)  # noqa: E731
++        den = blur(v[k])
++        st = blur(Yg[k] * v[k]) / np.maximum(den, 1e-6)
++        sp = [blur(np.where(v[k] > 0, Xg[m, k], Yg[k]) * v[k]) / np.maximum(den, 1e-6) for m in range(Ee)]
++        crps = np.mean([np.abs(p - st) for p in sp], 0)
++        for i in range(Ee):
++            for j in range(i + 1, Ee):
++                crps = crps - gam * np.abs(sp[i] - sp[j])
++        msk = (v[k] > 0) & (den >= min_cov)
++        out.append(crps[msk].mean() / st[msk].std(ddof=1))
++    return torch.tensor(out)
++
++
++hole = torch.from_numpy(~((lat.ravel() > 66) & (lon.ravel() > 22)))
++Yn = Y.clone()
++idx = torch.randperm(ny * nx, generator=g)[:80]
++Yn[idx, 1] = float("nan")
++with torch.no_grad():
++    for name, (y, x, c) in {"full domain": (Y, X, coords),
++                            "hole + missing values": (Yn[hole], X[:, hole], coords[hole])}.items():
++        a = loss_chs(y, x, c).double()
++        r = reference(y, x, c)
++        assert torch.allclose(a, r, rtol=1e-4), (name, a, r)
++        print(f"1) {name}: {a.numpy()} = reference {r.numpy()}")
++
++
++# 2) no block lattice ---------------------------------------------------------------------------
++def blocky(offset, block=32, amp=0.3, seed=3):
++    gg = torch.Generator().manual_seed(seed)
++    vals = amp * torch.randn(E, ny // block + 2, nx // block + 2, C, generator=gg)
++    iy = (torch.arange(ny) + (block - offset)) // block
++    ix = (torch.arange(nx) + (block - offset)) // block
++    return vals[:, iy][:, :, ix].reshape(E, -1, C)
++
++
++with torch.no_grad():
++    ratios = []
++    for seed in range(6):
++        a = loss_chs(Y, Y.unsqueeze(0) + blocky(0, seed=seed), coords).mean()
++        b = loss_chs(Y, Y.unsqueeze(0) + blocky(11, seed=seed), coords).mean()
++        ratios.append(float(a / b))
++    r = float(np.exp(np.mean(np.log(ratios))))
++    assert 0.8 < r < 1.25, ratios
++    print(f"2) blocks with edges on a 32-point lattice vs shifted by 11 points: cost ratio {r:.3f}")
++
++# 3) dimensionless --------------------------------------------------------------------------------
++with torch.no_grad():
++    a = loss_chs(Y, X, coords)
++    b = loss_chs(Y * 7.0, X * 7.0, coords)
++    assert torch.allclose(a, b, rtol=1e-4), (a, b)
++print("3) values x7: same loss")
++
++# 4) large-scale anchor -------------------------------------------------------------------------
++with torch.no_grad():
++    sd = Y.std(0)
++    vals = [float(loss_chs(Y, (Y + k * sd).unsqueeze(0).repeat(E, 1, 1), coords).mean())
++            for k in (0.0, 0.1, 0.3, 1.0)]
++    assert vals[0] < 1e-6 and vals[0] < vals[1] < vals[2] < vals[3], vals
++print("4) members shifted together by 0, 0.1, 0.3, 1 std: " + ", ".join(f"{v:.4f}" for v in vals))
++
++# 5) one member ---------------------------------------------------------------------------------
++with torch.no_grad():
++    a = loss_chs(Y, X[:1], coords).double()
++    r = reference(Y, X[:1], coords)
++    assert torch.allclose(a, r, rtol=1e-4), (a, r)
++print("5) one member: absolute error of the smoothed fields, as the reference")
++
++# 6) missing values: gradients -------------------------------------------------------------------
++Xg = X.clone().requires_grad_(True)
++Ynan = Y.clone()
++Ynan[idx, :] = float("nan")
++loss, _ = lf.global_smooth_crps(Ynan, Xg, coords, None, None, **KW)
++loss.backward()
++assert torch.isfinite(loss) and torch.isfinite(Xg.grad).all()
++assert Xg.grad[:, idx].abs().max() == 0.0 and Xg.grad.abs().sum() > 0
++with torch.no_grad():
++    full = loss_chs(Y, X, coords)
++    holed = loss_chs(Y[hole], X[:, hole], coords[hole])
++    rr = float((holed / full).max())
++    assert rr < 1.3, rr
++print(f"6) missing values: finite, gradients 0 at the missing points; hole / full domain {rr:.3f}")
++print("ALL SMOOTH CRPS TESTS PASSED")
+diff --git a/src/weathergen/train/loss_modules/loss_functions.py b/src/weathergen/train/loss_modules/loss_functions.py
+index 105f432..13133ac 100644
+--- a/src/weathergen/train/loss_modules/loss_functions.py
++++ b/src/weathergen/train/loss_modules/loss_functions.py
+@@ -2277,6 +2277,139 @@ def _crps_pointwise_mixed(target: torch.Tensor, preds: torch.Tensor, alpha: floa
+     return skill - c_e * spread
+ 
+ 
++def _gaussian_kernel_1d(sigma: float, dev, dtype=torch.float32) -> torch.Tensor:
++    """Normalised 1-D Gaussian kernel, standard deviation `sigma` (grid points), radius
++    ceil(3 sigma)."""
++    radius = max(1, int(math.ceil(3.0 * sigma)))
++    x = torch.arange(-radius, radius + 1, device=dev, dtype=dtype)
++    k = torch.exp(-0.5 * (x / sigma) ** 2)
++    return k / k.sum()
++
++
++def _gaussian_blur_2d(f: torch.Tensor, sigma: float) -> torch.Tensor:
++    """
++    Gaussian blur of the last two dims of f (any leading dims), as two 1-D convolutions,
++    zero outside the grid. Linear: gradients flow through it.
++    """
++    shape = f.shape
++    H, W = shape[-2], shape[-1]
++    k = _gaussian_kernel_1d(sigma, f.device, f.dtype)
++    r = (k.numel() - 1) // 2
++    x = f.reshape(-1, 1, H, W)
++    x = F.conv2d(x, k.view(1, 1, 1, -1), padding=(0, r))
++    x = F.conv2d(x, k.view(1, 1, -1, 1), padding=(r, 0))
++    return x.reshape(shape)
++
++
++def global_smooth_crps(
++    target: torch.Tensor,
++    pred: torch.Tensor,
++    target_coords_raw: torch.Tensor,
++    weights_channels: torch.Tensor | None,
++    weights_points: torch.Tensor | None,
++    template_path: str = "",
++    sigma_km: float = 25.0,
++    grid_km: float = 2.5,
++    crps_alpha: float = 0.95,
++    fair: bool = True,
++    min_coverage: float = 0.5,
++    regrid_method: str = "nearest",
++    stream_name: str = "",
++):
++    """
++    CRPS of Gaussian-smoothed fields: every member is compared with the target after both
++    are smoothed with the same Gaussian (standard deviation sigma_km). Scores the large
++    scales of every member without any block lattice (replaces the block-mean term
++    member_ll_mse_weight of the Haar CRPS, whose 2^L x 2^L block means pushed block-wise
++    corrections). A proper score: it rewards members that agree with the target at the
++    large scale and also honest spread there.
++
++    Steps (per channel):
++      1. regrid target and members to the template grid (shared helper, as the Haar
++         losses); NaN targets -> 0 in target and members; members := target on invalid
++         cells (no nearby data point, or NaN target)
++      2. normalised smoothing with the valid mask v (no edge or hole artefacts):
++             S[f] = G * (v f) / G * v,   G = Gaussian with sigma = sigma_km / grid_km points
++      3. pointwise CRPS (almost fair, crps_alpha) between S[members] and S[target], on the
++         cells that are valid and well covered (G * v >= min_coverage)
++      4. mean over those cells, divided by the standard deviation of S[target] over the
++         same cells (dimensionless, like level_norm)
++
++    Args:
++        target          : (num_points, num_channels)
++        pred            : (ens_size, num_points, num_channels); one member -> absolute error
++        sigma_km        : standard deviation of the Gaussian, km (25 km ~ the spread of a
++                          box of 80 km)
++        grid_km         : spacing of the template grid, km (CARRA2: 2.5)
++        crps_alpha      : 1 = fair CRPS, < 1 almost fair (fair=False -> standard CRPS)
++        min_coverage    : minimum smoothed valid fraction G * v of a scored cell
++    Returns:
++        loss     : scalar
++        loss_chs : (num_channels,)
++    """
++    _self = global_smooth_crps
++    if pred.dim() == 2:
++        pred = pred.unsqueeze(0)
++    num_points, C = target.shape
++    E = pred.shape[0]
++    dev = target.device
++    alpha = float(crps_alpha) if (fair and E > 1) else 0.0
++
++    nan_t = torch.isnan(target)
++    tgt = torch.where(nan_t, torch.zeros_like(target), target).float()
++    prd = torch.where(nan_t.unsqueeze(0), torch.zeros_like(pred), pred).float()
++
++    def _zero():
++        return prd.sum() * 0.0, torch.zeros(C, device=dev)
++
++    template_grid, ny_nx = _load_haar_template(_self, template_path, stream_name, "smooth")
++    if template_grid is None:
++        return _zero()
++    ny, nx = ny_nx
++
++    nan_ind = nan_t.float()
++    p_cols = prd.permute(1, 0, 2).reshape(num_points, E * C)
++    t_cols = tgt.repeat(1, E)
++    t_flat, p_flat, valid_cell, empty = _reshape_regrid_to_grid(
++        torch.cat([t_cols, nan_ind], dim=1),
++        torch.cat([p_cols, nan_ind], dim=1),
++        target_coords_raw, template_grid, ny, nx, E * C + C, dev,
++        regrid_method=regrid_method, stream_name=stream_name, _report_owner=_self,
++    )
++    if empty:
++        return _zero()
++
++    t_g = t_flat[:, :C].reshape(ny, nx, C).permute(2, 0, 1)                # (C,ny,nx)
++    p_g = p_flat[:, : E * C].reshape(ny, nx, E, C).permute(2, 3, 0, 1)     # (E,C,ny,nx)
++    nan_g = t_flat[:, E * C:].reshape(ny, nx, C).permute(2, 0, 1) > 0      # (C,ny,nx)
++    valid = valid_cell.view(1, ny, nx) & ~nan_g                            # (C,ny,nx)
++    p_g = torch.where(valid.unsqueeze(0), p_g, t_g.detach().unsqueeze(0))
++    v = valid.float()
++
++    sigma = float(sigma_km) / float(grid_km)
++    den = _gaussian_blur_2d(v, sigma)                                       # (C,ny,nx)
++    den_safe = den.clamp(min=1e-6)
++    s_t = _gaussian_blur_2d(t_g * v, sigma) / den_safe                      # (C,ny,nx)
++    s_p = _gaussian_blur_2d(p_g * v.unsqueeze(0), sigma) / den_safe.unsqueeze(0)
++
++    m = (valid & (den >= min_coverage)).float()                             # scored cells
++    n = m.sum(dim=(1, 2))                                                   # (C,)
++    crps = _crps_pointwise_mixed(s_t, s_p, alpha)                           # (C,ny,nx)
++    mean_crps = (crps * m).sum(dim=(1, 2)) / n.clamp(min=1.0)
++    # typical size of the smoothed target (no gradient: target only)
++    with torch.no_grad():
++        mu = (s_t * m).sum(dim=(1, 2)) / n.clamp(min=1.0)
++        var = (((s_t - mu.view(C, 1, 1)) ** 2) * m).sum(dim=(1, 2)) / (n - 1).clamp(min=1.0)
++        scale = var.sqrt().clamp(min=1e-6)
++    loss_chs = torch.where(n > 1, mean_crps / scale, torch.zeros_like(mean_crps))
++
++    if weights_channels is not None:
++        loss = torch.mean(loss_chs * weights_channels.to(dev))
++    else:
++        loss = torch.mean(loss_chs)
++    return loss, loss_chs
++
++
+ def global_haar_wavelet_reshape_varweighted_crps(
+     target: torch.Tensor,
+     pred: torch.Tensor,
+diff --git a/src/weathergen/train/loss_modules/loss_module_physical.py b/src/weathergen/train/loss_modules/loss_module_physical.py
+index b0511e9..f7e1859 100644
+--- a/src/weathergen/train/loss_modules/loss_module_physical.py
++++ b/src/weathergen/train/loss_modules/loss_module_physical.py
+@@ -121,6 +121,7 @@ class LossPhysical(LossModuleBase):
+             "global_haar_energy_reshape",
+             "global_fft_mse",
+             "healpix_cell_pattern",
++            "global_smooth_crps",
+         )
+         self.loss_fcts = []
+         for name, params in loss_fcts.items():
+@@ -381,6 +382,32 @@ class LossPhysical(LossModuleBase):
+             haar_random_shift=haar_random_shift,
+         )
+ 
++    @staticmethod
++    def _loss_global_smooth_crps(
++        target, pred, target_coords_raw, weights_channels,
++        stream_name="", template_path="", **kwargs,
++    ):
++        """kwargs: options of loss_fns.global_smooth_crps (sigma_km, grid_km, crps_alpha,
++        fair, min_coverage, regrid_method); unknown keys are dropped (reported once)."""
++        if target.shape[0] == 0:
++            return (
++                torch.tensor(0.0, device=target.device, requires_grad=True),
++                torch.zeros(target.shape[-1], device=target.device),
++            )
++        import inspect
++
++        known = set(inspect.signature(loss_fns.global_smooth_crps).parameters)
++        unknown = sorted(k for k in kwargs if k not in known)
++        if unknown and not getattr(loss_fns.global_smooth_crps, "_unknown_reported", False):
++            loss_fns.global_smooth_crps._unknown_reported = True
++            print(f"[global_smooth_crps] ignoring unknown options: {unknown}")
++        kwargs = {k: v for k, v in kwargs.items() if k in known}
++        return loss_fns.global_smooth_crps(
++            target, pred, target_coords_raw.to(target.device),
++            weights_channels=weights_channels, weights_points=None,
++            template_path=template_path, stream_name=stream_name, **kwargs,
++        )
++
+     @staticmethod
+     def _loss_global_fft(
+         target, pred, target_coords_raw, weights_channels,
+@@ -681,6 +708,20 @@ class LossPhysical(LossModuleBase):
+                                 **_ov,
+                             )
+ 
++                        elif loss_fct_name == "global_smooth_crps":
++                            # per-stream overrides via `smooth_overrides`
++                            _ov = dict(loss_fct_params)
++                            _ov.update(stream_info.get("smooth_overrides", {}))
++                            if "regrid_method" in stream_info:
++                                _ov["regrid_method"] = stream_info["regrid_method"]
++                            _ov.pop("template_path", None)
++                            loss_lfct, loss_lfct_chs = self._loss_global_smooth_crps(
++                                target, pred, targets_coords_batch[target_idx],
++                                weights_channels, stream_name=stream_name,
++                                template_path=stream_info.get("template_path", ""),
++                                **_ov,
++                            )
++
+                         elif loss_fct_name == "global_fft_mse":
+                             loss_lfct, loss_lfct_chs = self._loss_global_fft(
+                                 target, pred, targets_coords_batch[target_idx],

@@ -2277,6 +2277,139 @@ def _crps_pointwise_mixed(target: torch.Tensor, preds: torch.Tensor, alpha: floa
     return skill - c_e * spread
 
 
+def _gaussian_kernel_1d(sigma: float, dev, dtype=torch.float32) -> torch.Tensor:
+    """Normalised 1-D Gaussian kernel, standard deviation `sigma` (grid points), radius
+    ceil(3 sigma)."""
+    radius = max(1, int(math.ceil(3.0 * sigma)))
+    x = torch.arange(-radius, radius + 1, device=dev, dtype=dtype)
+    k = torch.exp(-0.5 * (x / sigma) ** 2)
+    return k / k.sum()
+
+
+def _gaussian_blur_2d(f: torch.Tensor, sigma: float) -> torch.Tensor:
+    """
+    Gaussian blur of the last two dims of f (any leading dims), as two 1-D convolutions,
+    zero outside the grid. Linear: gradients flow through it.
+    """
+    shape = f.shape
+    H, W = shape[-2], shape[-1]
+    k = _gaussian_kernel_1d(sigma, f.device, f.dtype)
+    r = (k.numel() - 1) // 2
+    x = f.reshape(-1, 1, H, W)
+    x = F.conv2d(x, k.view(1, 1, 1, -1), padding=(0, r))
+    x = F.conv2d(x, k.view(1, 1, -1, 1), padding=(r, 0))
+    return x.reshape(shape)
+
+
+def global_smooth_crps(
+    target: torch.Tensor,
+    pred: torch.Tensor,
+    target_coords_raw: torch.Tensor,
+    weights_channels: torch.Tensor | None,
+    weights_points: torch.Tensor | None,
+    template_path: str = "",
+    sigma_km: float = 25.0,
+    grid_km: float = 2.5,
+    crps_alpha: float = 0.95,
+    fair: bool = True,
+    min_coverage: float = 0.5,
+    regrid_method: str = "nearest",
+    stream_name: str = "",
+):
+    """
+    CRPS of Gaussian-smoothed fields: every member is compared with the target after both
+    are smoothed with the same Gaussian (standard deviation sigma_km). Scores the large
+    scales of every member without any block lattice (replaces the block-mean term
+    member_ll_mse_weight of the Haar CRPS, whose 2^L x 2^L block means pushed block-wise
+    corrections). A proper score: it rewards members that agree with the target at the
+    large scale and also honest spread there.
+
+    Steps (per channel):
+      1. regrid target and members to the template grid (shared helper, as the Haar
+         losses); NaN targets -> 0 in target and members; members := target on invalid
+         cells (no nearby data point, or NaN target)
+      2. normalised smoothing with the valid mask v (no edge or hole artefacts):
+             S[f] = G * (v f) / G * v,   G = Gaussian with sigma = sigma_km / grid_km points
+      3. pointwise CRPS (almost fair, crps_alpha) between S[members] and S[target], on the
+         cells that are valid and well covered (G * v >= min_coverage)
+      4. mean over those cells, divided by the standard deviation of S[target] over the
+         same cells (dimensionless, like level_norm)
+
+    Args:
+        target          : (num_points, num_channels)
+        pred            : (ens_size, num_points, num_channels); one member -> absolute error
+        sigma_km        : standard deviation of the Gaussian, km (25 km ~ the spread of a
+                          box of 80 km)
+        grid_km         : spacing of the template grid, km (CARRA2: 2.5)
+        crps_alpha      : 1 = fair CRPS, < 1 almost fair (fair=False -> standard CRPS)
+        min_coverage    : minimum smoothed valid fraction G * v of a scored cell
+    Returns:
+        loss     : scalar
+        loss_chs : (num_channels,)
+    """
+    _self = global_smooth_crps
+    if pred.dim() == 2:
+        pred = pred.unsqueeze(0)
+    num_points, C = target.shape
+    E = pred.shape[0]
+    dev = target.device
+    alpha = float(crps_alpha) if (fair and E > 1) else 0.0
+
+    nan_t = torch.isnan(target)
+    tgt = torch.where(nan_t, torch.zeros_like(target), target).float()
+    prd = torch.where(nan_t.unsqueeze(0), torch.zeros_like(pred), pred).float()
+
+    def _zero():
+        return prd.sum() * 0.0, torch.zeros(C, device=dev)
+
+    template_grid, ny_nx = _load_haar_template(_self, template_path, stream_name, "smooth")
+    if template_grid is None:
+        return _zero()
+    ny, nx = ny_nx
+
+    nan_ind = nan_t.float()
+    p_cols = prd.permute(1, 0, 2).reshape(num_points, E * C)
+    t_cols = tgt.repeat(1, E)
+    t_flat, p_flat, valid_cell, empty = _reshape_regrid_to_grid(
+        torch.cat([t_cols, nan_ind], dim=1),
+        torch.cat([p_cols, nan_ind], dim=1),
+        target_coords_raw, template_grid, ny, nx, E * C + C, dev,
+        regrid_method=regrid_method, stream_name=stream_name, _report_owner=_self,
+    )
+    if empty:
+        return _zero()
+
+    t_g = t_flat[:, :C].reshape(ny, nx, C).permute(2, 0, 1)                # (C,ny,nx)
+    p_g = p_flat[:, : E * C].reshape(ny, nx, E, C).permute(2, 3, 0, 1)     # (E,C,ny,nx)
+    nan_g = t_flat[:, E * C:].reshape(ny, nx, C).permute(2, 0, 1) > 0      # (C,ny,nx)
+    valid = valid_cell.view(1, ny, nx) & ~nan_g                            # (C,ny,nx)
+    p_g = torch.where(valid.unsqueeze(0), p_g, t_g.detach().unsqueeze(0))
+    v = valid.float()
+
+    sigma = float(sigma_km) / float(grid_km)
+    den = _gaussian_blur_2d(v, sigma)                                       # (C,ny,nx)
+    den_safe = den.clamp(min=1e-6)
+    s_t = _gaussian_blur_2d(t_g * v, sigma) / den_safe                      # (C,ny,nx)
+    s_p = _gaussian_blur_2d(p_g * v.unsqueeze(0), sigma) / den_safe.unsqueeze(0)
+
+    m = (valid & (den >= min_coverage)).float()                             # scored cells
+    n = m.sum(dim=(1, 2))                                                   # (C,)
+    crps = _crps_pointwise_mixed(s_t, s_p, alpha)                           # (C,ny,nx)
+    mean_crps = (crps * m).sum(dim=(1, 2)) / n.clamp(min=1.0)
+    # typical size of the smoothed target (no gradient: target only)
+    with torch.no_grad():
+        mu = (s_t * m).sum(dim=(1, 2)) / n.clamp(min=1.0)
+        var = (((s_t - mu.view(C, 1, 1)) ** 2) * m).sum(dim=(1, 2)) / (n - 1).clamp(min=1.0)
+        scale = var.sqrt().clamp(min=1e-6)
+    loss_chs = torch.where(n > 1, mean_crps / scale, torch.zeros_like(mean_crps))
+
+    if weights_channels is not None:
+        loss = torch.mean(loss_chs * weights_channels.to(dev))
+    else:
+        loss = torch.mean(loss_chs)
+    return loss, loss_chs
+
+
 def global_haar_wavelet_reshape_varweighted_crps(
     target: torch.Tensor,
     pred: torch.Tensor,

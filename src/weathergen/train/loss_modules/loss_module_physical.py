@@ -121,6 +121,7 @@ class LossPhysical(LossModuleBase):
             "global_haar_energy_reshape",
             "global_fft_mse",
             "healpix_cell_pattern",
+            "global_smooth_crps",
         )
         self.loss_fcts = []
         for name, params in loss_fcts.items():
@@ -379,6 +380,32 @@ class LossPhysical(LossModuleBase):
             energy_window_stride=energy_window_stride,
             energy_window_random_shift=energy_window_random_shift,
             haar_random_shift=haar_random_shift,
+        )
+
+    @staticmethod
+    def _loss_global_smooth_crps(
+        target, pred, target_coords_raw, weights_channels,
+        stream_name="", template_path="", **kwargs,
+    ):
+        """kwargs: options of loss_fns.global_smooth_crps (sigma_km, grid_km, crps_alpha,
+        fair, min_coverage, regrid_method); unknown keys are dropped (reported once)."""
+        if target.shape[0] == 0:
+            return (
+                torch.tensor(0.0, device=target.device, requires_grad=True),
+                torch.zeros(target.shape[-1], device=target.device),
+            )
+        import inspect
+
+        known = set(inspect.signature(loss_fns.global_smooth_crps).parameters)
+        unknown = sorted(k for k in kwargs if k not in known)
+        if unknown and not getattr(loss_fns.global_smooth_crps, "_unknown_reported", False):
+            loss_fns.global_smooth_crps._unknown_reported = True
+            print(f"[global_smooth_crps] ignoring unknown options: {unknown}")
+        kwargs = {k: v for k, v in kwargs.items() if k in known}
+        return loss_fns.global_smooth_crps(
+            target, pred, target_coords_raw.to(target.device),
+            weights_channels=weights_channels, weights_points=None,
+            template_path=template_path, stream_name=stream_name, **kwargs,
         )
 
     @staticmethod
@@ -678,6 +705,20 @@ class LossPhysical(LossModuleBase):
                             loss_lfct, loss_lfct_chs = self._loss_healpix_cell_pattern(
                                 target, pred, targets_coords_batch[target_idx],
                                 weights_channels, stream_name=stream_name,
+                                **_ov,
+                            )
+
+                        elif loss_fct_name == "global_smooth_crps":
+                            # per-stream overrides via `smooth_overrides`
+                            _ov = dict(loss_fct_params)
+                            _ov.update(stream_info.get("smooth_overrides", {}))
+                            if "regrid_method" in stream_info:
+                                _ov["regrid_method"] = stream_info["regrid_method"]
+                            _ov.pop("template_path", None)
+                            loss_lfct, loss_lfct_chs = self._loss_global_smooth_crps(
+                                target, pred, targets_coords_batch[target_idx],
+                                weights_channels, stream_name=stream_name,
+                                template_path=stream_info.get("template_path", ""),
                                 **_ov,
                             )
 
