@@ -273,7 +273,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                         )
                     ds = dataset(filename=filename, **kwargs)
                 else:
-                    ds = dataset.init_empty()
+                    ds.init_empty()
 
                 streams_datasets[stream_name].readers += [ds]
 
