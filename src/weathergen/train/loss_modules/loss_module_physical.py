@@ -270,6 +270,7 @@ class LossPhysical(LossModuleBase):
         stream_name="", template_path="",
         detail_weight=2.0, num_levels=3, var_weight_epsilon=1e-3,
         regrid_method="nearest", level_start=0, haar_random_shift=False,
+        level_norm=False,
     ):
         if target.shape[0] == 0:
             return (
@@ -287,6 +288,7 @@ class LossPhysical(LossModuleBase):
             regrid_method=regrid_method,
             level_start=level_start,
             haar_random_shift=haar_random_shift,
+            level_norm=level_norm,
         )
 
     @staticmethod

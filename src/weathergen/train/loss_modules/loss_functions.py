@@ -1208,11 +1208,18 @@ def global_haar_wavelet_reshape_varweighted(
     regrid_method: str = "nearest",
     level_start: int = 0,
     haar_random_shift: bool = False,
+    level_norm: bool = False,
 ):
     """
     Global 2D Haar wavelet MSE with inverse-variance spatial weighting.
     haar_random_shift: random offset of the Haar block lattice in training
     (see _haar_grid_offset).
+    level_norm: divide every level by s_l**2, the mean square of the target detail
+    coefficients at that level (per sample and channel, over valid positions), and use
+    var_weight_epsilon * s_l**2 in the weights. Puts all levels on the same footing
+    (without it the coarsest levels dominate). The level losses are then dimensionless,
+    so they are not divided by the field variance; only fully valid positions enter the
+    weighted means (see _haar_level_valid).
 
     Identical to global_haar_wavelet_reshape except that at each Haar level
     the detail subband MSE is weighted by the inverse of the local target
@@ -1479,10 +1486,13 @@ def global_haar_wavelet_reshape_varweighted(
         t_field    = t_grid[:, :, c]
         p_field    = p_grid[:, :, c]
         level_loss = torch.tensor(0.0, device=dev)
+        level_norm_loss = torch.tensor(0.0, device=dev)
+        v_all = valid_grid.float()
 
         for lvl in range(num_levels):
             t_LL, t_LH, t_HL, t_HH = haar_2d(t_field)
             p_LL, p_LH, p_HL, p_HH = haar_2d(p_field)
+            v_all = _haar_level_valid(v_all)
 
             # local variance of target at this level estimated from its own
             # detail coefficients — exact for orthonormal Haar, free to compute
@@ -1492,7 +1502,11 @@ def global_haar_wavelet_reshape_varweighted(
             ).detach()   # detach: weight is a constant, not part of gradient
 
             # inverse variance weight — smooth regions (low var) get high weight
-            inv_var_weight = 1.0 / (local_var + var_weight_epsilon)
+            if level_norm:
+                s2 = _haar_level_s2(local_var, v_all)
+                inv_var_weight = v_all / (local_var + var_weight_epsilon * s2)
+            else:
+                inv_var_weight = 1.0 / (local_var + var_weight_epsilon)
 
             # active mask: exclude cells where all detail bands are identical
 #            _active_mask = (
@@ -1514,7 +1528,10 @@ def global_haar_wavelet_reshape_varweighted(
                 # still traversed via the cascade, just not penalised). Default
                 # level_start=0 counts every level, unchanged.
                 if lvl >= level_start:
-                    level_loss = level_loss + (lh_loss + hl_loss + hh_loss) / 3.0
+                    if level_norm:
+                        level_norm_loss = level_norm_loss + (lh_loss + hl_loss + hh_loss) / (3.0 * s2)
+                    else:
+                        level_loss = level_loss + (lh_loss + hl_loss + hh_loss) / 3.0
 
                 # ----------------------------------------------------------------
                 # DEBUG: plot subbands and inverse variance weight
@@ -1677,6 +1694,8 @@ def global_haar_wavelet_reshape_varweighted(
             field_var = _tvals.var().clamp(min=1e-8)
         _n_active_lvl = max(num_levels - level_start, 1)
         loss_chs[c] = level_loss / (_n_active_lvl * field_var)
+        if level_norm:
+            loss_chs[c] = loss_chs[c] + level_norm_loss / _n_active_lvl
 
     if weights_channels is not None:
         loss = torch.mean(loss_chs * weights_channels.to(dev))
@@ -2167,6 +2186,34 @@ def global_haar_ll_reshape_varweighted(
 
     return loss, loss_chs
 
+def _haar_level_valid(v: torch.Tensor) -> torch.Tensor:
+    """
+    Validity of the Haar coefficients of the next level, from the validity v (1 = valid
+    cell, 0 = invalid or padding; shape (..., H, W), H and W even) of the current level:
+    1 where the whole 2x2 block is valid. Used with level_norm for the statistics s_l and
+    to keep only fully valid positions in the weighted means. A block that straddles the
+    edge of the valid cells is left out: there the members are set equal to the target
+    (invalid cells) or both are 0 (padding), so the error field jumps to 0 at the edge and
+    the block would show a fine-scale "error" made by the masking, not by the members.
+    """
+    a, b = v[..., 0::2, 0::2], v[..., 0::2, 1::2]
+    c, d = v[..., 1::2, 0::2], v[..., 1::2, 1::2]
+    return torch.minimum(torch.minimum(a, b), torch.minimum(c, d))
+
+
+def _haar_level_s2(local_var: torch.Tensor, v_all: torch.Tensor) -> torch.Tensor:
+    """
+    s_l**2: mean square of the target detail coefficients at one level, per channel,
+    over fully valid positions. local_var = t_LH**2 + t_HL**2 + t_HH**2, shape (C, h, w)
+    (or (h, w)); v_all with the same shape. Returns shape (C,) (or a scalar), floored.
+    No gradient (target only).
+    """
+    num = (local_var * v_all).sum(dim=(-2, -1))
+    den = 3.0 * v_all.sum(dim=(-2, -1))
+    s2 = torch.where(den > 0, num / den.clamp(min=1.0), torch.zeros_like(num))
+    return s2.detach().clamp(min=1e-12)
+
+
 def _crps_pointwise_mixed(target: torch.Tensor, preds: torch.Tensor, alpha: float) -> torch.Tensor:
     """
     Per-point ensemble CRPS with a mixed spread normalisation.
@@ -2212,6 +2259,7 @@ def global_haar_wavelet_reshape_varweighted_crps(
     member_ll_mse_weight: float = 0.0,
     crps_alpha: float = 1.0,
     haar_random_shift: bool = False,
+    level_norm: bool = False,
 ):
     """
     Global 2D Haar wavelet kernel CRPS with inverse-variance spatial weighting.
@@ -2258,6 +2306,14 @@ def global_haar_wavelet_reshape_varweighted_crps(
         crps_alpha          : 1 = fair CRPS, <1 = "almost fair" mix with the standard CRPS
         haar_random_shift   : random offset of the Haar block lattice in training
                               (see _haar_grid_offset)
+        level_norm          : divide every level by s_l, the RMS of the target detail
+                              coefficients at that level (per sample and channel, over
+                              valid positions), and use var_weight_epsilon * s_l**2 in
+                              the weights. Puts all levels on the same footing (without
+                              it the coarsest levels dominate). The level losses are then
+                              dimensionless, so `normalization` is not applied to them;
+                              only fully valid positions enter the weighted means (see
+                              _haar_level_valid).
 
     Returns:
         loss     : scalar
@@ -2337,10 +2393,12 @@ def global_haar_wavelet_reshape_varweighted_crps(
     sy, sx = _haar_grid_offset(factor, haar_random_shift, _self, stream_name)
     ny_p = int(math.ceil((ny + sy) / factor)) * factor
     nx_p = int(math.ceil((nx + sx) / factor)) * factor
+    vmask_p = valid.float()
     if ny_p > ny or nx_p > nx:
         pad4 = (sx, nx_p - nx - sx, sy, ny_p - ny - sy)
         t_g = F.pad(t_g, pad4)
         p_g = F.pad(p_g, pad4)
+        vmask_p = F.pad(vmask_p, pad4)
 
     if level_weights is None:
         lw = [1.0] * num_levels
@@ -2353,20 +2411,30 @@ def global_haar_wavelet_reshape_varweighted_crps(
     w_used = max(w_used, 1e-8)
 
     t_field, p_field = t_g, p_g
+    v_all = vmask_p                                      # (C,ny_p,nx_p) 1 = valid cell
     level_loss = torch.zeros(C, device=dev)
+    level_norm_loss = torch.zeros(C, device=dev)
     for lvl in range(num_levels):
         t_LL, t_LH, t_HL, t_HH = haar_2d(t_field)     # (C,h,w)
         p_LL, p_LH, p_HL, p_HH = haar_2d(p_field)     # (E,C,h,w)
+        v_all = _haar_level_valid(v_all)
         if lvl >= level_start and lw[lvl] != 0.0:
             local_var = (t_LH**2 + t_HL**2 + t_HH**2).detach()
-            inv_var_weight = 1.0 / (local_var + var_weight_epsilon)
+            if level_norm:
+                s2 = _haar_level_s2(local_var, v_all)                       # (C,)
+                inv_var_weight = v_all / (local_var + var_weight_epsilon * s2.view(C, 1, 1))
+            else:
+                inv_var_weight = 1.0 / (local_var + var_weight_epsilon)
             w_sum = inv_var_weight.sum(dim=(1, 2)).clamp(min=1e-8)          # (C,)
             band = 0.0
             for t_b, p_b in ((t_LH, p_LH), (t_HL, p_HL), (t_HH, p_HH)):
                 band = band + (
                     _crps_pointwise_mixed(t_b, p_b, alpha) * inv_var_weight
                 ).sum(dim=(1, 2)) / w_sum
-            level_loss = level_loss + lw[lvl] * band / 3.0
+            if level_norm:
+                level_norm_loss = level_norm_loss + lw[lvl] * band / (3.0 * s2.sqrt())
+            else:
+                level_loss = level_loss + lw[lvl] * band / 3.0
         t_field, p_field = t_LL, p_LL
 
     # optional CRPS on the coarsest approximation band (large-scale content)
@@ -2381,6 +2449,9 @@ def global_haar_wavelet_reshape_varweighted_crps(
     else:
         denom = torch.ones(C, device=dev)
     loss_chs = level_loss / (w_used * denom)
+    if level_norm:
+        # dimensionless already (each level divided by s_l): no per-channel normaliser
+        loss_chs = loss_chs + level_norm_loss / w_used
 
     # optional per-member MSE of the coarse block means (orthonormal Haar: LL / 2**L)
     if member_ll_mse_weight > 0.0:
