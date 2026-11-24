@@ -342,11 +342,17 @@ class Trainer(TrainerBase):
         self.target_and_aux_calculators = self.get_target_aux_calculators(self.training_cfg)
         self.target_and_aux_calculators_val = self.get_target_aux_calculators(self.validation_cfg)
 
-        # if with_fsdp then parameter count is unreliable
+        # parameter count, also in multi-GPU runs: under FSDP2 the parameters are DTensors whose
+        # size() is the global shape, so the count is the full model (see
+        # scripts/metno_checks/test_param_count_fsdp.py); a DDP-wrapped model (DDP without
+        # FSDP) exposes the model as .module
         if is_root():
-            # ddp-wrapped model does not expose this function
-            if not cf.with_ddp:
-                self.model.print_num_parameters()
+            model_unwrapped = (
+                self.model.module
+                if isinstance(self.model, torch.nn.parallel.DistributedDataParallel)
+                else self.model
+            )
+            model_unwrapped.print_num_parameters()
 
         # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
         # aiming for beta1=0.9 and beta2=0.95 following the MAE paper
