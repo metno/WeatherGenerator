@@ -27,6 +27,14 @@ Same structure as `LatentPredictionHeadTransformer` (Linear bottleneck -> num_bl
   latent size of a frozen teacher).
 
 Only the levels listed in the JEPA `levels` config get an output; all levels are input.
+
+Option `residual: true`: prediction = input state (post-norm latent of the level) + output
+projection, the latter zero-initialised: the predictor starts as the identity and its width
+is no bottleneck of the output (needs out_dim == latent size of the level).
+
+With a frozen teacher (latent downscaler) the predictor is the map into the teacher's latent
+and is kept in the supervised stage (model/latent_adapter.py); with an EMA teacher it is a
+pretraining device and is discarded.
 """
 
 from __future__ import annotations
@@ -103,6 +111,19 @@ class MultiLevelLatentPredictor(nn.Module):
             "MultiLevelLatentPredictor assumes one latent token per cell (ae_local_num_queries=1)"
         )
 
+        # residual: prediction = input state + correction (proj_out zero-initialised), so the
+        # predictor starts as the identity and its width is no bottleneck for the output
+        self.residual = bool(loss_conf.get("residual", False))
+        if self.residual:
+            bad = {
+                lvl: (dims_in[lvl], out_dims[lvl])
+                for lvl in out_dims
+                if dims_in[lvl] != out_dims[lvl]
+            }
+            assert not bad, (
+                f"{name}: residual predictor needs out_dim == latent size per level, got "
+                f"(latent size, out_dim) {bad}"
+            )
         dim = loss_conf["intermediate_dim"]
         num_blocks = loss_conf["num_blocks"]
         num_heads = loss_conf["num_heads"]
@@ -158,6 +179,9 @@ class MultiLevelLatentPredictor(nn.Module):
         self.proj_out = nn.ModuleDict(
             {str(lvl): nn.Linear(dim, out_dims[lvl], bias=False) for lvl in self.out_levels}
         )
+        if self.residual:
+            for lin in self.proj_out.values():
+                nn.init.zeros_(lin.weight)
 
         self.num_deep_targets = num_deep_targets
         if num_deep_targets > 0:
@@ -193,7 +217,10 @@ class MultiLevelLatentPredictor(nn.Module):
         or None).
         """
         xs, sizes = [], []
+        skip = {}
         for i, lvl in enumerate(self.levels):
+            if self.residual and lvl in self.out_levels:
+                skip[lvl] = tokens[lvl][:, self.num_aux :]
             t = self.proj_in[str(lvl)](tokens[lvl])
             aux, cells = t[:, : self.num_aux], t[:, self.num_aux :]
             xyz = getattr(self, f"xyz_{lvl}")
@@ -215,6 +242,8 @@ class MultiLevelLatentPredictor(nn.Module):
             if lvl not in self.out_levels:
                 continue
             pred = self.proj_out[str(lvl)](x_l[:, self.num_aux :])
+            if self.residual:
+                pred = pred + skip[lvl].to(pred.dtype)
             out[lvl] = pred
             if deep is not None:
                 deep[lvl] = [proj(pred) for proj in self.deep_proj[str(lvl)]]

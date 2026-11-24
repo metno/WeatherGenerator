@@ -9,16 +9,22 @@
 #   stage 1: CARRA2 autoencoder (single latent level hl8)               -> run AE_RUN
 #   stage 2: JEPA, student encoders (ERA5 @ hl5, SEVIRI / AVHRR @ hl8) learn to predict the
 #            frozen CARRA2 latent (FrozenTeacher = AE_RUN)            -> run JEPA_RUN
-#   stage 3: this file. The JEPA predictor is discarded; the stage-2 encoders (+ latent
-#            cascade) feed the stage-1 CARRA2 decoder directly, trained with a physical
-#            loss on CARRA2. Which parts stay frozen is configurable (fixed .. flexible).
+#   stage 3: this file. The stage-2 encoders (+ latent cascade) feed the stage-1 CARRA2
+#            decoder, trained with a physical loss on CARRA2. With the frozen CARRA2
+#            teacher the stage-2 predictor learned the map into the CARRA2 latent
+#            coordinates: it is KEPT as `latent_adapter` (default here) between latent and
+#            decoder. Which parts stay frozen is configurable (fixed .. flexible).
+#            (Stage 3 after an SSL run with an EMA teacher: no latent_adapter, the predictor
+#            is discarded and only the encoder is loaded.)
 #
 # Copy the blocks into your full stage-3 base config (--base-config). model_input,
 # target_input and losses must replace the base config's entries (not merge with them).
 #
-# Requirement: the student's hl8 latent size must equal the autoencoder's latent size
-# (set latent_levels[hl8].dim_embed already in stage 2), otherwise the decoder weights do
-# not fit; init_from stops with a shape-mismatch error.
+# Latent sizes: the CARRA2 decoder reads the adapter output, whose size is the stage-2
+# predictor's out_dim (= the autoencoder's latent size), so the student's own hl8 latent
+# size is free. Without latent_adapter the student's hl8 latent size must equal the
+# autoencoder's latent size (latent_levels[hl8].dim_embed); otherwise init_from stops with a
+# shape-mismatch error.
 # ---------------------------------------------------------------------------------------
 
 # ---- latent: same levels / domains / sizes as stage 2 ---------------------------------
@@ -27,7 +33,8 @@ latent_levels:
     domain: {type: points, points_file: carra2_scandi_domain.npz, pad_rings: 2}
   - level: 8
     domain: {type: points, points_file: carra2_scandi_domain.npz, pad_rings: 0}
-    # dim_embed: 2048                 # = CARRA2 autoencoder latent size
+    # dim_embed: 2048                 # = CARRA2 autoencoder latent size (needed without
+                                      # latent_adapter, or with a residual predictor)
 
 # encoder-side cascade (loaded from stage 2). Its cycles share weights, so num_cycles can
 # be raised in stage 3 (more hl5 <-> hl8 exchange, same weights, no new parameters).
@@ -88,19 +95,44 @@ init_from:
       - 'target_token_engines\.CARRA2\..*'
       - 'pred_heads\.CARRA2\..*'
 
+# ---- kept stage-2 predictor (latent alignment to the CARRA2 latent) ----------------------
+# Rebuilt from JEPA_RUN's JEPA loss config (architecture copied once into
+# latent_adapter.resolved, saved with this run) and loaded from its checkpoint as an extra
+# init_from source (predictor + its input post-norms + deep-SSL fusion if used). It runs as
+# in stage 2: cells without student data (satellite gaps at hl8) get the mask embedding.
+# Its output replaces the decoder input of `levels`; the latent itself (and multi-step
+# roll-outs) are unchanged. Parameters: latent_adapter.* (freeze / lr like any module).
+# Refused for a run with an EMA teacher (predictor = pretraining device, discard it) unless
+# allow_ema_teacher: true. If JEPA_RUN used deep SSL, keep its training_config.deep_ssl
+# (enabled, tap_after) here: the predictor reads the fusion of the encoder taps.
+latent_adapter:
+  enabled: true
+  run_id: "JEPA_RUN"
+  mini_epoch: -1
+  levels: [8]                # decoder input levels replaced by the predictor output
+  load: true                 # false: weights must come from your own init_from source
+  allow_ema_teacher: false
+
 # ---- what is trained ---------------------------------------------------------------------
 # freeze_modules: regex or list of regexes, full match on module names (model.named_modules();
 # "q_cells" also freezes the learnable cell queries of all levels). trainable_modules:
 # exceptions, made trainable again after freezing. Parameter counts (trainable / frozen)
 # per module are logged at start-up.
 #
-# A) fixed: pretrained encoder and decoder frozen, only the cascades train
-freeze_modules: ['encoder', 'embed_target_coords', 'target_token_engines', 'pred_heads', 'q_cells']
+# A) fixed: pretrained encoder, adapter and decoder frozen, only the cascades train
+freeze_modules: ['encoder', 'latent_adapter', 'embed_target_coords', 'target_token_engines',
+                 'pred_heads', 'q_cells']
 trainable_modules: ['encoder\.latent_cascade']
 #
-# B) partially unfrozen: + the decoder's last mapping (pred_heads) and the hl8 global engine
+# A') fixed encoder / decoder, the adapter (latent alignment) fine-tuned
+# freeze_modules: ['encoder', 'embed_target_coords', 'target_token_engines', 'pred_heads',
+#                  'q_cells']
+# trainable_modules: ['encoder\.latent_cascade', 'latent_adapter']
+#
+# B) partially unfrozen: + adapter, the decoder's last mapping (pred_heads) and the hl8
+#    global engine
 # freeze_modules: ['encoder', 'embed_target_coords', 'target_token_engines', 'q_cells']
-# trainable_modules: ['encoder\.latent_cascade', 'encoder\.ae_global_engine']
+# trainable_modules: ['encoder\.latent_cascade', 'encoder\.ae_global_engine', 'latent_adapter']
 #
 # C) flexible: everything trains except the input embedders, with lower learning rates
 #    for the pretrained parts (optimizer.param_groups below)
@@ -151,6 +183,8 @@ training_config:
     param_groups:
       - modules: ['encoder\.(?!latent_cascade).*']     # pretrained encoders
         lr_scale: 0.1
+      - modules: ['latent_adapter\..*']               # kept stage-2 predictor
+        lr_scale: 0.3
       - modules: ['pred_heads\..*', 'target_token_engines\..*', 'embed_target_coords\..*']
         lr_scale: 0.3                                  # pretrained decoder
       # encoder.latent_cascade, forecast_cascade: default group (full lr)

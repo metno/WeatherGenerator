@@ -29,6 +29,8 @@ from weathergen.model.attention import (
     MultiSelfAttentionHeadVarlen,
 )
 from weathergen.model.init_utils import materialize_and_init_missing
+from weathergen.model.latent_adapter import init_from_source as adapter_init_from_source
+from weathergen.model.latent_adapter import latent_adapter_enabled
 from weathergen.model.layers import MLP
 from weathergen.model.model import Model, build_model_params
 from weathergen.model.utils import apply_fct_to_blocks, freeze_weights, unfreeze_weights
@@ -189,9 +191,10 @@ def init_model_and_shard(
         if is_root():
             logger.info(f"Loading checkpoint from id={run_id} at mini_epoch {mini_epoch}.")
         model = load_model(cf, model, device, run_id, mini_epoch)
-    elif cf.get("init_from", None):
+    elif cf.get("init_from", None) or latent_adapter_enabled(cf):
         # warm start from parts of several runs (e.g. encoder of a JEPA run + decoder of an
-        # autoencoder run); everything not loaded keeps its fresh initialisation
+        # autoencoder run, + the kept predictor of the latent adapter); everything not
+        # loaded keeps its fresh initialisation
         model = load_init_from(cf, model, device)
     else:
         if with_ddp and with_fsdp:
@@ -349,7 +352,12 @@ def load_init_from(cf, model, device):
     global INIT_FROM_REPORT
     merged: dict = {}
     origin: dict[str, str] = {}
-    for src in cf.init_from:
+    base = getattr(model, "module", model)
+    sources = list(cf.get("init_from", None) or [])
+    adapter_src = adapter_init_from_source(cf, getattr(base, "healpix_level", None))
+    if adapter_src is not None:
+        sources.append(adapter_src)
+    for src in sources:
         run_id = src["run_id"]
         mini_epoch = src.get("mini_epoch", -1)
         include = _as_regex(src.get("include", None)) or ".*"
@@ -378,7 +386,6 @@ def load_init_from(cf, model, device):
         if is_root():
             logger.info(f"init_from: {n} tensors selected from {filename.name}")
 
-    base = getattr(model, "module", model)
     model_sd = base.state_dict()
     unknown = [k for k in merged if k not in model_sd]
     mismatch = [
@@ -395,6 +402,16 @@ def load_init_from(cf, model, device):
             f"init_from: {len(unknown)} selected tensors not in the model: {unknown[:20]}"
         )
     merged = {k: v for k, v in merged.items() if k in model_sd}
+    if adapter_src is not None:
+        # the kept predictor must come completely from the stage-2 run
+        missing = [
+            k
+            for k, _ in base.named_parameters()
+            if k.startswith("latent_adapter.") and k not in merged
+        ]
+        assert not missing, (
+            f"latent_adapter: parameters not found in run {adapter_src['run_id']}: {missing[:10]}"
+        )
     INIT_FROM_REPORT = {"loaded": {k: origin[k] for k in merged}}
     return load_params_into_model(cf, model, device, merged, "init_from")
 

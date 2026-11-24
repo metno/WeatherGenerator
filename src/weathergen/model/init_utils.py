@@ -32,6 +32,7 @@ to the outermost (the order in which the constructors run):
   CascadeBlock (zero_init)    : attention.proj_out.weight -> 0, last MLP Linear -> 0
   _PairOperator ("linear")    : down_proj / up_proj weights -> 0
   TargetPredictionEngine      : pos_embed -> 0
+  MultiLevelLatentPredictor   : proj_out -> 0 with `residual` (identity at init)
 
 The learnable cell queries (q_cells) are handled by the encoder (reset_q_cells /
 initial_q_cells), ModelParams are rebuilt from the config.
@@ -48,6 +49,7 @@ from torch import nn
 from weathergen.model.blocks import CrossAttentionBlock, SelfAttentionBlock
 from weathergen.model.engines import EfficientBilinear, ForecastingEngine, TargetPredictionEngine
 from weathergen.model.latent_cascade import CascadeBlock, _PairOperator
+from weathergen.model.latent_predictor import MultiLevelLatentPredictor
 from weathergen.model.norms import AdaLayerNorm, AdaLayerNormLayer, RMSNorm
 
 logger = logging.getLogger(__name__)
@@ -92,6 +94,9 @@ def _context_override(anc: nn.Module, owner: nn.Linear, rel_path: str) -> None:
                 nn.init.zeros_(owner.weight)
             elif owner is anc.mlp.layers[-1]:
                 _zero_(owner)
+    elif isinstance(anc, MultiLevelLatentPredictor):
+        if anc.residual and rel_path.startswith("proj_out."):
+            nn.init.zeros_(owner.weight)
     elif isinstance(anc, _PairOperator):
         if anc.kind == "linear" and (owner is anc.down_proj or owner is anc.up_proj):
             nn.init.zeros_(owner.weight)

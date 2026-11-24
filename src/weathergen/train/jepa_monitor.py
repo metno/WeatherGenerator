@@ -324,6 +324,20 @@ class JepaMonitor:
         fc = _cfg_dict(cf.get("forecast_cascade", None))
         if fc:
             lines.append(f"forecast_cascade: {fc}")
+        la = _cfg_dict(cf.get("latent_adapter", None))
+        if la and la.get("enabled", False) and getattr(base, "latent_adapter", None) is not None:
+            res = la.get("resolved", {}) or {}
+            ad = base.latent_adapter
+            n_tr = sum(p.numel() for p in ad.parameters() if p.requires_grad)
+            n_all = sum(p.numel() for p in ad.parameters())
+            lines.append(
+                f"latent adapter: kept predictor of run {res.get('run_id')} "
+                f"({res.get('teacher')} teacher) -> decoder input of levels "
+                f"{ad.replace_levels}; residual={ad.head.residual}; deep fusion="
+                f"{ad.fusion is not None}; params {n_all:,} (trainable {n_tr:,})"
+            )
+        elif teachers:
+            lines.append("latent adapter: none (the JEPA predictor is discarded after this run)")
         lines += self._init_from_lines(base)
         lines += self._param_lines(base)
         lines += self._optimizer_lines(base, optimizer)
@@ -433,8 +447,6 @@ class JepaMonitor:
         """After backward and gradient clipping, before the optimizer step (all ranks)."""
         if not is_root():
             return
-        if not torch.isfinite(loss.detach()).all():
-            self._warn(f"istep={istep}: loss is {loss.item()} (NaN/Inf)")
         teachers = self._teachers(target_aux_calculators)
         if not self._batch0_done:
             self._batch0_done = True
@@ -442,10 +454,17 @@ class JepaMonitor:
         self._count_strategies(metadata)
         if istep % self.every != 0:
             return
+        # checked on report steps only: a check on every step would sync the device
+        if not torch.isfinite(loss.detach()).all():
+            self._warn(f"istep={istep}: loss is {loss.item()} (NaN/Inf)")
         self._n_reports += 1
         lines = [f"----- step {istep} -----"]
         lines += self._latent_lines(preds, targets_and_auxs, metadata, teachers)
         lines += self._teacher_lines(istep if ema_step is None else ema_step, model, teachers)
+        corr = getattr(getattr(model, "module", model), "latent_adapter_correction", None)
+        if corr:
+            desc = ", ".join(f"hl{k}={_fmt(float(v))}" for k, v in sorted(corr.items()))
+            lines.append(f"latent adapter |output - input| / |input|: {desc}")
         lines += self._grad_lines(model)
         lines += self._frozen_lines(model)
         lrs = ", ".join(f"g{i}={g['lr']:.2e}" for i, g in enumerate(optimizer.param_groups))

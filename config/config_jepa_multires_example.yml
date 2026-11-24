@@ -96,6 +96,17 @@ training_config:
           #   weight : w_l, weight of the level in the loss
           #   out_dim: size of the target vectors (default: the student's latent size of the
           #            level). Set-up B: the latent size of the CARRA2 autoencoder.
+          # residual: prediction = predictor input (post-norm latent) + correction, the
+          #   correction's output projection zero-initialised (identity at start). Needs
+          #   out_dim == the student's latent size at every predicted level. The predictor
+          #   width is then no bottleneck: with residual false every prediction lies in an
+          #   intermediate_dim-dimensional subspace of the out_dim-dimensional target.
+          # Set-up B (frozen CARRA2 teacher): this predictor is KEPT in stage 3
+          #   (latent_adapter in config_downscaling_stage3_example.yml) as the map into the
+          #   CARRA2 latent: size it as part of the model (intermediate_dim >= out_dim, or
+          #   residual: true with the student's hl8 latent size = out_dim).
+          # Set-up A (EMA teacher): the predictor is discarded after pretraining.
+          residual: false
           levels:
             8: {weight: 1.0, out_dim: 2048}
             # 5: {weight: 0.5}           # A) also predict hl5 (EMA teacher has hl5)

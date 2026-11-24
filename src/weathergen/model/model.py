@@ -38,6 +38,11 @@ from weathergen.model.engines import (
     TargetPredictionEngineClassic,
 )
 from weathergen.model.init_utils import reinit_parameters
+from weathergen.model.latent_adapter import (
+    LatentAdapter,
+    latent_adapter_enabled,
+    resolve_latent_adapter,
+)
 from weathergen.model.latent_cascade import LatentCascade
 from weathergen.model.latent_predictor import (
     MultiLevelLatentPredictor,
@@ -482,6 +487,9 @@ class Model(torch.nn.Module):
         # latent downscaler: frozen decoder of another run applied to the JEPA prediction
         # (train/latent_decoder.py; a plain attribute, not a submodule)
         self.latent_decoder = None
+        # latent downscaler, stage 3: the kept stage-2 predictor (model/latent_adapter.py)
+        self.latent_adapter = None
+        self.latent_adapter_correction: dict = {}
 
     def _create_latent_pred_head(
         self, global_cfg, name, loss_cfg, use_class_token, use_patch_token
@@ -557,12 +565,52 @@ class Model(torch.nn.Module):
                 {str(lvl): DeepSSLFusion(num, d, hidden_factor) for lvl, d in dims.items()}
             )
 
+    def create_latent_adapter(self) -> None:
+        """Stage 3 of the latent downscaler: rebuild the kept stage-2 predictor."""
+        res = resolve_latent_adapter(self.cf)
+        dims = self.encoder.dims_embed
+        pyramid = self.encoder.domain_pyramid
+        out_dims = {
+            int(k): int(v) if v is not None else dims[int(k)] for k, v in res["out_levels"].items()
+        }
+        xyz = {lvl: cell_xyz(*pyramid.domain(lvl).centres_lonlat()) for lvl in pyramid.levels}
+        head = MultiLevelLatentPredictor(
+            self.cf,
+            "latent_adapter",
+            res["loss_conf"],
+            dims_in=dict(dims),
+            out_dims=out_dims,
+            cells_xyz=xyz,
+            num_aux_tokens=self.num_aux_tokens,
+            num_deep_targets=0,
+        )
+        post_norm = nn.ModuleDict({str(lvl): nn.LayerNorm(d) for lvl, d in dims.items()})
+        fusion = None
+        if res["deep"]:
+            assert self.encoder.deep_ssl, "latent_adapter: deep SSL taps missing in the encoder"
+            hidden_factor = self.cf.training_config.deep_ssl.get("fusion_hidden_factor", 2)
+            num = len(self.encoder_deep_taps()) + 1
+            fusion = nn.ModuleDict(
+                {str(lvl): DeepSSLFusion(num, d, hidden_factor) for lvl, d in dims.items()}
+            )
+        self.latent_adapter = LatentAdapter(
+            head, post_norm, fusion, res["replace_levels"], self.num_aux_tokens
+        )
+
+    def _decoder_latent_dims(self) -> dict[int, int]:
+        """Latent size per level as the decoders read it (adapter output where it applies)."""
+        dims = dict(self.encoder.dims_embed)
+        if self.latent_adapter is not None:
+            for lvl in self.latent_adapter.replace_levels:
+                dims[lvl] = self.latent_adapter.head.proj_out[str(lvl)].out_features
+        return dims
+
     def _decoder_kv_dims(self, stream_name: str) -> tuple[int, dict[int, int]]:
         """
         Latent size of a stream's own latent level, and {level: latent size} of its other
         decode levels with a different latent size (their keys are projected, `kv_proj`).
         """
-        dims = self.encoder.dims_embed
+        dims = self._decoder_latent_dims()
         dim_latent = dims[self.encoder.stream_encode_level[stream_name]]
         kv_level_dims = {
             lvl: dims[lvl]
@@ -607,6 +655,10 @@ class Model(torch.nn.Module):
             self.forecast_cascade = LatentCascade.from_config(
                 self.domain_pyramid, cf, "forecast_cascade"
             )
+
+        # latent downscaler, stage 3: kept stage-2 predictor between latent and decoders
+        if latent_adapter_enabled(cf):
+            self.create_latent_adapter()
 
         # embed coordinates yielding one query token for each target token
         dropout_rate = cf.embed_dropout_rate
@@ -868,15 +920,18 @@ class Model(torch.nn.Module):
         self.encoder.reset_q_cells()
 
         # multi-level JEPA predictor: plain Parameters (level / mask embeddings)
-        for module in self.latent_heads.modules() if self.latent_heads is not None else []:
-            if isinstance(module, MultiLevelLatentPredictor):
-                module.reset_extra_parameters()
+        for module in self._multilevel_predictors():
+            module.reset_extra_parameters()
+
+    def _multilevel_predictors(self) -> list[MultiLevelLatentPredictor]:
+        """Multi-level predictors of the SSL heads and of the latent adapter."""
+        roots = [m for m in (self.latent_heads, self.latent_adapter) if m is not None]
+        return [m for r in roots for m in r.modules() if isinstance(m, MultiLevelLatentPredictor)]
 
     def rebuild_ssl_buffers(self, device) -> None:
         """Non-persistent buffers of the multi-level JEPA predictor (after to_empty, FSDP)."""
-        for module in self.latent_heads.modules() if self.latent_heads is not None else []:
-            if isinstance(module, MultiLevelLatentPredictor):
-                module.rebuild_buffers(device)
+        for module in self._multilevel_predictors():
+            module.rebuild_buffers(device)
 
     def latent_cascades(self) -> list[LatentCascade]:
         """The latent cascades of a multi-resolution latent (empty for one level)."""
@@ -1058,9 +1113,25 @@ class Model(torch.nn.Module):
             else:
                 tokens_lvl = self.forecast_levels(model_params, tokens_lvl, step)
                 tokens = tokens_lvl[self.healpix_level]
-            # decoder predictions
+            # decoder predictions (latent downscaler, stage 3: through the kept predictor)
+            dec_tokens, dec_lvl = tokens, tokens_lvl
+            if self.latent_adapter is not None:
+                lvl_in = tokens_lvl if tokens_lvl is not None else {self.healpix_level: tokens}
+                dec_lvl = self.latent_adapter(
+                    lvl_in,
+                    self.student_hidden_cells(batch),
+                    ssl_intermediates if step == 0 else None,
+                )
+                if step == 0:
+                    # |adapter output - its input| / |input| per level (monitoring, no sync)
+                    self.latent_adapter_correction = self.latent_adapter.correction_norms(
+                        lvl_in, dec_lvl
+                    )
+                dec_tokens = dec_lvl[self.healpix_level]
+                if tokens_lvl is None:
+                    dec_lvl = None
             output = self.predict_decoders(
-                model_params, step, tokens, batch, output, tokens_lvl=tokens_lvl
+                model_params, step, dec_tokens, batch, output, tokens_lvl=dec_lvl
             )
             # latent predictions (raw and with SSL heads)
             output = self.predict_latent(
