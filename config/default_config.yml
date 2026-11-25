@@ -77,6 +77,10 @@ fe_noise_injection:
   noise_channels: 4
   noise_mlp_hidden_dim: 32
   noise_std: 1.0
+  # "iid": independent per latent cell; "fourier": spatially smooth random field (needs rope_2D)
+  noise_type: iid
+  length_scales_km: [150.0, 500.0]  # fourier only: correlation length(s), mixed if several
+  num_fourier_features: 256         # fourier only
 # currently fixed to 1.0 (due to limitations with flex_attention and triton)
 forecast_att_dense_rate: 1.0
 

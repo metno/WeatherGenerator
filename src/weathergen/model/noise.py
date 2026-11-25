@@ -9,21 +9,34 @@
 
 """AIFS-CRPS-style noise injection for generating exchangeable ensemble members.
 
-For every ensemble member and forecast step, independent Gaussian noise is drawn for each latent
-token, embedded with a small MLP followed by a layer norm, and used to condition all layer norms of
+For every ensemble member and forecast step, Gaussian noise is drawn for each latent token,
+embedded with a small MLP followed by a layer norm, and used to condition all layer norms of
 the forecasting engine (Lang et al. 2024, arXiv:2412.15832; defaults follow anemoi-models'
 ``NoiseConditioning`` / ``ConditionalLayerNorm`` with ``zero_init``). Members are stacked along the
 batch dimension in member-major order: member ``m`` of sample ``b`` is at index
 ``m * batch_size + b``.
+
+``noise_type``:
+  * ``iid``     : independent noise per token (original behaviour). Neighbouring HEALPix cells get
+                  unrelated perturbations, which show up as cell-shaped tiles in member
+                  differences.
+  * ``fourier`` : a spatially smooth Gaussian random field, evaluated at the token's cell centre via
+                  random Fourier features of the 3D position (squared-exponential covariance, unit
+                  variance). ``length_scales_km`` gives the correlation length(s); with several
+                  values every feature picks one at random (mixture of scales).
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 
 from weathergen.model.norms import AdaLayerNorm
 
 NOISE_CONFIG_KEY = "fe_noise_injection"
+NOISE_TYPES = ("iid", "fourier")
+EARTH_RADIUS_KM = 6371.0
 
 
 def get_noise_injection_config(cf) -> dict | None:
@@ -37,19 +50,39 @@ def get_noise_injection_config(cf) -> dict | None:
         "noise_channels": int(cfg.get("noise_channels", 4)),
         "noise_mlp_hidden_dim": int(cfg.get("noise_mlp_hidden_dim", 32)),
         "noise_std": float(cfg.get("noise_std", 1.0)),
+        "noise_type": str(cfg.get("noise_type", "iid")),
+        "length_scales_km": [float(s) for s in cfg.get("length_scales_km", [150.0, 500.0])],
+        "num_fourier_features": int(cfg.get("num_fourier_features", 256)),
     }
-    for key in ("num_members", "noise_channels", "noise_mlp_hidden_dim"):
+    for key in ("num_members", "noise_channels", "noise_mlp_hidden_dim", "num_fourier_features"):
         if settings[key] < 1:
             raise ValueError(f"{NOISE_CONFIG_KEY}.{key} must be >= 1, got {settings[key]}.")
     if settings["noise_std"] <= 0.0:
         raise ValueError(f"{NOISE_CONFIG_KEY}.noise_std must be > 0, got {settings['noise_std']}.")
+    if settings["noise_type"] not in NOISE_TYPES:
+        raise ValueError(
+            f"{NOISE_CONFIG_KEY}.noise_type must be one of {NOISE_TYPES}, "
+            f"got {settings['noise_type']!r}."
+        )
+    if not settings["length_scales_km"] or min(settings["length_scales_km"]) <= 0.0:
+        raise ValueError(
+            f"{NOISE_CONFIG_KEY}.length_scales_km must be a non-empty list of positive values, "
+            f"got {settings['length_scales_km']}."
+        )
     return settings
 
 
 def validate_noise_injection_setup(cf, streams) -> None:
     """Reject configurations in which injected noise cannot produce exchangeable members."""
-    if get_noise_injection_config(cf) is None:
+    noise_cfg = get_noise_injection_config(cf)
+    if noise_cfg is None:
         return
+
+    if noise_cfg["noise_type"] == "fourier" and not cf.get("rope_2D", False):
+        raise ValueError(
+            f"{NOISE_CONFIG_KEY}.noise_type: fourier needs the cell-centre coordinates of the "
+            "latent tokens, which are only computed with rope_2D: True."
+        )
 
     has_forecast_blocks = (
         cf.get("fe_num_blocks", 0) > 0
@@ -74,10 +107,25 @@ def validate_noise_injection_setup(cf, streams) -> None:
 class NoiseInjector(torch.nn.Module):
     """Draw per-token Gaussian noise and embed it for conditional layer norms."""
 
-    def __init__(self, noise_channels: int, mlp_hidden_dim: int, noise_std: float = 1.0):
+    def __init__(
+        self,
+        noise_channels: int,
+        mlp_hidden_dim: int,
+        noise_std: float = 1.0,
+        noise_type: str = "iid",
+        length_scales_km: list[float] | tuple[float, ...] = (150.0, 500.0),
+        num_fourier_features: int = 256,
+    ):
         super().__init__()
         self.noise_channels = noise_channels
         self.noise_std = noise_std
+        self.noise_type = noise_type
+        self.num_fourier_features = num_fourier_features
+        self.register_buffer(
+            "length_scales_km",
+            torch.tensor(list(length_scales_km), dtype=torch.float32),
+            persistent=False,
+        )
         self.mlp = torch.nn.Sequential(
             torch.nn.Linear(noise_channels, mlp_hidden_dim),
             torch.nn.GELU(),
@@ -94,15 +142,47 @@ class NoiseInjector(torch.nn.Module):
             if isinstance(module, torch.nn.Linear | torch.nn.LayerNorm):
                 module.reset_parameters()
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Return a noise embedding of shape ``(*tokens.shape[:-1], noise_channels)``."""
+    def forward(self, tokens: torch.Tensor, coords: torch.Tensor | None = None) -> torch.Tensor:
+        """Return a noise embedding of shape ``(*tokens.shape[:-1], noise_channels)``.
+
+        coords : (1 or batch, num_tokens, 2) token positions as (lat, lon) in radians; required
+            for noise_type "fourier".
+        """
         # Drawn outside any activation-checkpointed block, so recomputation reuses the same noise.
-        noise = torch.randn(
-            (*tokens.shape[:-1], self.noise_channels),
-            device=tokens.device,
-            dtype=self.mlp[0].weight.dtype,
-        )
+        dtype = self.mlp[0].weight.dtype
+        if self.noise_type == "fourier":
+            noise = self.smooth_noise(tokens, coords).to(dtype)
+        else:
+            noise = torch.randn(
+                (*tokens.shape[:-1], self.noise_channels), device=tokens.device, dtype=dtype
+            )
         return self.mlp(noise * self.noise_std)
+
+    def smooth_noise(self, tokens: torch.Tensor, coords: torch.Tensor | None) -> torch.Tensor:
+        """Unit-variance Gaussian random field per batch row and channel (random Fourier feat.)."""
+        if coords is None:
+            raise ValueError("noise_type 'fourier' requires the token coordinates (rope_2D: True).")
+        batch, num_tokens = tokens.shape[0], tokens.shape[1]
+        assert coords.shape[-2] == num_tokens, (coords.shape, tokens.shape)
+        device = tokens.device
+
+        lat, lon = coords[..., 0].float(), coords[..., 1].float()
+        pos = EARTH_RADIUS_KM * torch.stack(
+            [torch.cos(lat) * torch.cos(lon), torch.cos(lat) * torch.sin(lon), torch.sin(lat)],
+            dim=-1,
+        ).expand(batch, num_tokens, 3)
+
+        nc, nf = self.noise_channels, self.num_fourier_features
+        scales = self.length_scales_km.to(device)
+        ell = scales[torch.randint(len(scales), (batch, nc, nf), device=device)]
+        omega = torch.randn(batch, nc, nf, 3, device=device) / ell.unsqueeze(-1)
+        phase = 2.0 * math.pi * torch.rand(batch, nc, nf, device=device)
+        amp = torch.randn(batch, nc, nf, device=device)
+
+        # (batch, channels, tokens, features)
+        proj = torch.einsum("btd,bcfd->bctf", pos, omega) + phase.unsqueeze(2)
+        field = torch.einsum("bctf,bcf->btc", torch.cos(proj), amp)
+        return field * math.sqrt(2.0 / nf)
 
 
 def zero_init_noise_conditioning(module: torch.nn.Module) -> None:

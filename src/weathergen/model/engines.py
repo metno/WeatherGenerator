@@ -598,6 +598,9 @@ class ForecastingEngine(torch.nn.Module):
                 noise_cfg["noise_channels"],
                 noise_cfg["noise_mlp_hidden_dim"],
                 noise_cfg["noise_std"],
+                noise_type=noise_cfg["noise_type"],
+                length_scales_km=noise_cfg["length_scales_km"],
+                num_fourier_features=noise_cfg["num_fourier_features"],
             )
             dim_aux = self.noise_injector.dim_embed
 
@@ -683,7 +686,7 @@ class ForecastingEngine(torch.nn.Module):
                 tokens = tokens + torch.randn_like(tokens) * torch.norm(tokens) * noise_std
 
         # fresh noise for every member and every forecast step (members are stacked in the batch)
-        aux_info = self.noise_injector(tokens) if self.noise_injector is not None else None
+        aux_info = self.noise_injector(tokens, coords) if self.noise_injector is not None else None
         for _b_idx, block in enumerate(self.fe_blocks):
             if isinstance(block, torch.nn.modules.normalization.LayerNorm):
                 tokens = checkpoint(block, tokens, use_reentrant=False)

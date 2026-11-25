@@ -197,3 +197,53 @@ def test_combine_member_predictions_passes_through_skipped_streams():
     members = [{"MEPS": (torch.tensor([]), [0])} for _ in range(2)]
 
     assert combine_member_predictions(members)["MEPS"][0].numel() == 0
+
+
+def _lat_lon_along_meridian(distances_km):
+    lat = torch.tensor(distances_km) / 6371.0 + 1.1
+    return torch.stack([lat, torch.full_like(lat, 0.3)], dim=-1).unsqueeze(0)
+
+
+def test_fourier_noise_is_smooth_in_space_and_independent_far_away():
+    torch.manual_seed(0)
+    injector = NoiseInjector(4, 8, noise_type="fourier", length_scales_km=[200.0])
+    # neighbouring hl8-like cells (25 km apart) and a point far beyond the length scale
+    coords = _lat_lon_along_meridian([0.0, 25.0, 3000.0])
+    tokens = torch.zeros(4000, 3, DIM)
+
+    noise = injector.smooth_noise(tokens, coords).flatten(0, 0).permute(1, 0, 2).reshape(3, -1)
+    corr = torch.corrcoef(noise)
+
+    assert noise.var(dim=1).sub(1.0).abs().max() < 0.1
+    assert corr[0, 1] > 0.95
+    assert corr[0, 2].abs() < 0.1
+
+
+def test_fourier_noise_config_requires_rope_coordinates():
+    cf = _engine_config()
+    cf.training_config = {"forecast": {"policy": "fixed"}}
+    cf.fe_noise_injection.noise_type = "fourier"
+
+    with pytest.raises(ValueError, match="rope_2D"):
+        validate_noise_injection_setup(cf, {})
+    cf.rope_2D = True
+    validate_noise_injection_setup(cf, {})
+
+    cf.fe_noise_injection.noise_type = "smooth"
+    with pytest.raises(ValueError, match="noise_type"):
+        get_noise_injection_config(cf)
+
+
+def test_engine_with_fourier_noise_diverges_members():
+    cf = _engine_config()
+    cf.fe_noise_injection.noise_type = "fourier"
+    torch.manual_seed(0)
+    mode_cfg = OmegaConf.create({"forecast": {"policy": "fixed"}})
+    engine = engines.ForecastingEngine(cf, mode_cfg, num_healpix_cells=6)
+    assert engine.noise_injector.noise_type == "fourier"
+    _randomise_conditioning_outputs(engine)
+
+    coords = _lat_lon_along_meridian([0.0, 25.0, 50.0, 75.0, 100.0, 125.0])
+    out = engine(_member_tokens(), fstep=0, coords=coords)
+
+    assert not torch.allclose(out[0], out[1])
