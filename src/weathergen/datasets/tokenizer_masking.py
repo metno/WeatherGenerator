@@ -8,6 +8,8 @@
 # nor does it submit to any jurisdiction.
 
 
+import logging
+
 import numpy as np
 import torch
 
@@ -23,6 +25,53 @@ from weathergen.datasets.tokenizer_utils import (
     tokenize_space,
     tokenize_spacetime,
 )
+
+
+_logger = logging.getLogger(__name__)
+_n_keep_one = 0
+
+
+def keep_one_source_cell(cell_mask, idxs_cells_lens, rng=None, stream_name="?"):
+    """
+    Source mask safeguard for random (cell) masking.
+
+    If the mask keeps some cells (cell_mask.any()) but none of the cells that hold tokens,
+    the stream would have no source tokens on this rank: its embedding is skipped on this
+    rank only, the FSDP collectives get out of step and training deadlocks (NCCL watchdog
+    timeout). This happens e.g. for spoofed windows (2 points in 2 cells, MEPS before
+    2020) or sparse streams (few stations / a small satellite swath) when part of the
+    cells is masked. Then one random cell with tokens is kept.
+
+    A mask that keeps no cell at all (diagnostic stream: no source by design) and windows
+    without tokens are returned unchanged. Returns the (possibly new) mask; the input mask
+    is not modified.
+    """
+    global _n_keep_one
+    if cell_mask is None or idxs_cells_lens is None:
+        return cell_mask
+    km = np.asarray(cell_mask.cpu() if isinstance(cell_mask, torch.Tensor) else cell_mask,
+                    dtype=bool)
+    if not km.any():
+        return cell_mask
+    has_tok = np.array([len(lens) > 0 for lens in idxs_cells_lens], dtype=bool)
+    if not has_tok.any() or (km & has_tok).any():
+        return cell_mask
+    cand = np.flatnonzero(has_tok)
+    # the Masker's generator (np.random.Generator) when available, for reproducibility
+    pick = cand[rng.integers(len(cand))] if rng is not None else cand[np.random.randint(len(cand))]
+    _n_keep_one += 1
+    if _n_keep_one in (1, 10, 100, 1000) or _n_keep_one % 10000 == 0:
+        _logger.info(
+            "%s: random source mask kept no cell with data -> kept 1 of %d cells "
+            "(%d times so far in this process)", stream_name, len(cand), _n_keep_one,
+        )
+    if isinstance(cell_mask, torch.Tensor):
+        new = cell_mask.clone()
+        new[int(pick)] = True
+    else:
+        new = km.copy()
+        new[pick] = True
+    return new
 
 
 def readerdata_to_torch(rdata: IOReaderData) -> IOReaderData:
@@ -135,6 +184,13 @@ class TokenizerMasking(Tokenizer):
     ):
         # create tokenization index
         (idxs_cells, idxs_cells_lens) = idxs_cells_data
+
+        # a random source mask must not remove ALL cells that hold tokens (see
+        # keep_one_source_cell): the stream would be skipped on this rank only -> deadlock
+        cell_mask = keep_one_source_cell(
+            cell_mask, idxs_cells_lens, getattr(self.masker, "rng", None),
+            stream_info.get("name", "?"),
+        )
 
         # select strategy from XXX depending on stream and if student or teacher
 

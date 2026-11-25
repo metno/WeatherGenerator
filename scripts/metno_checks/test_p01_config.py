@@ -10,7 +10,7 @@ Checks:
   - the config survives the save step (_strip_interpolation + json) that config.save() runs
   - SYNOP: geoinfos / stats_file / drop_empty_rows / single file
   - masks: input = random part of the cells (rate of the stream), target = every cell,
-    for every stream, in train and val
+    for every stream, in train and val (no target for input-only streams, forcing: True)
 """
 import sys
 from pathlib import Path
@@ -88,7 +88,9 @@ for stage, mode_cfg in stage_cfgs.items():
             tm, sm, _ = m.build_samples_for_stream(["masking"], m.healpix_num_cells, sc)
             fs.append(np.asarray(sm.masks[0]).mean())
             ft.append(np.asarray(tm.masks[0]).mean())
+        forcing = bool(sc.get("forcing", False))
         print(f"  {stage:5s} {name:7s}: input {np.mean(fs):.2f} (rate {rate}), "
-              f"target {np.min(ft):.2f}")
-        assert abs(np.mean(fs) - rate) < 0.03 and np.min(ft) == 1.0
+              f"target {np.min(ft):.2f}{' (input only)' if forcing else ''}")
+        assert abs(np.mean(fs) - rate) < 0.03
+        assert np.max(ft) == 0.0 if forcing else np.min(ft) == 1.0
 print("OK")
