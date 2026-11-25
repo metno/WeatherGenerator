@@ -29,6 +29,7 @@ from weathergen.model.ema import EMAModel
 from weathergen.model.model_interface import (
     init_model_and_shard,
 )
+from weathergen.model.param_summary import log_parameter_summary
 from weathergen.model.utils import apply_fct_to_blocks, set_to_eval
 from weathergen.train.collapse_monitor import CollapseMonitor
 from weathergen.train.jepa_monitor import JepaMonitor
@@ -242,6 +243,8 @@ class Trainer(TrainerBase):
 
         # get target_aux calculators for different loss terms
         self.target_and_aux_calculators_val = self.get_target_aux_calculators(self.test_cfg)
+        if is_root():
+            log_parameter_summary(self.model, cf, self.target_and_aux_calculators_val)
 
         self.loss_calculator_val = LossCalculator(cf, self.test_cfg, VAL, device=self.devices[0])
 
@@ -331,11 +334,10 @@ class Trainer(TrainerBase):
         self.target_and_aux_calculators = self.get_target_aux_calculators(self.training_cfg)
         self.target_and_aux_calculators_val = self.get_target_aux_calculators(self.validation_cfg)
 
-        # if with_fsdp then parameter count is unreliable
+        # [PARAMS] parameter summary in the log (total / trainable per part; full-model counts
+        # also with FSDP, where parameter shapes are the global ones)
         if is_root():
-            # ddp-wrapped model does not expose this function
-            if not cf.with_ddp:
-                self.model.print_num_parameters()
+            log_parameter_summary(self.model, cf, self.target_and_aux_calculators)
 
         # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
         # aiming for beta1=0.9 and beta2=0.95 following the MAE paper
