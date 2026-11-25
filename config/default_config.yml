@@ -169,6 +169,7 @@ training_config:
     parallel_scaling_policy: "sqrt"
 
   optimizer:
+    name: "adamw"
     grad_clip: 1.0
     weight_decay: 0.1
     log_grad_norms: False

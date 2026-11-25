@@ -18,6 +18,11 @@ import numpy as np
 import torch
 import tqdm
 from omegaconf import OmegaConf
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_optimizer_state_dict,
+    set_optimizer_state_dict,
+)
 
 # FSDP2
 from torch.distributed.tensor import DTensor
@@ -33,6 +38,7 @@ from weathergen.model.utils import apply_fct_to_blocks, set_to_eval
 from weathergen.train.collapse_monitor import CollapseMonitor
 from weathergen.train.loss_calculator import LossCalculator
 from weathergen.train.lr_scheduler import LearningRateScheduler
+from weathergen.train.optimizer import AdEMAMix, build_optimizer
 from weathergen.train.target_and_aux_utils import get_target_aux_calculator
 from weathergen.train.trainer_base import TrainerBase
 from weathergen.train.utils import (
@@ -325,23 +331,11 @@ class Trainer(TrainerBase):
             if not cf.with_ddp:
                 self.model.print_num_parameters()
 
-        # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
-        # aiming for beta1=0.9 and beta2=0.95 following the MAE paper
-        # https://arxiv.org/pdf/2111.06377
-        kappa = self.get_batch_size_total(self.batch_size_per_gpu)
-        # aiming for beta1 = 0.9 at one node, ie kappa=B=4
-        beta1 = max(0.5, 1.0 - kappa * (1.0 - self.training_cfg.optimizer.adamw.beta1))
-        # aiming for beta2 = 0.95 at one node, ie B=4
-        beta2 = max(0.9, 1.0 - kappa * (1.0 - self.training_cfg.optimizer.adamw.beta2))
-        eps = self.training_cfg.optimizer.adamw.get("eps", 2e-08) / np.sqrt(kappa)
-
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.training_cfg.learning_rate_scheduling.lr_start,
-            weight_decay=self.training_cfg.optimizer.weight_decay,
-            betas=(beta1, beta2),
-            eps=eps,
-            fused=True,
+        self.optimizer = build_optimizer(
+            self.model,
+            self.training_cfg.optimizer,
+            self.training_cfg.learning_rate_scheduling.lr_start,
+            self.get_batch_size_total(self.batch_size_per_gpu),
         )
         if cf.get("training_config").get("optimizer").get("grad_scaling", True):
             self.grad_scaler = torch.amp.GradScaler("cuda")
@@ -359,6 +353,8 @@ class Trainer(TrainerBase):
             lr_steps,
             self.training_cfg.learning_rate_scheduling,
         )
+        if isinstance(self.optimizer, AdEMAMix) and run_id_contd is not None:
+            self._load_optimizer_checkpoint(run_id_contd, mini_epoch_contd)
 
         if self.cf.general.istep > 0 and is_root():
             logger.info(f"Continuing run with learning rate: {self.lr_scheduler.get_lr()}")
@@ -693,10 +689,12 @@ class Trainer(TrainerBase):
                     # "exp_avg" in AdamW is `DTensor`
                     full_tensor = sharded_tensor.full_tensor()
                 else:
-                    # "step" in AdamW is plain tensor
+                    # Step counters may be plain tensors or Python scalars.
                     full_tensor = sharded_tensor
                 if is_rank_zero:
-                    group_state[attr] = full_tensor.cpu()
+                    group_state[attr] = (
+                        full_tensor.cpu() if isinstance(full_tensor, torch.Tensor) else full_tensor
+                    )
                 else:
                     del full_tensor
             if is_rank_zero:
@@ -711,11 +709,36 @@ class Trainer(TrainerBase):
         else:
             return {}
 
+    def _load_optimizer_checkpoint(self, run_id: str, mini_epoch: int | None) -> None:
+        checkpoint_id = "latest" if mini_epoch in (-1, None) else f"chkpt{mini_epoch:05d}"
+        path = config.get_path_model(self.cf, run_id=run_id) / f"{run_id}_{checkpoint_id}.optim"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"AdEMAMix resume requires optimizer state: {path}. "
+                "Use load_chkpt for a weights-only start with fresh optimizer warmups."
+            )
+        optimizer_state = torch.load(path, map_location="cpu", weights_only=True)
+        set_optimizer_state_dict(
+            self.model,
+            self.optimizer,
+            optimizer_state,
+            options=StateDictOptions(full_state_dict=True),
+        )
+        if is_root():
+            logger.info(f"Restored AdEMAMix optimizer state from {path}")
+
     def save_model(self, mini_epoch: int, name=None):
         # Saving at mini_epoch == max_mini_epoch means that we are saving the latest checkpoint.
         max_mini_epoch = self.training_cfg.num_mini_epochs
         assert mini_epoch <= max_mini_epoch, (mini_epoch, max_mini_epoch)
         model_state_dict = self._get_full_model_state_dict()
+        optimizer_state = None
+        if isinstance(self.optimizer, AdEMAMix):
+            optimizer_state = get_optimizer_state_dict(
+                self.model,
+                self.optimizer,
+                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+            )
 
         if is_root():
             filename = "".join(
@@ -733,6 +756,11 @@ class Trainer(TrainerBase):
             torch.save(model_state_dict, file_tmp)
             # move file (which is changing the link in the file system and very fast)
             file_tmp.replace(file_out)
+            if optimizer_state is not None:
+                optimizer_out = base_path / (filename + ".optim")
+                optimizer_tmp = base_path / (filename + "_tmp.optim")
+                torch.save(optimizer_state, optimizer_tmp)
+                optimizer_tmp.replace(optimizer_out)
             if is_root():
                 logger.info(f"Saved model to {file_out}")
 
