@@ -80,6 +80,9 @@ bash packages/latent_subset/submit_subset.sh \
     2016 2024 --south 58 --north 72 --west 4 --east 32
 ```
 
+For a broad Europe subset in one store, use a fresh output path and pass
+`--south 34 --north 72 --west -12 --east 60` instead.
+
 The wrapper initializes one store, submits one array task per year (two at a
 time), and finalizes only after the array succeeds. Array tasks derive their
 year from `SLURM_ARRAY_TASK_ID` and write only the sample range assigned to
@@ -93,5 +96,3 @@ without rewriting successful years. After the failed task has stopped, run
 `weathergen-subset write-year OUTPUT YEAR` in a compute allocation (or submit
 it as a batch job). Then run `weathergen-subset finalize OUTPUT` once all years
 have succeeded. If initialization failed, start again with a fresh destination.
-The older [Europe example](submit_europe.sh) still produces separate year stores.
-
