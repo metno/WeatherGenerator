@@ -56,6 +56,8 @@ from weathergen.datasets.domain_pyramid import build_domain_pyramid
 
 logger = logging.getLogger(__name__)
 
+from weathergen.model.skip_log import log_skip  # noqa: E402
+
 # R3 tail of the target coordinates (tokenizer_utils.NUM_GLOBAL_COORD_CHANNELS)
 NUM_GLOBAL_COORD_CHANNELS_POU = 3
 
@@ -2318,6 +2320,7 @@ class Model(torch.nn.Module):
 
 #            print(f"READOUT skip check: stream={stream_name} step={step} n_coords={len(t_coords)}", flush=True)
             if len(t_coords) == 0:
+                log_skip("decoder", stream_name, "no target coords")
                 continue
 
             # embed token coords
@@ -2332,10 +2335,12 @@ class Model(torch.nn.Module):
                         f" of {torch.isnan(tc_tokens).sum()} NaN in tc_tokens.",
                     )
                 )
+                log_skip("decoder", stream_name, "NaN in target coord embedding")
                 pred = torch.tensor([], device=tc_tokens.device)
 
             # skip empty lengths
             elif tc_tokens.shape[0] == 0:
+                log_skip("decoder", stream_name, "empty target coord embedding")
                 pred = torch.tensor([], device=tc_tokens.device)
 
             else:

@@ -35,6 +35,8 @@ from weathergen.utils.utils import get_dtype
 
 logger = logging.getLogger(__name__)
 
+from weathergen.model.skip_log import log_skip  # noqa: E402
+
 
 class EmbeddingEngine(torch.nn.Module):
     name: "EmbeddingEngine"
@@ -111,9 +113,11 @@ class EmbeddingEngine(torch.nn.Module):
                     for sample in batch.get_samples():
                         sdata += [sample.streams_data[stream_name].source_tokens_cells[istep]]
                 if all(s is None for s in sdata):
+                    log_skip("embedding", stream_name, "no source tokens (None)")
                     continue
                 sdata = torch.cat(sdata).to(tokens_all.dtype)
                 if sdata.numel() == 0:
+                    log_skip("embedding", stream_name, "no source tokens (empty)")
                     continue
                 x_embeds += [self.embeds[stream_name](sdata).flatten(0, 1)]
 
