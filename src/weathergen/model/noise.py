@@ -177,9 +177,11 @@ class NoiseInjector(torch.nn.Module):
         phase = 2.0 * math.pi * torch.rand(batch, nc, nf, device=device)
         amp = torch.randn(batch, nc, nf, device=device)
 
-        # (batch, channels, tokens, features)
-        proj = torch.einsum("btd,bcfd->bctf", pos, omega) + phase.unsqueeze(2)
-        field = torch.einsum("bctf,bcf->btc", torch.cos(proj), amp)
+        # (batch, channels, tokens, features); fp32 even under bf16 autocast: positions are
+        # ~6371 km, so bf16 rounding (~25 km) would be as large as an hl8 cell
+        with torch.autocast(device_type=device.type, enabled=False):
+            proj = torch.einsum("btd,bcfd->bctf", pos, omega) + phase.unsqueeze(2)
+            field = torch.einsum("bctf,bcf->btc", torch.cos(proj), amp)
         return field * math.sqrt(2.0 / nf)
 
 

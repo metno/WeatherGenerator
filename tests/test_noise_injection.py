@@ -265,3 +265,18 @@ def test_fourier_noise_survives_meta_device_initialisation():
     assert corr[0, 1] > 0.95
     assert corr[0, 2].abs() < 0.1
     assert torch.isfinite(injector(torch.zeros(2, 3, DIM), coords)).all()
+
+
+def test_fourier_noise_is_computed_in_fp32_under_bf16_autocast():
+    injector = NoiseInjector(4, 8, noise_type="fourier", length_scales_km=[50.0])
+    coords = _lat_lon_along_meridian([0.0, 25.0, 3000.0])
+    tokens = torch.zeros(8, 3, DIM)
+
+    torch.manual_seed(0)
+    reference = injector.smooth_noise(tokens, coords)
+    torch.manual_seed(0)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        noise = injector.smooth_noise(tokens, coords)
+
+    assert noise.dtype == torch.float32
+    assert torch.allclose(noise, reference, atol=1e-4)
