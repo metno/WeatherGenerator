@@ -121,11 +121,9 @@ class NoiseInjector(torch.nn.Module):
         self.noise_std = noise_std
         self.noise_type = noise_type
         self.num_fourier_features = num_fourier_features
-        self.register_buffer(
-            "length_scales_km",
-            torch.tensor(list(length_scales_km), dtype=torch.float32),
-            persistent=False,
-        )
+        # plain floats, not a buffer: with FSDP the model is built on the meta device, and a
+        # non-persistent buffer is neither in the checkpoint nor re-initialised after to_empty()
+        self.length_scales_km = tuple(float(s) for s in length_scales_km)
         self.mlp = torch.nn.Sequential(
             torch.nn.Linear(noise_channels, mlp_hidden_dim),
             torch.nn.GELU(),
@@ -173,7 +171,7 @@ class NoiseInjector(torch.nn.Module):
         ).expand(batch, num_tokens, 3)
 
         nc, nf = self.noise_channels, self.num_fourier_features
-        scales = self.length_scales_km.to(device)
+        scales = torch.tensor(self.length_scales_km, device=device)
         ell = scales[torch.randint(len(scales), (batch, nc, nf), device=device)]
         omega = torch.randn(batch, nc, nf, 3, device=device) / ell.unsqueeze(-1)
         phase = 2.0 * math.pi * torch.rand(batch, nc, nf, device=device)

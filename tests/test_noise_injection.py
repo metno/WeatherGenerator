@@ -247,3 +247,21 @@ def test_engine_with_fourier_noise_diverges_members():
     out = engine(_member_tokens(), fstep=0, coords=coords)
 
     assert not torch.allclose(out[0], out[1])
+
+
+def test_fourier_noise_survives_meta_device_initialisation():
+    # FSDP path: built on the meta device, then to_empty() (uninitialised memory) or a
+    # checkpoint load; the length scales must not depend on module state
+    with torch.device("meta"):
+        injector = NoiseInjector(4, 8, noise_type="fourier", length_scales_km=[200.0])
+    injector.to_empty(device="cpu")
+    injector.reset_parameters()
+    torch.manual_seed(0)
+    coords = _lat_lon_along_meridian([0.0, 25.0, 3000.0])
+
+    noise = injector.smooth_noise(torch.zeros(4000, 3, DIM), coords)
+    corr = torch.corrcoef(noise.permute(1, 0, 2).reshape(3, -1))
+
+    assert corr[0, 1] > 0.95
+    assert corr[0, 2].abs() < 0.1
+    assert torch.isfinite(injector(torch.zeros(2, 3, DIM), coords)).all()
