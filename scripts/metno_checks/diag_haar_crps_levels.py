@@ -17,6 +17,14 @@ For every channel and every Haar level l it prints:
   spr/skl    spread / skill of the coefficients: sqrt(unbiased ensemble variance) /
              sqrt(E/(E+1) * mean (ens. mean - target)^2); about 1 for a calibrated ensemble
 
+Second table: the large scales, after Gaussian smoothing with standard deviation sigma_km
+(normalised smoothing with the valid mask, scored cells as in global_smooth_crps):
+  crps_s     the global_smooth_crps value at that sigma (sigma 25 km = the e06 loss term)
+  spr/skl    spread / skill of the smoothed fields (same definition as above);
+             > 1: members differ more than their error (over-dispersed), < 1: too similar
+  spread     RMS difference between members / RMS of the smoothed target anomaly
+  error      RMS error of the smoothed ensemble mean / RMS of the smoothed target anomaly
+
 Values are normalised per channel with the dataset statistics (mean, stdev), as the loss
 sees them. No random offset (as in validation).
 
@@ -51,6 +59,10 @@ p.add_argument("--stats", default="/e/data1/slmet/CARRA2/carra2-nordic-2016-2025
 p.add_argument("--levels", type=int, default=5)
 p.add_argument("--eps", type=float, default=0.1)
 p.add_argument("--alpha", type=float, default=0.95)
+p.add_argument("--smooth-km", type=float, nargs="+", default=[25.0, 50.0, 100.0],
+               help="Gaussian sigmas (km) for the large-scale table")
+p.add_argument("--grid-km", type=float, default=2.5)
+p.add_argument("--min-coverage", type=float, default=0.5)
 args = p.parse_args()
 L, eps, alpha = args.levels, args.eps, args.alpha
 
@@ -87,6 +99,8 @@ tmpl, (ny, nx) = lf._load_haar_template(_owner, args.template, args.stream, "dia
 assert tmpl is not None, f"cannot read template {args.template}"
 
 acc = None  # accumulated sums per (channel, level)
+acc_s = None  # large-scale (smoothed) sums per (channel, sigma)
+n_smooth = 0
 n_used = 0
 with zarrio_reader(fname) as zio:
     samples = sorted(int(s) for s in zio.samples)
@@ -137,6 +151,35 @@ with zarrio_reader(fname) as zio:
         nan_g = t_flat[:, E * C:].reshape(ny, nx, C).permute(2, 0, 1) > 0
         valid = valid_cell.view(1, ny, nx) & ~nan_g
         X = torch.where(valid.unsqueeze(0), X, Y.unsqueeze(0))
+
+        # ---- large scales: Gaussian-smoothed fields (as global_smooth_crps) ----
+        if E > 1:
+            if acc_s is None:
+                acc_s = {k: torch.zeros(C, len(args.smooth_km), dtype=torch.double)
+                         for k in ["crps", "spr", "skl", "d2", "e2", "a2", "n"]}
+            vv = valid.double()
+            gE_s = alpha / (E * (E - 1)) + (1 - alpha) / E**2
+            for si, skm in enumerate(args.smooth_km):
+                sig = skm / args.grid_km
+                den = lf._gaussian_blur_2d(vv, sig)
+                St = lf._gaussian_blur_2d(Y * vv, sig) / den.clamp(min=1e-6)
+                Sx = lf._gaussian_blur_2d(X * vv.unsqueeze(0), sig) / den.clamp(min=1e-6).unsqueeze(0)
+                msk = (vv > 0) & (den >= args.min_coverage)
+                mf = msk.double()
+                nm = mf.sum((1, 2)).clamp(min=2.0)
+                mu = (St * mf).sum((1, 2)) / nm
+                a2 = (((St - mu.view(C, 1, 1)) ** 2) * mf).sum((1, 2)) / (nm - 1)
+                cr = (Sx - St.unsqueeze(0)).abs().mean(0)
+                for i in range(E - 1):
+                    cr = cr - gE_s * (Sx[i].unsqueeze(0) - Sx[i + 1:]).abs().sum(0)
+                acc_s["crps"][:, si] += (cr * mf).sum((1, 2)) / nm / a2.sqrt().clamp(min=1e-6)
+                acc_s["spr"][:, si] += (Sx.var(0, unbiased=True) * mf).sum((1, 2))
+                acc_s["skl"][:, si] += (((Sx.mean(0) - St) ** 2) * mf).sum((1, 2)) * E / (E + 1)
+                acc_s["d2"][:, si] += (((Sx[0] - Sx[1]) ** 2) * mf).sum((1, 2))
+                acc_s["e2"][:, si] += (((Sx.mean(0) - St) ** 2) * mf).sum((1, 2))
+                acc_s["a2"][:, si] += a2 * mf.sum((1, 2))
+                acc_s["n"][:, si] += mf.sum((1, 2))
+            n_smooth += 1
 
         f = 2**L
         Ny, Nx = math.ceil(ny / f) * f, math.ceil(nx / f) * f
@@ -215,3 +258,28 @@ for lvl in range(L):
     print(f"  L{lvl}    " + "".join(f"{float(v):10.4f}" for v in vals))
 print("\nshare / mshare: share of each level in the Haar CRPS / Haar MSE now; "
       "share_n / mshare_n: if each level were divided by s_l / s_l**2")
+
+if acc_s is not None and n_smooth > 0:
+    ks = args.smooth_km
+    crps_s = acc_s["crps"] / n_smooth
+    r_s = (acc_s["spr"] / acc_s["skl"].clamp(min=1e-30)).sqrt()
+    sp_s = (acc_s["d2"] / acc_s["a2"].clamp(min=1e-30)).sqrt()
+    er_s = (acc_s["e2"] / acc_s["a2"].clamp(min=1e-30)).sqrt()
+    cols_s = ["crps_s", "spr/skl", "spread", "error"]
+    print(f"\nLarge scales (Gaussian smoothing, sigma in km; {n_smooth} samples)")
+    for c, ch in enumerate(chans):
+        print(f"\n{ch}")
+        print("  sigma   " + "".join(f"{h:>10}" for h in cols_s))
+        for si, skm in enumerate(ks):
+            vals = [crps_s[c, si], r_s[c, si], sp_s[c, si], er_s[c, si]]
+            print(f"  {skm:5.0f}   " + "".join(f"{float(v):10.4f}" for v in vals))
+    print("\nmean over channels")
+    print("  sigma   " + "".join(f"{h:>10}" for h in cols_s))
+    for si, skm in enumerate(ks):
+        vals = [crps_s[:, si].mean(), r_s[:, si].mean(), sp_s[:, si].mean(), er_s[:, si].mean()]
+        print(f"  {skm:5.0f}   " + "".join(f"{float(v):10.4f}" for v in vals))
+    print("\nspr/skl > 1: members differ more than their error (over-dispersed); < 1: too similar.")
+    print("spread / error: RMS member difference / RMS ensemble-mean error, both relative to the")
+    print("RMS of the smoothed target anomaly.")
+elif acc_s is None:
+    print("\n(one member only: no large-scale spread table)")
