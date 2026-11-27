@@ -243,6 +243,7 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                         f"for stream name '{stream_name}'."
                         raise ValueError(msg)
 
+            found = True
             for fname in stream_info.get("filenames", [pathlib.Path()]):
                 fname = pathlib.Path(fname)
                 # dont check if file exists since zarr stores might be directories
@@ -258,7 +259,9 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
                             f"Did not find input data for {stream_info['type']} "
                             f"stream '{stream_name}': {filenames}."
                         )
-                        raise FileNotFoundError(msg)
+                        logger.info(msg)
+                        found = False
+                        continue
 
                 ds_type = stream_info["type"]
                 if is_root():
@@ -270,13 +273,18 @@ Set repeat_data_in_mini_epoch to True if this is undesired."
 
                 streams_datasets[stream_name].readers += [ds]
 
-            stream_info[str(self._stage) + "_source_channels"] = ds.source_channels
-            stream_info[str(self._stage) + "_target_channels"] = ds.target_channels
-            stream_info["target_channel_weights"] = (
-                ds.target_channel_weights
-                if ds.target_channel_weights is not None
-                else [1.0 for _ in ds.target_channels]
-            )
+            if found:
+                stream_info[str(self._stage) + "_source_channels"] = ds.source_channels
+                stream_info[str(self._stage) + "_target_channels"] = ds.target_channels
+                stream_info["target_channel_weights"] = (
+                    ds.target_channel_weights
+                    if ds.target_channel_weights is not None
+                    else [1.0 for _ in ds.target_channels]
+                )
+            else:
+                #Delete from streams_dataset and config if no file is found
+                streams_datasets.pop(stream_name, None)
+                cf.streams.pop(stream_name, None)
 
         return streams_datasets
 
